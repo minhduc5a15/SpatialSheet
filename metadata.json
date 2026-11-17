@@ -1,0 +1,6 @@
+{
+  "name": "SpatialSheet Studio",
+  "description": "Visual CSV and Excel spreadsheet viewer and editor with interactive 2D charts and 3D XR Blocks visualization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

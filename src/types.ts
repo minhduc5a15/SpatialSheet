@@ -51,7 +51,7 @@ export type AggregationFn = 'none' | 'sum' | 'avg' | 'min' | 'max' | 'count';
 
 export type SpatialSortOrder = 'source' | 'value-desc' | 'value-asc' | 'label-asc';
 
-export type SamplingStrategy = 'stratified' | 'first-n';
+export type SamplingStrategy = 'systematic' | 'first-n';
 
 export type ScaleType = 'linear' | 'log';
 

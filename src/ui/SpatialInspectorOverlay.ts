@@ -701,7 +701,7 @@ export class SpatialInspectorOverlay {
           <label class="flex flex-col gap-1">
             <span class="text-[11px] text-slate-400">Sampling Strategy</span>
             <select data-cfg-field="samplingStrategy" class="bg-slate-950 border border-slate-700 rounded-md px-2 py-1.5 text-slate-100">
-              <option value="stratified" ${cfg.samplingStrategy === 'stratified' ? 'selected' : ''}>Stratified (Evenly Spaced)</option>
+              <option value="systematic" ${cfg.samplingStrategy === 'systematic' ? 'selected' : ''}>Evenly Spaced (Systematic)</option>
               <option value="first-n" ${cfg.samplingStrategy === 'first-n' ? 'selected' : ''}>First N Rows</option>
             </select>
           </label>

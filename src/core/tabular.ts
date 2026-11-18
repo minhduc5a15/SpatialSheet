@@ -203,15 +203,19 @@ export function normalizeRecordsToSheet(
   }
 
   const rawHeaders = Array.isArray(records[0]) ? records[0] : [];
-  const seen = new Map<string, number>();
+  const usedHeaders = new Set<string>();
   const columns = new Array<string>(maxCols);
 
   for (let c = 0; c < maxCols; c++) {
     const raw = String(rawHeaders[c] ?? '').trim();
     const base = raw || `Column ${columnIndexToLetter(c)}`;
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    columns[c] = count === 0 ? base : `${base} (${count + 1})`;
+    let candidate = base;
+    let suffix = 2;
+    while (usedHeaders.has(candidate)) {
+      candidate = `${base} (${suffix++})`;
+    }
+    usedHeaders.add(candidate);
+    columns[c] = candidate;
   }
 
   const rowCount = Math.max(0, records.length - 1);
@@ -304,7 +308,7 @@ export function parseNumericValue(raw: string): {
     cleaned = cleaned.replace(',', '.');
   }
 
-  if (!/^-?(\d+\.?\d*|\.\d+)$/.test(cleaned)) {
+  if (!/^-?(\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(cleaned)) {
     return {value: null, isPercent: false};
   }
 
@@ -527,6 +531,7 @@ const NUMBER_FORMATTERS = [
   new Intl.NumberFormat('en-US', {maximumFractionDigits: 0}),
   new Intl.NumberFormat('en-US', {maximumFractionDigits: 1}),
   new Intl.NumberFormat('en-US', {maximumFractionDigits: 2}),
+  new Intl.NumberFormat('en-US', {maximumFractionDigits: 5}),
 ];
 
 export function formatDisplayNumber(
@@ -534,8 +539,15 @@ export function formatDisplayNumber(
   type: ColumnType = 'number'
 ): string {
   if (!Number.isFinite(value)) return '0';
+  if (Object.is(value, -0) || value === 0) {
+    return type === 'percent' ? '0%' : '0';
+  }
   const abs = Math.abs(value);
-  const fmtIdx = abs >= 1000 ? 0 : abs >= 10 ? 1 : 2;
+  if (abs < 1e-4) {
+    const formatted = value.toExponential(2);
+    return type === 'percent' ? `${formatted}%` : formatted;
+  }
+  const fmtIdx = abs >= 1000 ? 0 : abs >= 10 ? 1 : abs >= 0.01 ? 2 : 3;
   const formatted = NUMBER_FORMATTERS[fmtIdx].format(value);
   return type === 'percent' ? `${formatted}%` : formatted;
 }
@@ -622,7 +634,6 @@ export function addSheetRow(sheet: SheetData): SheetData {
     if (colIdx === 0 && type === 'text') {
       return hasAnyNonEmptyFirstCol ? `Item ${sheet.rows.length + 1}` : '';
     }
-    if (type === 'number' || type === 'percent') return '0';
     return '';
   });
   const nextRows = sheet.rows.slice();
@@ -658,12 +669,8 @@ export function addSheetColumn(
   const nextColumns = sheet.columns.slice();
   const name =
     columnName?.trim() || `Column ${columnIndexToLetter(nextColumns.length)}`;
-  const hasAnyRowsWithData = sheet.rows.some((r) =>
-    r.some((cell) => cell.trim().length > 0)
-  );
   nextColumns.push(name);
-  const fillVal = hasAnyRowsWithData ? '0' : '';
-  const nextRows = sheet.rows.map((r) => [...r, fillVal]);
+  const nextRows = sheet.rows.map((r) => [...r, '']);
 
   return {
     id: sheet.id,

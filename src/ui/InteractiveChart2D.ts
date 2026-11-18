@@ -21,12 +21,51 @@ export interface Chart2DCallbacks {
   onApplyRecommendation?: (rec: ChartRecommendation) => void;
 }
 
-interface DataPointRow {
+export interface DataPointRow {
   rowIndex: number;
   label: string;
-  values: number[];
+  values: (number | null)[];
   hasAnyNumeric: boolean;
   xNumeric: number | null;
+}
+
+export function extractChart2DPoints(
+  sheet: SheetData,
+  visibleRowIndices: VisibleRowsSource,
+  xColIndex: number,
+  yColIndices: number[]
+): {points: DataPointRow[]; hasAnyNumeric: boolean} {
+  const sampledIndices = sampleChartIndices(visibleRowIndices, MAX_CHART_POINTS);
+  let hasAnyNumeric = false;
+  const points: DataPointRow[] = new Array<DataPointRow>(sampledIndices.length);
+
+  for (let i = 0; i < sampledIndices.length; i++) {
+    const rowIndex = sampledIndices[i];
+    const row = sheet.rows[rowIndex] ?? [];
+    const rawLabel = (row[xColIndex] ?? '').trim() || `Row ${rowIndex + 1}`;
+    const xParsed = parseNumericValue(rawLabel).value;
+    const values = new Array<number | null>(yColIndices.length);
+    let rowHasNum = false;
+    for (let s = 0; s < yColIndices.length; s++) {
+      const p = parseNumericValue(row[yColIndices[s]] ?? '');
+      if (p.value !== null) {
+        values[s] = p.value;
+        rowHasNum = true;
+        hasAnyNumeric = true;
+      } else {
+        values[s] = null;
+      }
+    }
+    points[i] = {
+      rowIndex,
+      label: rawLabel,
+      values,
+      hasAnyNumeric: rowHasNum,
+      xNumeric: xParsed,
+    };
+  }
+
+  return {points, hasAnyNumeric};
 }
 
 function escapeHtml(str: string): string {
@@ -373,43 +412,13 @@ export class InteractiveChart2D {
       return {points: this.cachedPoints, hasAnyNumeric: this.cachedHasNumeric};
     }
 
-    const sheet = this.sheet;
     const {xColIndex, yColIndices} = this.config;
-    const sampledIndices = sampleChartIndices(
+    const {points, hasAnyNumeric} = extractChart2DPoints(
+      this.sheet,
       this.visibleRowIndices,
-      MAX_CHART_POINTS
+      xColIndex,
+      yColIndices
     );
-
-    let hasAnyNumeric = false;
-    const points: DataPointRow[] = new Array<DataPointRow>(
-      sampledIndices.length
-    );
-
-    for (let i = 0; i < sampledIndices.length; i++) {
-      const rowIndex = sampledIndices[i];
-      const row = sheet.rows[rowIndex] ?? [];
-      const rawLabel = (row[xColIndex] ?? '').trim() || `Row ${rowIndex + 1}`;
-      const xParsed = parseNumericValue(rawLabel).value;
-      const values = new Array<number>(yColIndices.length);
-      let rowHasNum = false;
-      for (let s = 0; s < yColIndices.length; s++) {
-        const p = parseNumericValue(row[yColIndices[s]] ?? '');
-        if (p.value !== null) {
-          values[s] = p.value;
-          rowHasNum = true;
-          hasAnyNumeric = true;
-        } else {
-          values[s] = 0;
-        }
-      }
-      points[i] = {
-        rowIndex,
-        label: rawLabel,
-        values,
-        hasAnyNumeric: rowHasNum,
-        xNumeric: xParsed,
-      };
-    }
 
     this.lastPointsKey = {
       sheet: this.sheet,
@@ -489,16 +498,22 @@ export class InteractiveChart2D {
   }
 
   private getMinMaxValues(points: DataPointRow[]): {minVal: number; maxVal: number} {
-    let minVal = 0;
-    let maxVal = 1;
+    let minVal = Infinity;
+    let maxVal = -Infinity;
     for (let i = 0; i < points.length; i++) {
       const vals = points[i].values;
       for (let j = 0; j < vals.length; j++) {
         const v = vals[j];
+        if (v === null) continue;
         if (v < minVal) minVal = v;
         if (v > maxVal) maxVal = v;
       }
     }
+    if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) {
+      return {minVal: 0, maxVal: 1};
+    }
+    if (minVal > 0) minVal = 0;
+    if (maxVal < 0) maxVal = 0;
     return {minVal, maxVal};
   }
 
@@ -546,6 +561,7 @@ export class InteractiveChart2D {
       }
 
       pt.values.forEach((val, sIdx) => {
+        if (val === null) return;
         const yColIdx = this.config.yColIndices[sIdx];
         const colName = this.sheet!.columns[yColIdx] ?? '';
         const colType = this.sheet!.types[yColIdx] ?? 'number';
@@ -633,43 +649,65 @@ export class InteractiveChart2D {
       const colName = this.sheet!.columns[yColIdx] ?? '';
       const colType = this.sheet!.types[yColIdx] ?? 'number';
 
-      const coords = points.map((pt, idx) => ({
-        x: getX(idx),
-        y: getY(pt.values[sIdx] ?? 0),
-        val: pt.values[sIdx] ?? 0,
-        pt,
-      }));
+      const segments: Array<
+        Array<{x: number; y: number; val: number; pt: DataPointRow}>
+      > = [];
+      let currentSeg: Array<{x: number; y: number; val: number; pt: DataPointRow}> =
+        [];
 
-      const polyPoints = coords.map((c) => `${c.x},${c.y}`).join(' ');
-      if (sIdx === 0 && coords.length > 1) {
-        const baselineY = pad.top + plotH;
-        const areaPath = `M ${coords[0].x},${baselineY} L ${coords.map((c) => `${c.x},${c.y}`).join(' L ')} L ${coords[coords.length - 1].x},${baselineY} Z`;
-        seriesHtml.push(
-          `<path d="${areaPath}" fill="${color}" opacity="0.10" />`
-        );
+      points.forEach((pt, idx) => {
+        const rawVal = pt.values[sIdx];
+        if (rawVal === null || rawVal === undefined) {
+          if (currentSeg.length > 0) {
+            segments.push(currentSeg);
+            currentSeg = [];
+          }
+          return;
+        }
+        currentSeg.push({
+          x: getX(idx),
+          y: getY(rawVal),
+          val: rawVal,
+          pt,
+        });
+      });
+      if (currentSeg.length > 0) {
+        segments.push(currentSeg);
       }
 
-      seriesHtml.push(`
-        <polyline fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" points="${polyPoints}" />
-      `);
+      const baselineY = pad.top + plotH;
+      for (const seg of segments) {
+        if (seg.length > 1) {
+          if (sIdx === 0) {
+            const areaPath = `M ${seg[0].x},${baselineY} L ${seg.map((c) => `${c.x},${c.y}`).join(' L ')} L ${seg[seg.length - 1].x},${baselineY} Z`;
+            seriesHtml.push(
+              `<path d="${areaPath}" fill="${color}" opacity="0.10" />`
+            );
+          }
+          const polyPoints = seg.map((c) => `${c.x},${c.y}`).join(' ');
+          seriesHtml.push(`
+            <polyline fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" points="${polyPoints}" />
+          `);
+        }
 
-      coords.forEach((c) => {
-        const isSel = this.highlightedRowIndex === c.pt.rowIndex;
-        markersHtml.push(`
-          <circle
-            cx="${c.x}"
-            cy="${c.y}"
-            r="${isSel ? 6.5 : 4.5}"
-            fill="#ffffff"
-            stroke="${color}"
-            stroke-width="${isSel ? 3 : 2.5}"
-            data-point-row="${c.pt.rowIndex}"
-            data-tip-title="${escapeHtml(c.pt.label)}"
-            data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(c.val, colType))}"
-            class="cursor-pointer"
-          />
-        `);
-      });
+        for (const c of seg) {
+          const isSel = this.highlightedRowIndex === c.pt.rowIndex;
+          markersHtml.push(`
+            <circle
+              cx="${c.x}"
+              cy="${c.y}"
+              r="${isSel ? 6.5 : 4.5}"
+              fill="#ffffff"
+              stroke="${color}"
+              stroke-width="${isSel ? 3 : 2.5}"
+              data-point-row="${c.pt.rowIndex}"
+              data-tip-title="${escapeHtml(c.pt.label)}"
+              data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(c.val, colType))}"
+              class="cursor-pointer"
+            />
+          `);
+        }
+      }
     });
 
     points.forEach((pt, idx) => {
@@ -705,14 +743,14 @@ export class InteractiveChart2D {
     const colType = this.sheet!.types[yColIdx] ?? 'number';
 
     const slices = points
+      .filter((pt) => pt.values[0] !== null && pt.values[0] > 0)
       .slice(0, 12)
       .map((pt, idx) => ({
         rowIndex: pt.rowIndex,
         label: pt.label,
-        value: Math.max(0, pt.values[0] ?? 0),
+        value: pt.values[0] as number,
         color: CHART_PALETTE[idx % CHART_PALETTE.length],
-      }))
-      .filter((s) => s.value > 0);
+      }));
 
     const total = slices.reduce((acc, s) => acc + s.value, 0);
     if (total <= 0) {
@@ -802,15 +840,26 @@ export class InteractiveChart2D {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
+    const validYPoints = points.filter((pt) => pt.values[0] !== null);
+    const hasNumericX = validYPoints.some((pt) => pt.xNumeric !== null);
+    const scatterPoints = hasNumericX
+      ? validYPoints.filter((pt) => pt.xNumeric !== null)
+      : validYPoints;
+
+    if (scatterPoints.length === 0) {
+      wrap.innerHTML = `<div class="flex items-center justify-center h-full text-xs text-slate-500">Valid numeric values are required to render a scatter chart.</div>`;
+      return;
+    }
+
     let xMin = Infinity;
     let xMax = -Infinity;
-    let yMin = 0;
-    let yMax = 1;
-    const xCoords = new Array<number>(points.length);
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    const xCoords = new Array<number>(scatterPoints.length);
 
-    for (let i = 0; i < points.length; i++) {
-      const xv = points[i].xNumeric ?? i + 1;
-      const yv = points[i].values[0] ?? 0;
+    for (let i = 0; i < scatterPoints.length; i++) {
+      const xv = hasNumericX ? (scatterPoints[i].xNumeric as number) : i + 1;
+      const yv = scatterPoints[i].values[0] as number;
       xCoords[i] = xv;
       if (xv < xMin) xMin = xv;
       if (xv > xMax) xMax = xv;
@@ -819,6 +868,8 @@ export class InteractiveChart2D {
     }
     if (!Number.isFinite(xMin)) xMin = 0;
     if (xMax <= xMin) xMax = xMin + 1;
+    if (!Number.isFinite(yMin)) yMin = 0;
+    if (yMax <= yMin) yMax = yMin + 1;
 
     const gridLines: string[] = [];
     for (let i = 0; i <= 4; i++) {
@@ -835,10 +886,10 @@ export class InteractiveChart2D {
     const colName = this.sheet!.columns[yColIdx] ?? '';
     const colType = this.sheet!.types[yColIdx] ?? 'number';
 
-    const dotsHtml = points
+    const dotsHtml = scatterPoints
       .map((pt, idx) => {
         const xv = xCoords[idx];
-        const yv = pt.values[0] ?? 0;
+        const yv = pt.values[0] as number;
         const cx =
           pad.left + ((xv - xMin) / Math.max(1e-6, xMax - xMin)) * plotW;
         const cy =
@@ -861,7 +912,7 @@ export class InteractiveChart2D {
               data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(yv, colType))}"
               class="cursor-pointer"
             />
-            ${points.length <= 18 || isSel ? `<text x="${cx}" y="${cy - 10}" text-anchor="middle" class="fill-slate-600 text-[10px] pointer-events-none">${escapeHtml(truncateLabel(pt.label, 10))}</text>` : ''}
+            ${scatterPoints.length <= 18 || isSel ? `<text x="${cx}" y="${cy - 10}" text-anchor="middle" class="fill-slate-600 text-[10px] pointer-events-none">${escapeHtml(truncateLabel(pt.label, 10))}</text>` : ''}
           </g>
         `;
       })

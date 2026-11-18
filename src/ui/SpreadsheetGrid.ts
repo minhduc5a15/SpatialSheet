@@ -532,8 +532,12 @@ export class SpreadsheetGrid {
       this.externalStatsState = columnStats;
     }
 
-    if (oldTypes && oldTypes[colIndex] !== nextSheet.types[colIndex]) {
+    const typeChanged = Boolean(
+      oldTypes && oldTypes[colIndex] !== nextSheet.types[colIndex]
+    );
+    if (typeChanged) {
       this.renderHeader(false);
+      this.renderVirtualWindow(true);
     }
 
     if (this.tbodyEl) {

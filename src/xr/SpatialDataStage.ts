@@ -125,6 +125,11 @@ export class SpatialDataStage extends xb.Script {
   private shadowTexture: THREE.CanvasTexture | null = null;
   private envTexture: THREE.Texture | null = null;
   private orbitControls: OrbitControls | null = null;
+  private hemiLight: THREE.HemisphereLight | null = null;
+  private keyLight: THREE.DirectionalLight | null = null;
+  private rimLight: THREE.DirectionalLight | null = null;
+  private renderOverrideFn: NonNullable<typeof xb.core.renderSceneOverride> | null =
+    null;
 
   private derived: DerivedSpatialDataset | null = null;
   private selectedItemId: number | null = null;
@@ -271,7 +276,7 @@ export class SpatialDataStage extends xb.Script {
       pmrem.dispose();
 
       // Only render WebGL when 3D view is visible; pause idle draws on software WebGL
-      xb.core.renderSceneOverride = (r, s, c) => {
+      this.renderOverrideFn = (r, s, c) => {
         if (!this.embeddedVisible && !this.xrOrSimActive) return;
         if (this.isSoftwareGl && this.dirtyFrames <= 0) return;
         if (this.dirtyFrames > 0) this.dirtyFrames--;
@@ -279,23 +284,24 @@ export class SpatialDataStage extends xb.Script {
           r.render(s, c);
         }
       };
+      xb.core.renderSceneOverride = this.renderOverrideFn;
     }
 
-    const hemiLight = new THREE.HemisphereLight(0xe2e8f0, 0x1e293b, 1.65);
-    this.add(hemiLight);
+    this.hemiLight = new THREE.HemisphereLight(0xe2e8f0, 0x1e293b, 1.65);
+    this.add(this.hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfff7ed, 2.0);
-    keyLight.position.set(3.2, 5.0, 2.8);
+    this.keyLight = new THREE.DirectionalLight(0xfff7ed, 2.0);
+    this.keyLight.position.set(3.2, 5.0, 2.8);
     if (!this.isSoftwareGl) {
-      keyLight.castShadow = true;
-      keyLight.shadow.mapSize.set(1024, 1024);
-      keyLight.shadow.bias = -0.0005;
+      this.keyLight.castShadow = true;
+      this.keyLight.shadow.mapSize.set(1024, 1024);
+      this.keyLight.shadow.bias = -0.0005;
     }
-    this.add(keyLight);
+    this.add(this.keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x60a5fa, 0.85);
-    rimLight.position.set(-3.0, 2.5, -3.5);
-    this.add(rimLight);
+    this.rimLight = new THREE.DirectionalLight(0x60a5fa, 0.85);
+    this.rimLight.position.set(-3.0, 2.5, -3.5);
+    this.add(this.rimLight);
 
     this.stageRoot.position.set(0, 0.84, -1.55);
     this.add(this.stageRoot);
@@ -1174,7 +1180,26 @@ export class SpatialDataStage extends xb.Script {
     this.dropLineMat.dispose();
     this.gridTexture?.dispose();
     this.shadowTexture?.dispose();
+    if (xb.core.scene?.environment === this.envTexture) {
+      xb.core.scene.environment = null;
+    }
     this.envTexture?.dispose();
+    this.envTexture = null;
+    if (
+      this.renderOverrideFn &&
+      xb.core.renderSceneOverride === this.renderOverrideFn
+    ) {
+      xb.core.renderSceneOverride = undefined;
+    }
+    this.renderOverrideFn = null;
+    this.hemiLight?.removeFromParent();
+    this.keyLight?.removeFromParent();
+    this.rimLight?.removeFromParent();
+    this.hemiLight = null;
+    this.keyLight = null;
+    this.rimLight = null;
+    this.spatialCard.removeFromParent();
+    this.stageRoot.removeFromParent();
     this.orbitControls?.dispose();
 
     const renderer = xb.core.renderer;

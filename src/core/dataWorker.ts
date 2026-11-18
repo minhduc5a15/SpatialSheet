@@ -105,6 +105,12 @@ export type WorkerResponse =
       sheetVersion: number;
       filterKey: string;
       derived: DerivedSpatialDataset;
+    }
+  | {
+      type: 'worker-error';
+      requestId: number;
+      op: 'filter-sort' | 'compute-stats' | 'transform-spatial';
+      error: string;
     };
 
 let cachedSheet: SheetData | null = null;
@@ -218,26 +224,45 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
     }
     const targetSheet =
       cachedVersion === msg.sheetVersion ? cachedSheet : msg.sheet ?? null;
-    if (!targetSheet) return;
+    if (!targetSheet) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'filter-sort',
+        error: `Worker sheet cache miss for version ${msg.sheetVersion}.`,
+      };
+      self.postMessage(resp);
+      return;
+    }
 
-    const indices = filterAndSortRowsBuffer(
-      targetSheet,
-      msg.searchQuery,
-      msg.sort
-    );
-    cachedIndices = indices;
-    cachedIndicesVersion = msg.sheetVersion;
-    cachedFilterKey = msg.filterKey;
+    try {
+      const indices = filterAndSortRowsBuffer(
+        targetSheet,
+        msg.searchQuery,
+        msg.sort
+      );
+      cachedIndices = indices;
+      cachedIndicesVersion = msg.sheetVersion;
+      cachedFilterKey = msg.filterKey;
 
-    const transferCopy = indices.slice();
-    const buffer = transferCopy.buffer as ArrayBuffer;
-    const resp: WorkerResponse = {
-      type: 'filter-sort-result',
-      requestId: msg.requestId,
-      sheetVersion: msg.sheetVersion,
-      indicesBuffer: buffer,
-    };
-    (self as unknown as Worker).postMessage(resp, [buffer]);
+      const transferCopy = indices.slice();
+      const buffer = transferCopy.buffer as ArrayBuffer;
+      const resp: WorkerResponse = {
+        type: 'filter-sort-result',
+        requestId: msg.requestId,
+        sheetVersion: msg.sheetVersion,
+        indicesBuffer: buffer,
+      };
+      (self as unknown as Worker).postMessage(resp, [buffer]);
+    } catch (err) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'filter-sort',
+        error: err instanceof Error ? err.message : 'Filter/sort failed.',
+      };
+      self.postMessage(resp);
+    }
     return;
   }
 
@@ -248,23 +273,42 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
     }
     const targetSheet =
       cachedVersion === msg.sheetVersion ? cachedSheet : msg.sheet ?? null;
-    if (!targetSheet) return;
-
-    let rowSource: Int32Array | undefined;
-    if (!msg.useAllRows) {
-      rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
+    if (!targetSheet) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'compute-stats',
+        error: `Worker sheet cache miss for version ${msg.sheetVersion}.`,
+      };
+      self.postMessage(resp);
+      return;
     }
 
-    const stats = computeColumnStats(targetSheet, msg.colIndex, rowSource);
-    const resp: WorkerResponse = {
-      type: 'stats-result',
-      requestId: msg.requestId,
-      sheetVersion: msg.sheetVersion,
-      colIndex: msg.colIndex,
-      filterKey: msg.filterKey,
-      stats,
-    };
-    self.postMessage(resp);
+    try {
+      let rowSource: Int32Array | undefined;
+      if (!msg.useAllRows) {
+        rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
+      }
+
+      const stats = computeColumnStats(targetSheet, msg.colIndex, rowSource);
+      const resp: WorkerResponse = {
+        type: 'stats-result',
+        requestId: msg.requestId,
+        sheetVersion: msg.sheetVersion,
+        colIndex: msg.colIndex,
+        filterKey: msg.filterKey,
+        stats,
+      };
+      self.postMessage(resp);
+    } catch (err) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'compute-stats',
+        error: err instanceof Error ? err.message : 'Stats computation failed.',
+      };
+      self.postMessage(resp);
+    }
     return;
   }
 
@@ -275,25 +319,44 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
     }
     const targetSheet =
       cachedVersion === msg.sheetVersion ? cachedSheet : msg.sheet ?? null;
-    if (!targetSheet) return;
+    if (!targetSheet) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'transform-spatial',
+        error: `Worker sheet cache miss for version ${msg.sheetVersion}.`,
+      };
+      self.postMessage(resp);
+      return;
+    }
 
-    const rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
-    const derived = transformSpatialDataset({
-      sheet: targetSheet,
-      visibleRowIndices: rowSource,
-      profile: msg.profile,
-      config: msg.config,
-      mode: msg.mode,
-      yColIndices: msg.yColIndices,
-    });
+    try {
+      const rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
+      const derived = transformSpatialDataset({
+        sheet: targetSheet,
+        visibleRowIndices: rowSource,
+        profile: msg.profile,
+        config: msg.config,
+        mode: msg.mode,
+        yColIndices: msg.yColIndices,
+      });
 
-    const resp: WorkerResponse = {
-      type: 'spatial-result',
-      requestId: msg.requestId,
-      sheetVersion: msg.sheetVersion,
-      filterKey: msg.filterKey,
-      derived,
-    };
-    self.postMessage(resp);
+      const resp: WorkerResponse = {
+        type: 'spatial-result',
+        requestId: msg.requestId,
+        sheetVersion: msg.sheetVersion,
+        filterKey: msg.filterKey,
+        derived,
+      };
+      self.postMessage(resp);
+    } catch (err) {
+      const resp: WorkerResponse = {
+        type: 'worker-error',
+        requestId: msg.requestId,
+        op: 'transform-spatial',
+        error: err instanceof Error ? err.message : 'Spatial transform failed.',
+      };
+      self.postMessage(resp);
+    }
   }
 });

@@ -124,7 +124,16 @@ export function exportSheetAsCsv(sheet: SheetData, baseFileName: string): void {
   URL.revokeObjectURL(url);
 }
 
-export function exportWorkbookAsExcel(workbook: WorkbookState): void {
+function shouldPreserveAsExcelString(trimmed: string): boolean {
+  const compact = trimmed.replace(/,/g, '');
+  if (/^-?0\d+$/.test(compact)) return true; // Leading zeros like "00123"
+  if (/^-?\d{16,}$/.test(compact)) return true; // Exceeds IEEE-754 safe integer precision
+  return false;
+}
+
+export function buildExcelWorkbookForExport(
+  workbook: WorkbookState
+): XLSX.WorkBook {
   const wb = XLSX.utils.book_new();
   const usedNames = new Set<string>();
 
@@ -135,26 +144,40 @@ export function exportWorkbookAsExcel(workbook: WorkbookState): void {
         row.map((cell, colIdx) => {
           const type = sheet.types[colIdx];
           if (type === 'number') {
-            const num = Number(cell.replace(/,/g, ''));
-            if (cell.trim() !== '' && Number.isFinite(num)) return num;
+            const trimmed = cell.trim();
+            if (trimmed !== '' && !shouldPreserveAsExcelString(trimmed)) {
+              const compact = trimmed.replace(/,/g, '');
+              if (/^-?(\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(compact)) {
+                const num = Number(compact);
+                if (Number.isFinite(num)) return num;
+              }
+            }
           }
           return cell;
         })
       ),
     ];
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    let safeName = (sheet.name || `Sheet${index + 1}`)
+    let safeBase = (sheet.name || `Sheet${index + 1}`)
       .replace(/[\\/?*[\]:]/g, ' ')
       .trim()
       .slice(0, 31);
-    if (!safeName) safeName = `Sheet${index + 1}`;
+    if (!safeBase) safeBase = `Sheet${index + 1}`;
+    let safeName = safeBase;
+    let suffix = 2;
     while (usedNames.has(safeName)) {
-      safeName = `${safeName.slice(0, 27)}_${index + 1}`;
+      const tag = `_${suffix++}`;
+      safeName = `${safeBase.slice(0, Math.max(1, 31 - tag.length))}${tag}`;
     }
     usedNames.add(safeName);
     XLSX.utils.book_append_sheet(wb, ws, safeName);
   });
 
+  return wb;
+}
+
+export function exportWorkbookAsExcel(workbook: WorkbookState): void {
+  const wb = buildExcelWorkbookForExport(workbook);
   const cleanBase = stripExtension(workbook.fileName) || 'Spreadsheet';
   XLSX.writeFile(wb, `${cleanBase}.xlsx`);
 }

@@ -95,6 +95,9 @@ export class DataWorkerClient {
       );
       this.worker.addEventListener('error', (err) => {
         const message = err?.message || 'Background worker failed.';
+        const deadWorker = this.worker;
+        this.worker = null;
+        this.invalidateCache();
         for (const [id, pending] of this.pendingParses) {
           this.pendingParses.delete(id);
           if (id === this.latestParseId) {
@@ -106,6 +109,11 @@ export class DataWorkerClient {
         this.settlePendingFiltersAsNull();
         this.settlePendingStatsAsNull();
         this.settlePendingSpatialAsNull();
+        try {
+          deadWorker?.terminate();
+        } catch {
+          // Ignore terminate error on already-crashed worker
+        }
       });
     }
   }
@@ -496,6 +504,30 @@ export class DataWorkerClient {
         if (msg.requestId === this.latestSpatialId) {
           pending.resolve(msg.derived);
         } else {
+          pending.resolve(null);
+        }
+      }
+      return;
+    }
+
+    if (msg.type === 'worker-error') {
+      this.invalidateCache();
+      if (msg.op === 'filter-sort') {
+        const pending = this.pendingFilters.get(msg.requestId);
+        if (pending) {
+          this.pendingFilters.delete(msg.requestId);
+          pending.resolve(null);
+        }
+      } else if (msg.op === 'compute-stats') {
+        const pending = this.pendingStats.get(msg.requestId);
+        if (pending) {
+          this.pendingStats.delete(msg.requestId);
+          pending.resolve(null);
+        }
+      } else if (msg.op === 'transform-spatial') {
+        const pending = this.pendingSpatial.get(msg.requestId);
+        if (pending) {
+          this.pendingSpatial.delete(msg.requestId);
           pending.resolve(null);
         }
       }

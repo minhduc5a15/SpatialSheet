@@ -62,7 +62,7 @@ export function extractExplicitHeaderUnit(colName: string): string | null {
 export function parseTemporalValue(raw: string): number | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return null;
+  if (/^-?(\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) return null;
 
   const qMatch = trimmed.match(QUARTER_RE);
   if (qMatch) {
@@ -174,6 +174,8 @@ export function profileSingleColumn(
   let totalCharLength = 0;
   let hasCurrencyCue = false;
   let hasDecimal = false;
+  let leadingZeroCodeCount = 0;
+  let unsafeIntegerCount = 0;
   let isSequentialOneBasedOrZeroBased = true;
 
   let min = Infinity;
@@ -218,6 +220,8 @@ export function profileSingleColumn(
       if (parsed.isPercent) percentCount++;
       if (/[₫$€£¥]|(VND|USD|EUR)$/i.test(raw)) hasCurrencyCue = true;
       if (!Number.isInteger(v)) hasDecimal = true;
+      if (/^-?0\d+$/.test(raw)) leadingZeroCodeCount++;
+      if (/^-?\d{16,}$/.test(raw.replace(/,/g, ''))) unsafeIntegerCount++;
     } else {
       isSequentialOneBasedOrZeroBased = false;
       if (parseTemporalValue(raw) !== null) {
@@ -270,8 +274,13 @@ export function profileSingleColumn(
   } else if (temporalCount / nonEmptyCount >= 0.75) {
     semanticType = 'temporal';
   } else if (
+    (leadingZeroCodeCount > 0 && leadingZeroCodeCount / nonEmptyCount >= 0.3 && !hasCurrencyCue && percentCount === 0) ||
+    (unsafeIntegerCount > 0 && unsafeIntegerCount / nonEmptyCount >= 0.3 && !hasCurrencyCue && percentCount === 0)
+  ) {
+    semanticType = 'identifier';
+  } else if (
     EXPLICIT_ID_HEADER_RE.test(colName) &&
-    nonEmptyCount >= 4 &&
+    nonEmptyCount >= 2 &&
     uniqueRatio >= 0.85 &&
     !hasCurrencyCue &&
     percentCount === 0

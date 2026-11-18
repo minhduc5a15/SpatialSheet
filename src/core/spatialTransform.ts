@@ -171,7 +171,7 @@ export function createDefaultSpatialConfig(
     aggregation,
     sortOrder: 'source',
     topK: 16,
-    samplingStrategy: 'stratified',
+    samplingStrategy: 'systematic',
     sampleLimit: 500,
     scaleType: 'linear',
     environmentMode: 'clean',
@@ -254,10 +254,18 @@ export function resolveModeSwitchConfig(
   if (!yIsQuant) aggregation = 'count';
   else if (aggregation === 'none' && profile.rowCount > 24) aggregation = 'avg';
 
+  const barTopKOptions = [8, 12, 16, 24, 36];
+  const normalizedTopK = barTopKOptions.includes(current.topK)
+    ? current.topK
+    : barTopKOptions.reduce((best, opt) =>
+        Math.abs(opt - current.topK) < Math.abs(best - current.topK) ? opt : best
+      );
+
   return {
     ...current,
     xColIndex,
     aggregation,
+    topK: normalizedTopK,
   };
 }
 
@@ -289,7 +297,7 @@ export function formatCompactTick(
     }
   }
   if (!Number.isFinite(val)) return '0';
-  if (Object.is(val, -0) || Math.abs(val) < 1e-12) {
+  if (val === 0 || Object.is(val, -0)) {
     return colType === 'percent' ? '0%' : '0';
   }
   const abs = Math.abs(val);
@@ -340,7 +348,7 @@ export function computeNiceAxisScale(
   }
 
   if (desiredScale === 'log') {
-    const safeMin = Math.max(1e-6, minVal);
+    const safeMin = Math.max(Number.MIN_VALUE, minVal);
     const safeMax = Math.max(safeMin * 10, maxVal);
     const expMin = Math.floor(Math.log10(safeMin));
     const expMax = Math.ceil(Math.log10(safeMax));
@@ -374,8 +382,9 @@ export function computeNiceAxisScale(
     if (maxVal < 0) maxVal = 0;
   }
 
-  if (Math.abs(maxVal - minVal) < 1e-12) {
-    const pad = Math.abs(minVal) > 1e-6 ? Math.abs(minVal) * 0.2 : 1;
+  const scaleRef = Math.max(0, Math.abs(minVal), Math.abs(maxVal));
+  if (Math.abs(maxVal - minVal) <= scaleRef * 1e-12) {
+    const pad = Math.abs(minVal) > 1e-30 ? Math.abs(minVal) * 0.2 : 1;
     minVal = includeZero && minVal >= 0 ? 0 : minVal - pad;
     maxVal = includeZero && maxVal <= 0 ? 0 : maxVal + pad;
   }
@@ -390,7 +399,7 @@ export function computeNiceAxisScale(
     if (maxVal <= 0 && scaleMax < 0) scaleMax = 0;
   }
 
-  const span = Math.max(1e-12, scaleMax - scaleMin);
+  const span = Math.max(Number.MIN_VALUE, scaleMax - scaleMin);
   const ticks: AxisTick[] = [];
   const stepsCount = Math.round(span / step);
   const maxSteps = Math.min(10, Math.max(1, stepsCount));
@@ -431,7 +440,7 @@ export function normalizeValueOnAxis(
 ): number {
   if (!Number.isFinite(value)) return 0;
   if (scaleType === 'log') {
-    const safeMin = Math.max(1e-6, min);
+    const safeMin = Math.max(Number.MIN_VALUE, min);
     const safeMax = Math.max(safeMin * 10, max);
     const safeVal = Math.max(safeMin, Math.min(safeMax, value));
     const span = Math.log10(safeMax) - Math.log10(safeMin);
@@ -440,7 +449,7 @@ export function normalizeValueOnAxis(
       Math.min(1, (Math.log10(safeVal) - Math.log10(safeMin)) / span)
     );
   }
-  const span = Math.max(1e-12, max - min);
+  const span = Math.max(Number.MIN_VALUE, max - min);
   return Math.max(0, Math.min(1, (value - min) / span));
 }
 
@@ -724,23 +733,33 @@ function transformBar3D(ctx: {
     const xSeen = new Set<string>();
     const seriesOrder: string[] = [];
     const seriesSeen = new Set<string>();
+    const rawRowSet = new Set<number>();
 
     for (let i = 0; i < sampleIndices.length; i++) {
       const rIdx = sampleIndices[i];
       const row = sheet.rows[rIdx] ?? [];
       const xRaw = (row[xColIdx] ?? '').trim() || `Row ${rIdx + 1}`;
-      const xKey = xSeen.has(xRaw) ? `${xRaw} #${rIdx + 1}` : xRaw;
-      if (!xSeen.has(xRaw)) xSeen.add(xRaw);
-      xLabelOrder.push(xKey);
+      let xKey = xRaw;
+      if (xSeen.has(xKey)) {
+        let suffix = rIdx + 1;
+        xKey = `${xRaw} #${suffix}`;
+        while (xSeen.has(xKey)) {
+          suffix++;
+          xKey = `${xRaw} #${suffix}`;
+        }
+      }
 
       if (groupColIdx !== null) {
+        const parsed = parseValueForDimension(row[yColIdx] ?? '', yRole);
+        if (parsed === null) continue;
         const gLabel = (row[groupColIdx] ?? '').trim() || '(Empty)';
         if (!seriesSeen.has(gLabel)) {
           seriesSeen.add(gLabel);
           seriesOrder.push(gLabel);
         }
-        const parsed = parseValueForDimension(row[yColIdx] ?? '', yRole);
-        if (parsed === null) continue;
+        xSeen.add(xKey);
+        xLabelOrder.push(xKey);
+        rawRowSet.add(rIdx);
         if (parsed < rawMin) rawMin = parsed;
         if (parsed > rawMax) rawMax = parsed;
         rawEntries.push({
@@ -752,12 +771,14 @@ function transformBar3D(ctx: {
           val: parsed,
         });
       } else {
+        let rowHadValid = false;
         for (let s = 0; s < activeYCols.length; s++) {
           const yc = activeYCols[s];
           const ycProfile = profile.columns[yc];
           const ycRole = ycProfile ? getEffectiveSemanticType(ycProfile) : 'quantitative';
           const parsed = parseValueForDimension(row[yc] ?? '', ycRole);
           if (parsed === null) continue;
+          rowHadValid = true;
           const sLabel = sheet.columns[yc] ?? `Series ${s + 1}`;
           if (!seriesSeen.has(sLabel)) {
             seriesSeen.add(sLabel);
@@ -773,6 +794,11 @@ function transformBar3D(ctx: {
             seriesIdx: s,
             val: parsed,
           });
+        }
+        if (rowHadValid) {
+          xSeen.add(xKey);
+          xLabelOrder.push(xKey);
+          rawRowSet.add(rIdx);
         }
       }
     }
@@ -867,10 +893,12 @@ function transformBar3D(ctx: {
       warningMessage,
       dataStateKind: isSampled ? 'sampled' : 'raw',
       dataStateSummary: isSampled
-        ? `Sampled ${sampleIndices.length} of ${totalVisible.toLocaleString('en-US')} rows (Raw)`
-        : `All ${totalVisible.toLocaleString('en-US')} raw records`,
+        ? `Sampled ${rawRowSet.size.toLocaleString('en-US')} plotted of ${totalVisible.toLocaleString('en-US')} visible rows (Raw)`
+        : rawRowSet.size < totalVisible
+          ? `Plotted ${rawRowSet.size.toLocaleString('en-US')} of ${totalVisible.toLocaleString('en-US')} visible rows (${(totalVisible - rawRowSet.size).toLocaleString('en-US')} missing/non-numeric skipped)`
+          : `All ${totalVisible.toLocaleString('en-US')} raw records`,
       totalVisibleRows: totalVisible,
-      representedRowCount: sampleIndices.length,
+      representedRowCount: rawRowSet.size,
       effectiveScaleType: scale.effectiveScaleType,
       axes: {
         x: {
@@ -923,6 +951,9 @@ function transformBar3D(ctx: {
   const bucketMap = new Map<string, AggBucket>();
   const xTotals = new Map<string, number>();
   const xCounts = new Map<string, number>();
+  const xMinMap = new Map<string, number>();
+  const xMaxMap = new Map<string, number>();
+  const xDistinctValidRows = new Map<string, number>();
   const seriesCounts = new Map<string, number>();
   const xSourceOrder: string[] = [];
   const seriesSourceOrder: string[] = [];
@@ -935,16 +966,21 @@ function transformBar3D(ctx: {
     if (!xTotals.has(xLabel)) {
       xTotals.set(xLabel, 0);
       xCounts.set(xLabel, 0);
+      xMinMap.set(xLabel, Infinity);
+      xMaxMap.set(xLabel, -Infinity);
+      xDistinctValidRows.set(xLabel, 0);
       xSourceOrder.push(xLabel);
     }
 
     if (hasMultipleYCols) {
+      let rowHadValidY = false;
       for (let s = 0; s < activeYCols.length; s++) {
         const yc = activeYCols[s];
         const ycProfile = profile.columns[yc];
         const ycRole = ycProfile ? getEffectiveSemanticType(ycProfile) : 'quantitative';
         const val = parseValueForDimension(row[yc] ?? '', ycRole);
         if (val === null) continue;
+        rowHadValidY = true;
         const sLabel = sheet.columns[yc] ?? `Series ${s + 1}`;
         if (!seriesCounts.has(sLabel)) {
           seriesCounts.set(sLabel, 0);
@@ -976,6 +1012,11 @@ function transformBar3D(ctx: {
         }
         xTotals.set(xLabel, (xTotals.get(xLabel) ?? 0) + val);
         xCounts.set(xLabel, (xCounts.get(xLabel) ?? 0) + 1);
+        if (val < (xMinMap.get(xLabel) ?? Infinity)) xMinMap.set(xLabel, val);
+        if (val > (xMaxMap.get(xLabel) ?? -Infinity)) xMaxMap.set(xLabel, val);
+      }
+      if (rowHadValidY) {
+        xDistinctValidRows.set(xLabel, (xDistinctValidRows.get(xLabel) ?? 0) + 1);
       }
     } else {
       const sLabel =
@@ -1020,6 +1061,9 @@ function transformBar3D(ctx: {
       }
       xTotals.set(xLabel, (xTotals.get(xLabel) ?? 0) + val);
       xCounts.set(xLabel, (xCounts.get(xLabel) ?? 0) + 1);
+      xDistinctValidRows.set(xLabel, (xDistinctValidRows.get(xLabel) ?? 0) + 1);
+      if (val < (xMinMap.get(xLabel) ?? Infinity)) xMinMap.set(xLabel, val);
+      if (val > (xMaxMap.get(xLabel) ?? -Infinity)) xMaxMap.set(xLabel, val);
     }
   }
 
@@ -1038,6 +1082,14 @@ function transformBar3D(ctx: {
     const cnt = xCounts.get(lbl) ?? 0;
     if (effectiveAgg === 'count') return cnt;
     if (effectiveAgg === 'avg') return cnt > 0 ? (xTotals.get(lbl) ?? 0) / cnt : 0;
+    if (effectiveAgg === 'min') {
+      const m = xMinMap.get(lbl);
+      return m !== undefined && Number.isFinite(m) ? m : 0;
+    }
+    if (effectiveAgg === 'max') {
+      const m = xMaxMap.get(lbl);
+      return m !== undefined && Number.isFinite(m) ? m : 0;
+    }
     return xTotals.get(lbl) ?? 0;
   };
 
@@ -1167,9 +1219,12 @@ function transformBar3D(ctx: {
     };
   });
 
-  // Deduplicate counted rows when multi-Y columns counted the same rows
+  // Count exact distinct rows represented across kept bars
   if (hasMultipleYCols) {
-    representedRowCount = Math.min(totalVisible, representedRowCount);
+    representedRowCount = keptX.reduce(
+      (acc, lbl) => acc + (xDistinctValidRows.get(lbl) ?? 0),
+      0
+    );
   }
 
   const categoryTicks: AxisCategoryTick[] = keptX.map((lbl, i) => ({
@@ -1199,9 +1254,9 @@ function transformBar3D(ctx: {
     validationMessage: null,
     warningMessage,
     dataStateKind: 'aggregated',
-    dataStateSummary: `Aggregated ${totalVisible.toLocaleString('en-US')} rows by ${xTitle}${groupColTitle ? ` × ${groupColTitle}` : ''} (${effectiveAgg.toUpperCase()}) -> ${items.length} bars`,
+    dataStateSummary: `Aggregated ${representedRowCount.toLocaleString('en-US')} of ${totalVisible.toLocaleString('en-US')} visible rows by ${xTitle}${groupColTitle ? ` × ${groupColTitle}` : ''} (${effectiveAgg.toUpperCase()}) -> ${items.length} bars`,
     totalVisibleRows: totalVisible,
-    representedRowCount: totalVisible,
+    representedRowCount,
     effectiveScaleType: scale.effectiveScaleType,
     axes: {
       x: {
@@ -1586,6 +1641,8 @@ function transformScatter3D(ctx: {
     };
   });
 
+  const skippedScatterCount = sampledIndices.length - parsedRows.length;
+
   return {
     mode: 'scatter3d',
     isValid: true,
@@ -1594,7 +1651,9 @@ function transformScatter3D(ctx: {
     dataStateKind: isSampled ? 'sampled' : 'raw',
     dataStateSummary: isSampled
       ? `Sampled ${items.length.toLocaleString('en-US')} of ${totalVisible.toLocaleString('en-US')} visible rows (${config.samplingStrategy})`
-      : `All ${items.length.toLocaleString('en-US')} raw points plotted across 3 dimensions`,
+      : skippedScatterCount > 0
+        ? `Plotted ${items.length.toLocaleString('en-US')} of ${totalVisible.toLocaleString('en-US')} visible rows (${skippedScatterCount.toLocaleString('en-US')} missing/non-numeric skipped)`
+        : `All ${items.length.toLocaleString('en-US')} raw points plotted across 3 dimensions`,
     totalVisibleRows: totalVisible,
     representedRowCount: items.length,
     effectiveScaleType: effectiveScale,
@@ -1830,15 +1889,17 @@ function transformRing3D(ctx: {
     };
   });
 
+  const representedRingRows = finalBuckets.reduce((acc, b) => acc + b.count, 0);
+
   return {
     mode: 'ring3d',
     isValid: true,
     validationMessage: null,
     warningMessage,
     dataStateKind: 'aggregated',
-    dataStateSummary: `Aggregated share of ${totalVisible.toLocaleString('en-US')} rows across ${items.length} slices (Total: ${formatCompactTick(grandTotal, yProfile?.baseType)}${yUnit ? ` ${yUnit}` : ''})`,
+    dataStateSummary: `Aggregated share of ${representedRingRows.toLocaleString('en-US')} of ${totalVisible.toLocaleString('en-US')} rows across ${items.length} slices (Total: ${formatCompactTick(grandTotal, yProfile?.baseType)}${yUnit ? ` ${yUnit}` : ''})`,
     totalVisibleRows: totalVisible,
-    representedRowCount: totalVisible,
+    representedRowCount: representedRingRows,
     effectiveScaleType: 'linear',
     axes: {
       x: {

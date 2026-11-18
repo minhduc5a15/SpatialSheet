@@ -36,6 +36,7 @@ import {
   createBlankWorkbook,
   deleteSheetColumn,
   deleteSheetRow,
+  filterAndSortRowsBuffer,
   renameSheetColumn,
   suggestChartConfig,
 } from './tabular';
@@ -99,6 +100,7 @@ export class AppStore {
   private columnStatsCacheFilterKey = '';
   private derivedSpatialCacheKey = '';
   private spatialStale = false;
+  private nextSheetIdSeq = 1;
 
   constructor(initialWorkbook?: WorkbookState, worker?: DataWorkerClient) {
     const initial = initialWorkbook ?? createBlankWorkbook();
@@ -266,8 +268,8 @@ export class AppStore {
       );
     }
 
-    // Fast synchronous computation for small sheets (< 2,500 visible rows)
-    if (this.visibleRowIndices.length < 2500) {
+    // Fast synchronous computation for small sheets or when worker is detached
+    if (this.visibleRowIndices.length < 2500 || !this.worker.hasWorker) {
       const stats = computeColumnStats(sheet, colIdx, this.visibleRowIndices);
       this.columnStatsCache.set(colIdx, stats);
       this.activeColumnStats = {
@@ -302,7 +304,6 @@ export class AppStore {
       })
       .then((stats) => {
         if (
-          !stats ||
           seq !== this.statsSeq ||
           reqVersion !== this.sheetVersion ||
           reqVisible !== this.visibleRowIndices
@@ -312,11 +313,14 @@ export class AppStore {
         const currentFilterKey = buildFilterKey(this.searchQuery, this.sort);
         if (currentFilterKey !== filterKey) return;
 
-        this.columnStatsCache.set(colIdx, stats);
+        const resolvedStats =
+          stats ?? computeColumnStats(sheet, colIdx, reqVisible);
+
+        this.columnStatsCache.set(colIdx, resolvedStats);
         if (this.getActiveStatsCol() === colIdx) {
           this.activeColumnStats = {
             colIndex: colIdx,
-            stats,
+            stats: resolvedStats,
             loading: false,
           };
           if (emitOnAsyncComplete) {
@@ -416,7 +420,7 @@ export class AppStore {
       return false;
     }
 
-    if (this.visibleRowIndices.length < 2500) {
+    if (this.visibleRowIndices.length < 2500 || !this.worker.hasWorker) {
       this.spatialStale = false;
       this.spatialTransformLoading = false;
       this.derivedSpatialCacheKey = nextKey;
@@ -452,16 +456,25 @@ export class AppStore {
       })
       .then((derived) => {
         if (
-          !derived ||
           seq !== this.spatialSeq ||
           reqVersion !== this.sheetVersion ||
           reqVisible !== this.visibleRowIndices
         ) {
           return;
         }
+        const resolvedDerived =
+          derived ??
+          transformSpatialDataset({
+            sheet: this.activeSheet,
+            visibleRowIndices: reqVisible,
+            profile: this.datasetProfile,
+            config: this.spatialConfig,
+            mode: this.chartConfig.spatialMode,
+            yColIndices: this.chartConfig.yColIndices,
+          });
         this.spatialTransformLoading = false;
         this.derivedSpatialCacheKey = nextKey;
-        this.derivedSpatialData = derived;
+        this.derivedSpatialData = resolvedDerived;
         this.reconcileSelectedSpatialItem();
         if (emitOnAsyncComplete) {
           this.emit(['spatialData']);
@@ -509,6 +522,7 @@ export class AppStore {
   }
 
   public highlightRowFromChart(rowIndex: number): void {
+    if (rowIndex < 0 || rowIndex >= this.activeSheet.rows.length) return;
     const nextCoord: CellCoord = {
       rowIndex,
       colIndex: this.chartConfig.yColIndices[0] ?? 0,
@@ -695,26 +709,74 @@ export class AppStore {
     void this.recomputeVisibleRows();
   }
 
+  private isRowVisible(vis: VisibleRowsSource, rowIndex: number): boolean {
+    if (rowIndex < 0 || rowIndex >= this.activeSheet.rows.length) return false;
+    if (
+      vis.length === this.activeSheet.rows.length &&
+      !this.hasActiveFilterOrSort()
+    ) {
+      return true;
+    }
+    for (let i = 0; i < vis.length; i++) {
+      if (vis[i] === rowIndex) return true;
+    }
+    return false;
+  }
+
   public async recomputeVisibleRows(): Promise<void> {
     this.cancelPendingSearchTimer();
     const seq = ++this.filterSeq;
     const reqVersion = this.sheetVersion;
+    const reqSearch = this.searchQuery;
+    const reqSort = this.sort;
     const sheet = this.activeSheet;
     const indices = await this.worker.filterAndSort({
       sheet,
       sheetVersion: reqVersion,
-      searchQuery: this.searchQuery,
-      sort: this.sort,
+      searchQuery: reqSearch,
+      sort: reqSort,
     });
     // Discard stale results if superseded by another filter/sort or sheet mutation
-    if (!indices || seq !== this.filterSeq || reqVersion !== this.sheetVersion) {
+    if (seq !== this.filterSeq || reqVersion !== this.sheetVersion) {
       return;
     }
-    this.visibleRowIndices = indices;
+    const resolvedIndices =
+      indices ?? filterAndSortRowsBuffer(sheet, reqSearch, reqSort);
+    this.visibleRowIndices = resolvedIndices;
+
+    let selectionChanged = false;
+    if (
+      this.highlightedRowIndex !== null &&
+      !this.isRowVisible(resolvedIndices, this.highlightedRowIndex)
+    ) {
+      this.highlightedRowIndex = null;
+      selectionChanged = true;
+    }
+    if (
+      this.selectedCell !== null &&
+      !this.isRowVisible(resolvedIndices, this.selectedCell.rowIndex)
+    ) {
+      this.selectedCell = null;
+      selectionChanged = true;
+    }
+    if (
+      this.selectedSpatialItem !== null &&
+      !this.isRowVisible(resolvedIndices, this.selectedSpatialItem.firstRowIndex) &&
+      !this.selectedSpatialItem.rowIndices.some((r) =>
+        this.isRowVisible(resolvedIndices, r)
+      )
+    ) {
+      this.selectedSpatialItem = null;
+    }
+
     this.clearColumnStatsCache();
     this.refreshActiveColumnStats(true);
     this.refreshDerivedSpatialData(true);
-    this.emit(['visibleRows', 'stats', 'spatialData']);
+    this.emit(
+      selectionChanged
+        ? ['visibleRows', 'selection', 'chartHighlight', 'stats', 'spatialData']
+        : ['visibleRows', 'stats', 'spatialData']
+    );
   }
 
   public addRow(): number {
@@ -1030,7 +1092,7 @@ export class AppStore {
     this.cancelPendingSearchTimer();
     const num = this.workbook.sheets.length + 1;
     const blank = createBlankWorkbook().sheets[0];
-    blank.id = `sheet-${Date.now()}`;
+    blank.id = `sheet-${Date.now()}-${this.nextSheetIdSeq++}`;
     blank.name = `Sheet ${num}`;
 
     const nextSheets = [...this.workbook.sheets, blank];

@@ -1,5 +1,6 @@
 import type {
   ChartConfig,
+  ChartRecommendation,
   ChartType,
   SheetData,
   VisibleRowsSource,
@@ -17,6 +18,7 @@ const MAX_CHART_POINTS = 32;
 export interface Chart2DCallbacks {
   onConfigChange: (config: ChartConfig) => void;
   onRowSelect: (rowIndex: number) => void;
+  onApplyRecommendation?: (rec: ChartRecommendation) => void;
 }
 
 interface DataPointRow {
@@ -68,6 +70,7 @@ export class InteractiveChart2D {
   private cachedPoints: DataPointRow[] = [];
   private cachedHasNumeric = false;
   private activeTooltipTarget: Element | null = null;
+  private recommendations: ChartRecommendation[] = [];
 
   constructor(container: HTMLElement, callbacks: Chart2DCallbacks) {
     this.container = container;
@@ -208,6 +211,19 @@ export class InteractiveChart2D {
         this.tooltipEl?.classList.add('hidden');
       });
     }
+
+    if (this.legendEl) {
+      this.legendEl.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement | null;
+        const btn = target?.closest<HTMLButtonElement>('[data-apply-2d-rec]');
+        if (btn) {
+          const rec = this.recommendations.find(
+            (r) => r.id === btn.dataset.apply2dRec
+          );
+          if (rec) this.callbacks.onApplyRecommendation?.(rec);
+        }
+      });
+    }
   }
 
   public setData(params: {
@@ -215,11 +231,15 @@ export class InteractiveChart2D {
     visibleRowIndices: VisibleRowsSource;
     config: ChartConfig;
     highlightedRowIndex: number | null;
+    recommendations?: ChartRecommendation[];
   }): void {
     this.sheet = params.sheet;
     this.visibleRowIndices = params.visibleRowIndices;
     this.config = params.config;
     this.highlightedRowIndex = params.highlightedRowIndex;
+    if (params.recommendations) {
+      this.recommendations = params.recommendations;
+    }
 
     this.renderControlsIfNeeded();
     this.renderChart();
@@ -442,9 +462,19 @@ export class InteractiveChart2D {
         ? `<span class="text-[11px] text-slate-400 font-mono-tabular">Sampled ${points.length} of ${totalVisible.toLocaleString('en-US')} rows</span>`
         : '';
 
+    const suggested2D = this.recommendations.find(
+      (r) =>
+        r.targetSurface === '2d' &&
+        r.chartType &&
+        r.chartType !== this.config.type
+    );
+    const recChipHtml = suggested2D
+      ? `<button type="button" data-apply-2d-rec="${escapeHtml(suggested2D.id)}" title="${escapeHtml(suggested2D.reason)}" class="text-[11px] font-medium text-blue-600 hover:text-blue-800 hover:underline cursor-pointer">Try ${escapeHtml(suggested2D.title)}</button>`
+      : '';
+
     this.legendEl.innerHTML = `
       <div class="flex flex-wrap items-center gap-x-4 gap-y-1">${legendItemsHtml}</div>
-      ${sampleNoteHtml}
+      <div class="flex items-center gap-3 ml-auto">${recChipHtml}${sampleNoteHtml}</div>
     `;
 
     if (this.config.type === 'pie') {

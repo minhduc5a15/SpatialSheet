@@ -3,20 +3,29 @@ import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
 import * as xb from 'xrblocks';
 import type {
-  ChartConfig,
-  SheetData,
+  DerivedSpatialDataset,
   SpatialChartMode,
-  VisibleRowsSource,
+  SpatialDataItem,
+  SpatialEnvironmentMode,
 } from '../types';
 import {
-  CHART_PALETTE,
-  formatDisplayNumber,
-  parseNumericValue,
-} from '../core/tabular';
-import {sampleChartIndices} from '../core/virtualWindow';
+  AxisSystem3D,
+  PLOT_BOTTOM_Y,
+  PLOT_DEPTH,
+  PLOT_HEIGHT,
+  PLOT_WIDTH,
+  normXToWorld,
+  normYToWorld,
+  normZToWorld,
+} from './AxisSystem3D';
 
 export interface SpatialStageCallbacks {
-  onRowSelect: (rowIndex: number) => void;
+  onItemSelect: (item: SpatialDataItem | null) => void;
+  onItemHover: (
+    item: SpatialDataItem | null,
+    clientX: number,
+    clientY: number
+  ) => void;
   onSpatialModeChange: (mode: SpatialChartMode) => void;
 }
 
@@ -26,16 +35,27 @@ interface BarNodeEntry {
   capMesh: THREE.Mesh;
   bodyMat: THREE.MeshStandardMaterial;
   capMat: THREE.MeshStandardMaterial;
-  rowIndex: number;
-  seriesIndex: number;
-  targetHeight: number;
-  currentHeight: number;
+  itemIndex: number;
   baseColor: THREE.Color;
-  isSphere: boolean;
+  zeroWorldY: number;
+  targetSignedH: number;
+  currentSignedH: number;
+  barWidth: number;
+  barDepth: number;
 }
 
+interface RingMeshEntry {
+  mesh: THREE.Mesh;
+  geometry: THREE.BufferGeometry;
+  material: THREE.MeshStandardMaterial;
+  itemIndex: number;
+  baseColor: THREE.Color;
+}
+
+const MAX_SCATTER_INSTANCES = 5000;
 const BLACK_COLOR = new THREE.Color(0x000000);
 const WHITE_COLOR = new THREE.Color(0xffffff);
+const HOVER_COLOR = new THREE.Color(0x38bdf8);
 
 export function detectSoftwareWebGL(): boolean {
   try {
@@ -58,16 +78,46 @@ export class SpatialDataStage extends xb.Script {
   private stageRoot = new THREE.Group();
   private dataGroup = new THREE.Group();
   private pedestalGroup = new THREE.Group();
+  private axisSystem = new AxisSystem3D();
 
-  // Reusable object/material pool (eliminates per-update GPU material allocation)
+  // Bar pool
   private barPool: BarNodeEntry[] = [];
   private activeBarCount = 0;
-  private pickTargetsCache: THREE.Object3D[] = [];
+  private barPickTargets: THREE.Object3D[] = [];
+
+  // Scatter InstancedMesh (up to 5,000 points in 1 draw call)
+  private scatterGeo = new THREE.SphereGeometry(0.022, 14, 10);
+  private scatterMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.25,
+    metalness: 0.15,
+  });
+  private scatterMesh: THREE.InstancedMesh;
+  private scatterDummy = new THREE.Object3D();
+  private scatterTempColor = new THREE.Color();
+
+  // Selection / Hover indicator for Scatter points
+  private haloGeo = new THREE.SphereGeometry(0.036, 16, 12);
+  private haloMat = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.9,
+  });
+  private selectionHalo = new THREE.Mesh(this.haloGeo, this.haloMat);
+  private dropLineGeo = new THREE.BufferGeometry();
+  private dropLineMat = new THREE.LineBasicMaterial({
+    color: 0x38bdf8,
+    transparent: true,
+    opacity: 0.75,
+  });
+  private dropLine: THREE.Line;
+
+  // Ring sector meshes
+  private ringEntries: RingMeshEntry[] = [];
 
   private sharedBarGeo = new THREE.BoxGeometry(1, 1, 1);
-  private sharedCapGeo = new THREE.BoxGeometry(1.04, 0.06, 1.04);
-  private sharedSphereGeo = new THREE.SphereGeometry(0.5, 20, 14);
-  private sharedStemGeo = new THREE.CylinderGeometry(0.08, 0.08, 1, 10);
+  private sharedCapGeo = new THREE.BoxGeometry(1.03, 0.014, 1.03);
   private pedestalGeos: THREE.BufferGeometry[] = [];
   private pedestalMats: THREE.Material[] = [];
 
@@ -76,27 +126,22 @@ export class SpatialDataStage extends xb.Script {
   private envTexture: THREE.Texture | null = null;
   private orbitControls: OrbitControls | null = null;
 
-  private sheet: SheetData | null = null;
-  private visibleRowIndices: VisibleRowsSource = [];
-  private config: ChartConfig = {
-    type: 'bar',
-    xColIndex: 0,
-    yColIndices: [1],
-    spatialMode: 'bar3d',
-  };
+  private derived: DerivedSpatialDataset | null = null;
+  private selectedItemId: number | null = null;
+  private hoveredItemId: number | null = null;
   private highlightedRowIndex: number | null = null;
-  private heightScale = 1.0;
+  private environmentMode: SpatialEnvironmentMode = 'clean';
+
   private embeddedVisible = false;
   private xrOrSimActive = false;
   private dirtyFrames = 15;
   private pendingMeshSync = false;
-  private lastMeshKey = '';
+  private lastDerivedRef: DerivedSpatialDataset | null = null;
 
-  // Built-in XR Blocks Spatial UI
+  // Built-in XR Blocks Spatial UI (used in XR / Simulator sessions)
   private spatialCard!: xb.UICard;
   private cardTitleText!: xb.UIText;
   private cardReadoutText!: xb.UIText;
-  private scaleLabelText!: xb.UIText;
   private modeButtons: Record<SpatialChartMode, xb.UIButton> = {} as Record<
     SpatialChartMode,
     xb.UIButton
@@ -104,47 +149,57 @@ export class SpatialDataStage extends xb.Script {
 
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
-  private onPointerClickBound = (e: PointerEvent) => this.handleCanvasClick(e);
+  private pointerDownPos: {x: number; y: number} | null = null;
+  private isOrbitDragging = false;
+  private lastHoverCheckAt = 0;
+
+  private onPointerDownBound = (e: PointerEvent) => this.handlePointerDown(e);
+  private onPointerMoveBound = (e: PointerEvent) => this.handlePointerMove(e);
+  private onPointerUpBound = (e: PointerEvent) => this.handlePointerUp(e);
+  private onPointerLeaveBound = () => this.clearHover();
 
   constructor(callbacks: SpatialStageCallbacks) {
     super();
     this.callbacks = callbacks;
+
+    this.scatterMesh = new THREE.InstancedMesh(
+      this.scatterGeo,
+      this.scatterMat,
+      MAX_SCATTER_INSTANCES
+    );
+    this.scatterMesh.count = 0;
+    this.scatterMesh.visible = false;
+    this.scatterMesh.frustumCulled = false;
+    this.scatterMesh.name = 'ScatterPointCloud';
+    this.scatterMesh.xb = {interactionEnabled: true};
+
+    this.selectionHalo.visible = false;
+    this.selectionHalo.xb = {pointerEvents: 'none'};
+
+    this.dropLineGeo.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, 0], 3)
+    );
+    this.dropLine = new THREE.Line(this.dropLineGeo, this.dropLineMat);
+    this.dropLine.visible = false;
+    this.dropLine.xb = {pointerEvents: 'none'};
+
     this.buildSpatialCard();
   }
 
   private buildSpatialCard(): void {
     this.cardTitleText = new xb.UIText({
-      text: '3D Data Stage',
-      style: {fontSize: 26, fontWeight: 'bold'},
+      text: '3D Analytical Stage',
+      style: {fontSize: 24, fontWeight: 'bold'},
     });
 
     this.cardReadoutText = new xb.UIText({
-      text: 'Tap or click a 3D bar to inspect row details.',
+      text: 'Select a bar, scatter point, or ring slice to inspect values.',
       style: {
-        fontSize: 16,
+        fontSize: 15,
         lineHeight: 1.35,
-        opacity: 0.85,
+        opacity: 0.9,
         whiteSpace: 'pre-line',
-      },
-    });
-
-    this.scaleLabelText = new xb.UIText({
-      text: 'Height Scale: 1.0x',
-      style: {fontSize: 16, fontWeight: 'bold'},
-    });
-
-    const scaleSlider = new xb.UISlider({
-      ariaLabel: 'Adjust 3D chart height scale',
-      min: 0.5,
-      max: 1.8,
-      step: 0.1,
-      value: 1.0,
-      style: {width: '100%', height: 36},
-      onInput: (val: number) => {
-        this.heightScale = val;
-        this.scaleLabelText.text = `Height Scale: ${val.toFixed(1)}x`;
-        this.lastMeshKey = '';
-        this.requestMeshSync();
       },
     });
 
@@ -156,7 +211,7 @@ export class SpatialDataStage extends xb.Script {
     });
 
     this.modeButtons.scatter3d = new xb.UIButton({
-      label: 'Scatter',
+      label: '3D Scatter',
       icon: 'scatter_plot',
       style: {flexGrow: 1},
       onClick: () => this.callbacks.onSpatialModeChange('scatter3d'),
@@ -170,7 +225,7 @@ export class SpatialDataStage extends xb.Script {
     });
 
     this.spatialCard = new xb.UICard({
-      size: {width: 0.62, height: 'auto'},
+      size: {width: 0.64, height: 'auto'},
       manipulation: true,
       edge: true,
       style: {
@@ -189,12 +244,10 @@ export class SpatialDataStage extends xb.Script {
             this.modeButtons.ring3d,
           ],
         }),
-        this.scaleLabelText,
-        scaleSlider,
       ],
     });
     this.spatialCard.name = 'Spatial Data Inspector Card';
-    this.spatialCard.position.set(1.05, 1.32, -1.55);
+    this.spatialCard.position.set(1.12, 1.36, -1.55);
     this.spatialCard.rotation.y = -0.32;
     this.spatialCard.visible = false;
   }
@@ -206,7 +259,7 @@ export class SpatialDataStage extends xb.Script {
     if (renderer instanceof THREE.WebGLRenderer) {
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.1;
+      renderer.toneMappingExposure = 1.08;
       renderer.setPixelRatio(
         this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2)
       );
@@ -217,7 +270,7 @@ export class SpatialDataStage extends xb.Script {
       scene.environment = this.envTexture;
       pmrem.dispose();
 
-      // Skip all WebGL rendering when 3D view is hidden; throttle idle draws on software WebGL
+      // Only render WebGL when 3D view is visible; pause idle draws on software WebGL
       xb.core.renderSceneOverride = (r, s, c) => {
         if (!this.embeddedVisible && !this.xrOrSimActive) return;
         if (this.isSoftwareGl && this.dirtyFrames <= 0) return;
@@ -228,13 +281,10 @@ export class SpatialDataStage extends xb.Script {
       };
     }
 
-    scene.background = new THREE.Color(0x0f172a);
-    scene.fog = new THREE.FogExp2(0x0f172a, 0.08);
-
-    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.6);
+    const hemiLight = new THREE.HemisphereLight(0xe2e8f0, 0x1e293b, 1.65);
     this.add(hemiLight);
 
-    const keyLight = new THREE.DirectionalLight(0xfff4e6, 2.2);
+    const keyLight = new THREE.DirectionalLight(0xfff7ed, 2.0);
     keyLight.position.set(3.2, 5.0, 2.8);
     if (!this.isSoftwareGl) {
       keyLight.castShadow = true;
@@ -243,18 +293,21 @@ export class SpatialDataStage extends xb.Script {
     }
     this.add(keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0x60a5fa, 0.9);
+    const rimLight = new THREE.DirectionalLight(0x60a5fa, 0.85);
     rimLight.position.set(-3.0, 2.5, -3.5);
     this.add(rimLight);
 
-    this.stageRoot.position.set(0, 0.85, -1.55);
+    this.stageRoot.position.set(0, 0.84, -1.55);
     this.add(this.stageRoot);
     this.stageRoot.add(this.pedestalGroup);
+    this.stageRoot.add(this.axisSystem);
     this.stageRoot.add(this.dataGroup);
+    this.dataGroup.add(this.scatterMesh, this.selectionHalo, this.dropLine);
 
     this.buildPedestal();
+    this.applyEnvironmentMode();
     this.setupEmbeddedCameraAndControls();
-    this.markDirty(8);
+    this.markDirty(12);
   }
 
   private setupEmbeddedCameraAndControls(): void {
@@ -266,21 +319,35 @@ export class SpatialDataStage extends xb.Script {
     renderer.domElement.style.height = '100%';
 
     camera.fov = 46;
-    camera.position.set(1.88, 2.38, 0.72);
-    camera.lookAt(0, 1.12, -1.55);
-    camera.updateProjectionMatrix();
-
     this.orbitControls = new OrbitControls(camera, renderer.domElement);
-    this.orbitControls.target.set(0, 1.12, -1.55);
     this.orbitControls.enableDamping = !this.isSoftwareGl;
     this.orbitControls.dampingFactor = 0.08;
-    this.orbitControls.minDistance = 1.1;
-    this.orbitControls.maxDistance = 4.8;
-    this.orbitControls.maxPolarAngle = Math.PI * 0.48;
+    this.orbitControls.minDistance = 1.05;
+    this.orbitControls.maxDistance = 5.2;
+    this.orbitControls.maxPolarAngle = Math.PI * 0.52;
     this.orbitControls.addEventListener('change', () => this.markDirty(4));
-    this.orbitControls.update();
 
-    renderer.domElement.addEventListener('pointerdown', this.onPointerClickBound);
+    this.resetCamera();
+
+    const dom = renderer.domElement;
+    dom.addEventListener('pointerdown', this.onPointerDownBound);
+    dom.addEventListener('pointermove', this.onPointerMoveBound);
+    dom.addEventListener('pointerup', this.onPointerUpBound);
+    dom.addEventListener('pointerleave', this.onPointerLeaveBound);
+  }
+
+  public resetCamera(): void {
+    const camera = xb.core.camera;
+    if (!camera) return;
+    camera.position.set(1.92, 2.28, 0.86);
+    if (this.orbitControls) {
+      this.orbitControls.target.set(0, 1.3, -1.55);
+      this.orbitControls.update();
+    } else {
+      camera.lookAt(0, 1.3, -1.55);
+    }
+    camera.updateProjectionMatrix();
+    this.markDirty(8);
   }
 
   private buildPedestal(): void {
@@ -304,7 +371,7 @@ export class SpatialDataStage extends xb.Script {
     }
     this.shadowTexture = new THREE.CanvasTexture(shadowCanvas);
 
-    const shadowGeo = new THREE.CircleGeometry(1.45, 36);
+    const shadowGeo = new THREE.CircleGeometry(1.48, 36);
     const shadowMat = new THREE.MeshBasicMaterial({
       map: this.shadowTexture,
       transparent: true,
@@ -318,7 +385,7 @@ export class SpatialDataStage extends xb.Script {
     contactShadow.position.y = -0.095;
     contactShadow.xb = {pointerEvents: 'none'};
 
-    const plinthGeo = new THREE.BoxGeometry(1.86, 0.09, 1.36);
+    const plinthGeo = new THREE.BoxGeometry(1.96, 0.09, 1.44);
     const plinthMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
       roughness: 0.78,
@@ -332,28 +399,14 @@ export class SpatialDataStage extends xb.Script {
     plinth.receiveShadow = !this.isSoftwareGl;
     plinth.xb = {pointerEvents: 'none'};
 
-    const trimGeo = new THREE.BoxGeometry(1.9, 0.024, 1.4);
-    const trimMat = new THREE.MeshStandardMaterial({
-      color: 0x64748b,
-      roughness: 0.28,
-      metalness: 0.78,
-    });
-    this.pedestalGeos.push(trimGeo);
-    this.pedestalMats.push(trimMat);
-
-    const trim = new THREE.Mesh(trimGeo, trimMat);
-    trim.position.y = -0.008;
-    trim.xb = {pointerEvents: 'none'};
-
-    const gridCanvas = document.createElement('canvas');
-    gridCanvas.width = 512;
-    gridCanvas.height = 512;
-    const gctx = gridCanvas.getContext('2d');
+    const deckCanvas = document.createElement('canvas');
+    deckCanvas.width = 512;
+    deckCanvas.height = 512;
+    const gctx = deckCanvas.getContext('2d');
     if (gctx) {
       gctx.fillStyle = '#0f172a';
       gctx.fillRect(0, 0, 512, 512);
-
-      gctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+      gctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
       gctx.lineWidth = 1;
       for (let i = 0; i <= 16; i++) {
         const p = (i / 16) * 512;
@@ -361,60 +414,53 @@ export class SpatialDataStage extends xb.Script {
         gctx.moveTo(p, 0);
         gctx.lineTo(p, 512);
         gctx.stroke();
-
         gctx.beginPath();
         gctx.moveTo(0, p);
         gctx.lineTo(512, p);
         gctx.stroke();
       }
-
-      gctx.strokeStyle = 'rgba(59, 130, 246, 0.55)';
-      gctx.lineWidth = 2;
-      gctx.strokeRect(4, 4, 504, 504);
     }
-
-    this.gridTexture = new THREE.CanvasTexture(gridCanvas);
+    this.gridTexture = new THREE.CanvasTexture(deckCanvas);
     this.gridTexture.colorSpace = THREE.SRGBColorSpace;
     this.gridTexture.anisotropy = maxAniso;
 
-    const deckGeo = new THREE.BoxGeometry(1.76, 0.014, 1.26);
+    const deckGeo = new THREE.BoxGeometry(1.88, 0.014, 1.36);
     const deckMat = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       map: this.gridTexture,
-      roughness: 0.42,
-      metalness: 0.15,
+      roughness: 0.48,
+      metalness: 0.1,
     });
     this.pedestalGeos.push(deckGeo);
     this.pedestalMats.push(deckMat);
 
     const deck = new THREE.Mesh(deckGeo, deckMat);
-    deck.position.y = 0.008;
+    deck.position.y = 0.004;
     deck.receiveShadow = !this.isSoftwareGl;
     deck.xb = {pointerEvents: 'none'};
 
-    const postGeo = new THREE.CylinderGeometry(0.012, 0.015, 0.09, 12);
-    const postMat = new THREE.MeshStandardMaterial({
-      color: 0x94a3b8,
-      roughness: 0.22,
-      metalness: 0.82,
-    });
-    this.pedestalGeos.push(postGeo);
-    this.pedestalMats.push(postMat);
+    this.pedestalGroup.add(contactShadow, plinth, deck);
+  }
 
-    const corners: [number, number][] = [
-      [-0.86, -0.61],
-      [0.86, -0.61],
-      [-0.86, 0.61],
-      [0.86, 0.61],
-    ];
-    for (const [cx, cz] of corners) {
-      const post = new THREE.Mesh(postGeo, postMat);
-      post.position.set(cx, 0.04, cz);
-      post.xb = {pointerEvents: 'none'};
-      this.pedestalGroup.add(post);
+  private applyEnvironmentMode(): void {
+    const scene = xb.core.scene;
+    if (!scene) return;
+    if (this.environmentMode === 'studio') {
+      scene.background = new THREE.Color(0x0f172a);
+      scene.fog = new THREE.FogExp2(0x0f172a, 0.075);
+      this.pedestalGroup.visible = true;
+    } else {
+      scene.background = new THREE.Color(0x0b1120);
+      scene.fog = null;
+      this.pedestalGroup.visible = false;
     }
+    this.markDirty(6);
+  }
 
-    this.pedestalGroup.add(contactShadow, plinth, trim, deck);
+  public setEnvironmentMode(mode: SpatialEnvironmentMode): void {
+    if (this.environmentMode === mode) return;
+    this.environmentMode = mode;
+    this.applyEnvironmentMode();
   }
 
   public setEmbeddedVisible(visible: boolean): void {
@@ -443,41 +489,50 @@ export class SpatialDataStage extends xb.Script {
     this.markDirty(8);
   }
 
-  public setData(params: {
-    sheet: SheetData;
-    visibleRowIndices: VisibleRowsSource;
-    config: ChartConfig;
+  public setDerivedData(params: {
+    derived: DerivedSpatialDataset;
+    selectedItem: SpatialDataItem | null;
     highlightedRowIndex: number | null;
+    environmentMode: SpatialEnvironmentMode;
   }): void {
-    const meshKey = `${params.sheet.id}|${params.sheet.rows.length}|${params.visibleRowIndices.length}|${params.config.xColIndex}|${params.config.yColIndices.join(',')}|${params.config.spatialMode}|${this.heightScale.toFixed(2)}`;
-    const dataChanged =
-      this.sheet !== params.sheet ||
-      this.visibleRowIndices !== params.visibleRowIndices ||
-      meshKey !== this.lastMeshKey;
-
-    this.sheet = params.sheet;
-    this.visibleRowIndices = params.visibleRowIndices;
-    this.config = params.config;
+    const dataChanged = this.lastDerivedRef !== params.derived;
+    this.derived = params.derived;
+    this.selectedItemId = params.selectedItem?.id ?? null;
     this.highlightedRowIndex = params.highlightedRowIndex;
 
-    this.cardTitleText.text = params.sheet.name;
+    if (this.environmentMode !== params.environmentMode) {
+      this.environmentMode = params.environmentMode;
+      this.applyEnvironmentMode();
+    }
+
     this.updateSpatialReadout();
 
     if (dataChanged) {
-      this.lastMeshKey = meshKey;
+      this.lastDerivedRef = params.derived;
+      this.hoveredItemId = null;
       this.requestMeshSync();
     } else {
-      this.applyHighlightStyles();
+      this.applySelectionAndHoverStyles();
+      this.markDirty(6);
     }
   }
 
-  /** Fast highlight-only update (zero mesh rebuild or height reset). */
-  public setHighlight(highlightedRowIndex: number | null): void {
-    if (this.highlightedRowIndex === highlightedRowIndex) return;
+  public setHighlight(
+    selectedItem: SpatialDataItem | null,
+    highlightedRowIndex: number | null
+  ): void {
+    const nextId = selectedItem?.id ?? null;
+    if (
+      this.selectedItemId === nextId &&
+      this.highlightedRowIndex === highlightedRowIndex
+    ) {
+      return;
+    }
+    this.selectedItemId = nextId;
     this.highlightedRowIndex = highlightedRowIndex;
     this.updateSpatialReadout();
     if (this.embeddedVisible || this.xrOrSimActive) {
-      this.applyHighlightStyles();
+      this.applySelectionAndHoverStyles();
       this.markDirty(6);
     }
   }
@@ -492,30 +547,81 @@ export class SpatialDataStage extends xb.Script {
 
   private flushPendingSync(): void {
     this.pendingMeshSync = false;
-    this.syncChartNodes();
+    this.syncVisualization();
     this.markDirty(30);
   }
 
   private updateSpatialReadout(): void {
-    if (!this.sheet) return;
-    if (this.highlightedRowIndex !== null) {
-      const row = this.sheet.rows[this.highlightedRowIndex] ?? [];
-      const xLabel =
-        row[this.config.xColIndex] ?? `Row ${this.highlightedRowIndex + 1}`;
-      const metrics = this.config.yColIndices
-        .map((cIdx) => {
-          const name = this.sheet!.columns[cIdx] ?? '';
-          const val = row[cIdx] ?? '0';
-          return `${name}: ${val}`;
-        })
-        .join('\n');
-      this.cardReadoutText.text = `Selected: ${xLabel}\n${metrics}`;
+    if (!this.derived) return;
+    const d = this.derived;
+    this.cardTitleText.text = `${d.axes.y.title} · ${d.mode.toUpperCase()}`;
+
+    const selected =
+      (this.selectedItemId !== null
+        ? d.items.find((it) => it.id === this.selectedItemId)
+        : null) ??
+      (this.highlightedRowIndex !== null
+        ? d.items.find(
+            (it) =>
+              it.firstRowIndex === this.highlightedRowIndex ||
+              it.rowIndices.includes(this.highlightedRowIndex!)
+          )
+        : null);
+
+    if (selected) {
+      const unitSuffix = selected.yUnit ? ` ${selected.yUnit}` : '';
+      this.cardReadoutText.text = `${selected.label} (${selected.seriesLabel})\nValue: ${selected.yValue.toLocaleString('en-US', {maximumFractionDigits: 3})}${unitSuffix} · Records: ${selected.recordCount.toLocaleString('en-US')}`;
+    } else if (!d.isValid && d.validationMessage) {
+      this.cardReadoutText.text = d.validationMessage;
     } else {
-      this.cardReadoutText.text = `${this.visibleRowIndices.length.toLocaleString('en-US')} rows · Tap a 3D bar for details.`;
+      this.cardReadoutText.text = d.dataStateSummary;
     }
   }
 
-  private getOrAcquirePoolEntry(index: number): BarNodeEntry {
+  private syncVisualization(): void {
+    const derived = this.derived;
+    if (!derived) return;
+
+    this.axisSystem.updateFromDerived(derived);
+
+    if (!derived.isValid || derived.items.length === 0) {
+      this.hideAllDataVisuals();
+      return;
+    }
+
+    if (derived.mode === 'scatter3d') {
+      this.hideUnusedBars(0);
+      this.disposeRingEntries();
+      this.syncScatterInstances(derived);
+    } else if (derived.mode === 'ring3d') {
+      this.hideUnusedBars(0);
+      this.scatterMesh.visible = false;
+      this.scatterMesh.count = 0;
+      this.selectionHalo.visible = false;
+      this.dropLine.visible = false;
+      this.syncRingSectors(derived);
+    } else {
+      this.scatterMesh.visible = false;
+      this.scatterMesh.count = 0;
+      this.selectionHalo.visible = false;
+      this.dropLine.visible = false;
+      this.disposeRingEntries();
+      this.syncBars(derived);
+    }
+
+    this.applySelectionAndHoverStyles();
+  }
+
+  private hideAllDataVisuals(): void {
+    this.hideUnusedBars(0);
+    this.scatterMesh.visible = false;
+    this.scatterMesh.count = 0;
+    this.selectionHalo.visible = false;
+    this.dropLine.visible = false;
+    this.disposeRingEntries();
+  }
+
+  private getOrAcquireBarEntry(index: number): BarNodeEntry {
     if (index < this.barPool.length) {
       const existing = this.barPool[index];
       existing.group.visible = true;
@@ -525,15 +631,15 @@ export class SpatialDataStage extends xb.Script {
     const group = new THREE.Group();
     const bodyMat = new THREE.MeshStandardMaterial({
       color: 0x2563eb,
-      roughness: 0.32,
-      metalness: 0.2,
+      roughness: 0.34,
+      metalness: 0.16,
       emissive: 0x000000,
       emissiveIntensity: 0,
     });
     const capMat = new THREE.MeshStandardMaterial({
       color: 0x60a5fa,
-      roughness: 0.15,
-      metalness: 0.45,
+      roughness: 0.18,
+      metalness: 0.35,
     });
 
     const bodyMesh = new THREE.Mesh(this.sharedBarGeo, bodyMat);
@@ -553,242 +659,414 @@ export class SpatialDataStage extends xb.Script {
       capMesh,
       bodyMat,
       capMat,
-      rowIndex: 0,
-      seriesIndex: 0,
-      targetHeight: 0.02,
-      currentHeight: 0.02,
+      itemIndex: 0,
       baseColor: new THREE.Color(0x2563eb),
-      isSphere: false,
+      zeroWorldY: PLOT_BOTTOM_Y,
+      targetSignedH: 0.02,
+      currentSignedH: 0.02,
+      barWidth: 0.08,
+      barDepth: 0.08,
     };
     this.barPool.push(entry);
     return entry;
   }
 
-  private configurePoolEntry(
-    idx: number,
-    opts: {
-      rowIndex: number;
-      seriesIndex: number;
-      height: number;
-      width: number;
-      depth: number;
-      px: number;
-      py: number;
-      pz: number;
-      colorHex: string;
-      isSphere: boolean;
+  private syncBars(derived: DerivedSpatialDataset): void {
+    const items = derived.items;
+    const xCount = Math.max(1, items[0]?.xBucketCount ?? items.length);
+    const zCount = Math.max(1, items[0]?.zBucketCount ?? 1);
+    const cellW = PLOT_WIDTH / xCount;
+    const cellD = PLOT_DEPTH / zCount;
+    const barW = Math.max(0.028, Math.min(0.15, cellW * 0.68));
+    const barD = Math.max(0.04, Math.min(0.18, cellD * 0.64));
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const entry = this.getOrAcquireBarEntry(i);
+      const px = normXToWorld(item.xNorm);
+      const pz = normZToWorld(item.zNorm);
+      const zeroY = normYToWorld(item.yZeroNorm);
+      const valY = normYToWorld(item.yNorm);
+      const signedH = valY - zeroY;
+      // Preserve tiny visible nub for exact 0 values so zero bars remain clickable/inspectable
+      const targetSignedH =
+        Math.abs(signedH) < 0.01 ? (signedH < 0 ? -0.01 : 0.01) : signedH;
+
+      entry.itemIndex = i;
+      entry.baseColor.set(item.colorHex);
+      entry.zeroWorldY = zeroY;
+      entry.targetSignedH = targetSignedH;
+      entry.barWidth = barW;
+      entry.barDepth = barD;
+
+      // Snap near-zero / inverted bars smoothly toward baseline
+      if (Math.sign(entry.currentSignedH) !== Math.sign(targetSignedH)) {
+        entry.currentSignedH = targetSignedH >= 0 ? 0.01 : -0.01;
+      }
+
+      entry.group.position.set(px, zeroY, pz);
+      entry.bodyMesh.userData.itemId = item.id;
+      entry.capMesh.userData.itemId = item.id;
+      entry.group.userData.itemId = item.id;
+      this.positionBarGeometry(entry);
     }
-  ): void {
-    const entry = this.getOrAcquirePoolEntry(idx);
-    const prevSphere = entry.isSphere;
-    entry.isSphere = opts.isSphere;
-    entry.rowIndex = opts.rowIndex;
-    entry.seriesIndex = opts.seriesIndex;
-    entry.targetHeight = opts.height;
-    entry.baseColor.set(opts.colorHex);
 
-    if (prevSphere !== opts.isSphere) {
-      entry.bodyMesh.geometry = opts.isSphere
-        ? this.sharedStemGeo
-        : this.sharedBarGeo;
-      entry.capMesh.geometry = opts.isSphere
-        ? this.sharedSphereGeo
-        : this.sharedCapGeo;
-    }
-
-    entry.group.position.set(opts.px, opts.py, opts.pz);
-    entry.bodyMesh.scale.set(
-      opts.isSphere ? 0.14 : opts.width,
-      entry.currentHeight,
-      opts.isSphere ? 0.14 : opts.depth
-    );
-    entry.capMesh.scale.set(
-      opts.width,
-      opts.isSphere ? opts.width : 0.02,
-      opts.depth
-    );
-
-    entry.bodyMesh.userData.rowIndex = opts.rowIndex;
-    entry.capMesh.userData.rowIndex = opts.rowIndex;
-    entry.group.userData.rowIndex = opts.rowIndex;
+    this.hideUnusedBars(items.length);
   }
 
-  private syncChartNodes(): void {
-    if (!this.sheet) {
-      this.hideUnusedPoolEntries(0);
-      return;
-    }
+  private positionBarGeometry(entry: BarNodeEntry): void {
+    const absH = Math.max(0.008, Math.abs(entry.currentSignedH));
+    const sign = entry.currentSignedH >= 0 ? 1 : -1;
 
-    const rows = sampleChartIndices(this.visibleRowIndices, 16);
-    const yCols = this.config.yColIndices;
-    if (rows.length === 0 || yCols.length === 0) {
-      this.hideUnusedPoolEntries(0);
-      return;
-    }
+    entry.bodyMesh.scale.set(entry.barWidth, absH, entry.barDepth);
+    entry.bodyMesh.position.y = sign * (absH * 0.5);
 
-    let maxVal = 1;
-    const matrix: number[][] = rows.map((rowIndex) =>
-      yCols.map((colIdx) => {
-        const v = Math.max(
-          0,
-          parseNumericValue(this.sheet!.rows[rowIndex]?.[colIdx] ?? '').value ?? 0
-        );
-        if (v > maxVal) maxVal = v;
-        return v;
-      })
-    );
-
-    const mode = this.config.spatialMode;
-    const deckW = 1.56;
-    const deckD = 1.04;
-    const maxBarHeight = 0.85 * this.heightScale;
-    let poolIdx = 0;
-
-    if (mode === 'ring3d') {
-      const radius = 0.44;
-      const totalItems = rows.length;
-      const arcStep = (Math.PI * 2) / Math.max(1, totalItems);
-      const colSize = Math.min(
-        0.11,
-        (Math.PI * 2 * radius) / (totalItems * 2.2)
-      );
-
-      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-        const rowIndex = rows[rIdx];
-        const angle = rIdx * arcStep - Math.PI / 2;
-        const val = matrix[rIdx][0] ?? 0;
-        const h = Math.max(0.04, (val / maxVal) * maxBarHeight);
-        this.configurePoolEntry(poolIdx++, {
-          rowIndex,
-          seriesIndex: 0,
-          height: h,
-          width: colSize,
-          depth: colSize,
-          px: Math.cos(angle) * radius,
-          py: 0.015,
-          pz: Math.sin(angle) * radius,
-          colorHex: CHART_PALETTE[rIdx % CHART_PALETTE.length],
-          isSphere: false,
-        });
-      }
-    } else if (mode === 'scatter3d') {
-      const xStep = rows.length > 1 ? deckW / (rows.length - 1) : 0;
-      const zStep = yCols.length > 1 ? (deckD * 0.65) / (yCols.length - 1) : 0;
-
-      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-        const rowIndex = rows[rIdx];
-        const px = rows.length > 1 ? -deckW / 2 + rIdx * xStep : 0;
-        for (let sIdx = 0; sIdx < yCols.length; sIdx++) {
-          const val = matrix[rIdx][sIdx] ?? 0;
-          const h = Math.max(0.08, (val / maxVal) * maxBarHeight);
-          const pz = yCols.length > 1 ? -deckD * 0.32 + sIdx * zStep : 0;
-          this.configurePoolEntry(poolIdx++, {
-            rowIndex,
-            seriesIndex: sIdx,
-            height: h,
-            width: 0.085,
-            depth: 0.085,
-            px,
-            py: 0.015,
-            pz,
-            colorHex: CHART_PALETTE[sIdx % CHART_PALETTE.length],
-            isSphere: true,
-          });
-        }
-      }
-    } else {
-      const xStep = deckW / Math.max(1, rows.length);
-      const zStep = deckD / Math.max(1, yCols.length);
-      const barW = Math.min(0.14, xStep * 0.64);
-      const barD = Math.min(0.18, zStep * 0.64);
-
-      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
-        const rowIndex = rows[rIdx];
-        const px = -deckW / 2 + (rIdx + 0.5) * xStep;
-        for (let sIdx = 0; sIdx < yCols.length; sIdx++) {
-          const val = matrix[rIdx][sIdx] ?? 0;
-          const h = Math.max(0.035, (val / maxVal) * maxBarHeight);
-          const pz = -deckD / 2 + (sIdx + 0.5) * zStep;
-          this.configurePoolEntry(poolIdx++, {
-            rowIndex,
-            seriesIndex: sIdx,
-            height: h,
-            width: barW,
-            depth: barD,
-            px,
-            py: 0.015,
-            pz,
-            colorHex: CHART_PALETTE[sIdx % CHART_PALETTE.length],
-            isSphere: false,
-          });
-        }
-      }
-    }
-
-    this.hideUnusedPoolEntries(poolIdx);
-    this.applyHighlightStyles();
+    entry.capMesh.scale.set(entry.barWidth, 1, entry.barDepth);
+    entry.capMesh.position.y = sign * (absH + 0.008);
   }
 
-  private hideUnusedPoolEntries(activeCount: number): void {
+  private hideUnusedBars(activeCount: number): void {
     this.activeBarCount = activeCount;
-    this.pickTargetsCache.length = 0;
+    this.barPickTargets.length = 0;
     for (let i = 0; i < this.barPool.length; i++) {
       const entry = this.barPool[i];
       if (i < activeCount) {
         entry.group.visible = true;
-        this.pickTargetsCache.push(entry.bodyMesh, entry.capMesh);
+        this.barPickTargets.push(entry.bodyMesh, entry.capMesh);
       } else {
         entry.group.visible = false;
       }
     }
   }
 
-  private applyHighlightStyles(): void {
-    for (let i = 0; i < this.activeBarCount; i++) {
-      const entry = this.barPool[i];
-      const isSel = this.highlightedRowIndex === entry.rowIndex;
+  private syncScatterInstances(derived: DerivedSpatialDataset): void {
+    const items = derived.items;
+    const count = Math.min(items.length, MAX_SCATTER_INSTANCES);
+    this.scatterMesh.count = count;
+    this.scatterMesh.visible = count > 0;
 
-      entry.bodyMat.color.copy(entry.baseColor);
-      entry.bodyMat.roughness = isSel ? 0.18 : 0.32;
-      entry.bodyMat.emissive.copy(isSel ? entry.baseColor : BLACK_COLOR);
-      entry.bodyMat.emissiveIntensity = isSel ? 0.35 : 0;
+    // Scale sphere radius slightly inversely with density so sparse clouds stay clear and dense clouds don't clump
+    const scaleFactor = count > 1500 ? 0.58 : count > 400 ? 0.78 : 1.05;
 
-      if (isSel) {
-        entry.capMat.color.copy(WHITE_COLOR);
+    for (let i = 0; i < count; i++) {
+      const item = items[i];
+      this.scatterDummy.position.set(
+        normXToWorld(item.xNorm),
+        normYToWorld(item.yNorm),
+        normZToWorld(item.zNorm)
+      );
+      this.scatterDummy.scale.setScalar(scaleFactor);
+      this.scatterDummy.updateMatrix();
+      this.scatterMesh.setMatrixAt(i, this.scatterDummy.matrix);
+
+      this.scatterTempColor.set(item.colorHex);
+      this.scatterMesh.setColorAt(i, this.scatterTempColor);
+    }
+
+    this.scatterMesh.instanceMatrix.needsUpdate = true;
+    if (this.scatterMesh.instanceColor) {
+      this.scatterMesh.instanceColor.needsUpdate = true;
+    }
+    this.scatterMesh.computeBoundingSphere();
+  }
+
+  private syncRingSectors(derived: DerivedSpatialDataset): void {
+    this.disposeRingEntries();
+    const innerR = 0.28;
+    const outerR = 0.6;
+    const gapAngle = derived.items.length > 1 ? 0.022 : 0;
+
+    for (let i = 0; i < derived.items.length; i++) {
+      const item = derived.items[i];
+      if (item.angleStart === undefined || item.angleEnd === undefined) continue;
+
+      const span = item.angleEnd - item.angleStart;
+      const effectiveGap = Math.min(gapAngle, span * 0.25);
+      const a0 = item.angleStart + effectiveGap * 0.5;
+      const a1 = item.angleEnd - effectiveGap * 0.5;
+      if (a1 <= a0) continue;
+
+      const shape = new THREE.Shape();
+      // Shape XY maps onto XZ when rotated -PI/2 around X (negate angle for right-handed XZ match)
+      shape.absarc(0, 0, outerR, -a0, -a1, true);
+      shape.lineTo(Math.cos(-a1) * innerR, Math.sin(-a1) * innerR);
+      shape.absarc(0, 0, innerR, -a1, -a0, false);
+      shape.closePath();
+
+      const extrudeDepth = 0.06 + item.yNorm * 0.18;
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth: extrudeDepth,
+        bevelEnabled: true,
+        bevelThickness: 0.008,
+        bevelSize: 0.008,
+        bevelSegments: 2,
+        curveSegments: 28,
+      });
+      geometry.rotateX(-Math.PI / 2);
+
+      const baseColor = new THREE.Color(item.colorHex);
+      const material = new THREE.MeshStandardMaterial({
+        color: baseColor,
+        roughness: 0.3,
+        metalness: 0.18,
+        emissive: 0x000000,
+        emissiveIntensity: 0,
+      });
+
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.y = PLOT_BOTTOM_Y;
+      mesh.castShadow = !this.isSoftwareGl;
+      mesh.receiveShadow = !this.isSoftwareGl;
+      mesh.userData.itemId = item.id;
+      mesh.xb = {interactionEnabled: true};
+
+      this.dataGroup.add(mesh);
+      this.ringEntries.push({
+        mesh,
+        geometry,
+        material,
+        itemIndex: i,
+        baseColor,
+      });
+    }
+  }
+
+  private disposeRingEntries(): void {
+    for (const r of this.ringEntries) {
+      r.mesh.removeFromParent();
+      r.geometry.dispose();
+      r.material.dispose();
+    }
+    this.ringEntries = [];
+  }
+
+  private isItemSelectedOrHighlighted(item: SpatialDataItem): boolean {
+    if (this.selectedItemId !== null && item.id === this.selectedItemId) {
+      return true;
+    }
+    if (
+      this.highlightedRowIndex !== null &&
+      (item.firstRowIndex === this.highlightedRowIndex ||
+        item.rowIndices.includes(this.highlightedRowIndex))
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private applySelectionAndHoverStyles(): void {
+    const derived = this.derived;
+    if (!derived) return;
+
+    if (derived.mode === 'bar3d') {
+      for (let i = 0; i < this.activeBarCount; i++) {
+        const entry = this.barPool[i];
+        const item = derived.items[entry.itemIndex];
+        if (!item) continue;
+        const isSel = this.isItemSelectedOrHighlighted(item);
+        const isHover = this.hoveredItemId === item.id;
+
+        entry.bodyMat.color.copy(entry.baseColor);
+        entry.bodyMat.roughness = isSel || isHover ? 0.16 : 0.34;
+        if (isSel) {
+          entry.bodyMat.emissive.copy(entry.baseColor);
+          entry.bodyMat.emissiveIntensity = 0.42;
+          entry.capMat.color.copy(WHITE_COLOR);
+        } else if (isHover) {
+          entry.bodyMat.emissive.copy(HOVER_COLOR);
+          entry.bodyMat.emissiveIntensity = 0.28;
+          entry.capMat.color.copy(HOVER_COLOR);
+        } else {
+          entry.bodyMat.emissive.copy(BLACK_COLOR);
+          entry.bodyMat.emissiveIntensity = 0;
+          entry.capMat.color.copy(entry.baseColor).offsetHSL(0, 0, 0.14);
+        }
+      }
+      return;
+    }
+
+    if (derived.mode === 'ring3d') {
+      for (const r of this.ringEntries) {
+        const item = derived.items[r.itemIndex];
+        if (!item) continue;
+        const isSel = this.isItemSelectedOrHighlighted(item);
+        const isHover = this.hoveredItemId === item.id;
+        r.material.emissive.copy(
+          isSel ? r.baseColor : isHover ? HOVER_COLOR : BLACK_COLOR
+        );
+        r.material.emissiveIntensity = isSel ? 0.42 : isHover ? 0.25 : 0;
+        r.mesh.position.y = PLOT_BOTTOM_Y + (isSel ? 0.032 : isHover ? 0.015 : 0);
+      }
+      return;
+    }
+
+    if (derived.mode === 'scatter3d') {
+      const targetId = this.hoveredItemId ?? this.selectedItemId;
+      const targetItem =
+        (targetId !== null
+          ? derived.items.find((it) => it.id === targetId)
+          : null) ??
+        (this.highlightedRowIndex !== null
+          ? derived.items.find((it) => it.firstRowIndex === this.highlightedRowIndex)
+          : null);
+
+      if (targetItem) {
+        const px = normXToWorld(targetItem.xNorm);
+        const py = normYToWorld(targetItem.yNorm);
+        const pz = normZToWorld(targetItem.zNorm);
+
+        this.selectionHalo.position.set(px, py, pz);
+        this.selectionHalo.visible = true;
+        this.haloMat.color.set(
+          this.hoveredItemId === targetItem.id ? 0x38bdf8 : 0xffffff
+        );
+
+        const posAttr = this.dropLineGeo.getAttribute(
+          'position'
+        ) as THREE.BufferAttribute;
+        posAttr.setXYZ(0, px, PLOT_BOTTOM_Y, pz);
+        posAttr.setXYZ(1, px, py, pz);
+        posAttr.needsUpdate = true;
+        this.dropLine.visible = true;
       } else {
-        entry.capMat.color.copy(entry.baseColor).offsetHSL(0, 0, 0.14);
+        this.selectionHalo.visible = false;
+        this.dropLine.visible = false;
       }
     }
   }
 
-  private handleCanvasClick(event: PointerEvent): void {
-    if (this.xrOrSimActive) return;
+  private pickItemAtClientPos(
+    clientX: number,
+    clientY: number
+  ): SpatialDataItem | null {
     const renderer = xb.core.renderer;
     const camera = xb.core.camera;
-    if (!(renderer instanceof THREE.WebGLRenderer) || !camera) return;
+    const derived = this.derived;
+    if (
+      !(renderer instanceof THREE.WebGLRenderer) ||
+      !camera ||
+      !derived ||
+      !derived.isValid
+    ) {
+      return null;
+    }
 
     const rect = renderer.domElement.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
+    if (rect.width === 0 || rect.height === 0) return null;
 
-    this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
+    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, camera);
-    const hits = this.raycaster.intersectObjects(this.pickTargetsCache, false);
-    if (hits.length > 0) {
-      const rowIndex = hits[0].object.userData?.rowIndex;
-      if (typeof rowIndex === 'number') {
-        this.callbacks.onRowSelect(rowIndex);
+
+    if (derived.mode === 'scatter3d' && this.scatterMesh.visible) {
+      const hits = this.raycaster.intersectObject(this.scatterMesh, false);
+      if (hits.length > 0 && hits[0].instanceId !== undefined) {
+        return derived.items[hits[0].instanceId] ?? null;
+      }
+      return null;
+    }
+
+    if (derived.mode === 'ring3d' && this.ringEntries.length > 0) {
+      const meshes = this.ringEntries.map((r) => r.mesh);
+      const hits = this.raycaster.intersectObjects(meshes, false);
+      if (hits.length > 0) {
+        const id = hits[0].object.userData?.itemId;
+        if (typeof id === 'number') {
+          return derived.items.find((it) => it.id === id) ?? null;
+        }
+      }
+      return null;
+    }
+
+    if (this.barPickTargets.length > 0) {
+      const hits = this.raycaster.intersectObjects(this.barPickTargets, false);
+      if (hits.length > 0) {
+        const id = hits[0].object.userData?.itemId;
+        if (typeof id === 'number') {
+          return derived.items.find((it) => it.id === id) ?? null;
+        }
       }
     }
+
+    return null;
+  }
+
+  private handlePointerDown(event: PointerEvent): void {
+    if (this.xrOrSimActive) return;
+    this.pointerDownPos = {x: event.clientX, y: event.clientY};
+    this.isOrbitDragging = true;
+  }
+
+  private handlePointerMove(event: PointerEvent): void {
+    if (this.xrOrSimActive || this.isOrbitDragging) return;
+    const now = performance.now();
+    if (now - this.lastHoverCheckAt < 28) return;
+    this.lastHoverCheckAt = now;
+
+    const item = this.pickItemAtClientPos(event.clientX, event.clientY);
+    const nextHoverId = item?.id ?? null;
+    if (nextHoverId !== this.hoveredItemId) {
+      this.hoveredItemId = nextHoverId;
+      this.applySelectionAndHoverStyles();
+      this.markDirty(4);
+    }
+
+    const renderer = xb.core.renderer;
+    if (renderer instanceof THREE.WebGLRenderer) {
+      renderer.domElement.style.cursor = item ? 'pointer' : 'grab';
+    }
+    this.callbacks.onItemHover(item, event.clientX, event.clientY);
+  }
+
+  private handlePointerUp(event: PointerEvent): void {
+    this.isOrbitDragging = false;
+    if (this.xrOrSimActive || !this.pointerDownPos) return;
+    const dx = event.clientX - this.pointerDownPos.x;
+    const dy = event.clientY - this.pointerDownPos.y;
+    this.pointerDownPos = null;
+
+    // Ignore orbit camera drags (> 6px pointer travel)
+    if (dx * dx + dy * dy > 36) return;
+
+    const item = this.pickItemAtClientPos(event.clientX, event.clientY);
+    this.callbacks.onItemSelect(item);
+  }
+
+  private clearHover(): void {
+    this.isOrbitDragging = false;
+    if (this.hoveredItemId !== null) {
+      this.hoveredItemId = null;
+      this.applySelectionAndHoverStyles();
+      this.markDirty(4);
+    }
+    this.callbacks.onItemHover(null, 0, 0);
   }
 
   onObjectSelectStart(event: xb.SelectEvent): void {
+    const derived = this.derived;
+    if (!derived || !derived.isValid) return;
+
+    const intersection = event.intersection;
+    if (
+      event.target === this.scatterMesh &&
+      intersection?.instanceId !== undefined
+    ) {
+      const item = derived.items[intersection.instanceId] ?? null;
+      if (item) {
+        this.callbacks.onItemSelect(item);
+        event.stopPropagation();
+      }
+      return;
+    }
+
     const target = event.target as THREE.Object3D | undefined;
-    const rowIndex = target?.userData?.rowIndex;
-    if (typeof rowIndex === 'number') {
-      this.callbacks.onRowSelect(rowIndex);
-      event.stopPropagation();
+    const itemId = target?.userData?.itemId;
+    if (typeof itemId === 'number') {
+      const item = derived.items.find((it) => it.id === itemId) ?? null;
+      if (item) {
+        this.callbacks.onItemSelect(item);
+        event.stopPropagation();
+      }
     }
   }
 
@@ -840,27 +1118,19 @@ export class SpatialDataStage extends xb.Script {
 
     for (let i = 0; i < this.activeBarCount; i++) {
       const entry = this.barPool[i];
-      const diff = Math.abs(entry.currentHeight - entry.targetHeight);
+      const diff = Math.abs(entry.currentSignedH - entry.targetSignedH);
       if (diff > 0.001) {
-        entry.currentHeight = THREE.MathUtils.damp(
-          entry.currentHeight,
-          entry.targetHeight,
-          10,
+        entry.currentSignedH = THREE.MathUtils.damp(
+          entry.currentSignedH,
+          entry.targetSignedH,
+          12,
           dt
         );
+        this.positionBarGeometry(entry);
         moving = true;
-      } else {
-        entry.currentHeight = entry.targetHeight;
-      }
-
-      if (entry.isSphere) {
-        entry.bodyMesh.scale.y = entry.currentHeight;
-        entry.bodyMesh.position.y = entry.currentHeight * 0.5;
-        entry.capMesh.position.y = entry.currentHeight;
-      } else {
-        entry.bodyMesh.scale.y = entry.currentHeight;
-        entry.bodyMesh.position.y = entry.currentHeight * 0.5;
-        entry.capMesh.position.y = entry.currentHeight + 0.01;
+      } else if (entry.currentSignedH !== entry.targetSignedH) {
+        entry.currentSignedH = entry.targetSignedH;
+        this.positionBarGeometry(entry);
       }
     }
 
@@ -878,12 +1148,15 @@ export class SpatialDataStage extends xb.Script {
   }
 
   dispose(): void {
+    this.axisSystem.dispose();
+    this.disposeRingEntries();
+
     for (const entry of this.barPool) {
       entry.bodyMat.dispose();
       entry.capMat.dispose();
     }
     this.barPool = [];
-    this.pickTargetsCache = [];
+    this.barPickTargets = [];
     this.activeBarCount = 0;
 
     for (const g of this.pedestalGeos) g.dispose();
@@ -893,8 +1166,12 @@ export class SpatialDataStage extends xb.Script {
 
     this.sharedBarGeo.dispose();
     this.sharedCapGeo.dispose();
-    this.sharedSphereGeo.dispose();
-    this.sharedStemGeo.dispose();
+    this.scatterGeo.dispose();
+    this.scatterMat.dispose();
+    this.haloGeo.dispose();
+    this.haloMat.dispose();
+    this.dropLineGeo.dispose();
+    this.dropLineMat.dispose();
     this.gridTexture?.dispose();
     this.shadowTexture?.dispose();
     this.envTexture?.dispose();
@@ -902,10 +1179,11 @@ export class SpatialDataStage extends xb.Script {
 
     const renderer = xb.core.renderer;
     if (renderer instanceof THREE.WebGLRenderer) {
-      renderer.domElement.removeEventListener(
-        'pointerdown',
-        this.onPointerClickBound
-      );
+      const dom = renderer.domElement;
+      dom.removeEventListener('pointerdown', this.onPointerDownBound);
+      dom.removeEventListener('pointermove', this.onPointerMoveBound);
+      dom.removeEventListener('pointerup', this.onPointerUpBound);
+      dom.removeEventListener('pointerleave', this.onPointerLeaveBound);
     }
   }
 }

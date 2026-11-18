@@ -1,12 +1,17 @@
 import type {
   ColumnStats,
   ColumnType,
+  DatasetProfile,
+  DerivedSpatialDataset,
   SheetData,
   SortState,
+  SpatialChartMode,
+  SpatialConfig,
   VisibleRowsSource,
   WorkbookState,
 } from '../types';
 import {importTabularFile} from './excelIO';
+import {transformSpatialDataset} from './spatialTransform';
 import {computeColumnStats, filterAndSortRowsBuffer} from './tabular';
 import type {WorkerRequest, WorkerResponse} from './dataWorker';
 
@@ -41,6 +46,12 @@ interface PendingStats {
   resolve: (stats: ColumnStats | null) => void;
 }
 
+interface PendingSpatial {
+  requestId: number;
+  sheetVersion: number;
+  resolve: (derived: DerivedSpatialDataset | null) => void;
+}
+
 export function buildFilterKey(searchQuery: string, sort: SortState): string {
   return `${searchQuery.trim().toLowerCase()}\x00${sort.colIndex ?? ''}\x00${sort.direction ?? ''}`;
 }
@@ -51,12 +62,14 @@ export class DataWorkerClient {
   private latestParseId = 0;
   private latestFilterId = 0;
   private latestStatsId = 0;
+  private latestSpatialId = 0;
   private syncedSheetVersion = -1;
   private syncedFilterKey = '';
   private syncedFilterVersion = -1;
   private pendingParses = new Map<number, PendingParse>();
   private pendingFilters = new Map<number, PendingFilter>();
   private pendingStats = new Map<number, PendingStats>();
+  private pendingSpatial = new Map<number, PendingSpatial>();
 
   constructor(options?: DataWorkerClientOptions) {
     if (options?.createWorker) {
@@ -92,6 +105,7 @@ export class DataWorkerClient {
         }
         this.settlePendingFiltersAsNull();
         this.settlePendingStatsAsNull();
+        this.settlePendingSpatialAsNull();
       });
     }
   }
@@ -117,6 +131,13 @@ export class DataWorkerClient {
   private settlePendingStatsAsNull(): void {
     for (const [id, pending] of this.pendingStats) {
       this.pendingStats.delete(id);
+      pending.resolve(null);
+    }
+  }
+
+  private settlePendingSpatialAsNull(): void {
+    for (const [id, pending] of this.pendingSpatial) {
+      this.pendingSpatial.delete(id);
       pending.resolve(null);
     }
   }
@@ -321,6 +342,89 @@ export class DataWorkerClient {
     });
   }
 
+  public async transformSpatial(params: {
+    sheet: SheetData;
+    sheetVersion: number;
+    visibleRowIndices: VisibleRowsSource;
+    searchQuery: string;
+    sort: SortState;
+    profile: DatasetProfile;
+    config: SpatialConfig;
+    mode: SpatialChartMode;
+    yColIndices?: number[];
+  }): Promise<DerivedSpatialDataset | null> {
+    const requestId = this.nextRequestId++;
+    this.latestSpatialId = requestId;
+    this.settlePendingSpatialAsNull();
+
+    const needsWorker =
+      this.worker !== null && params.visibleRowIndices.length >= 2500;
+
+    if (!needsWorker) {
+      const derived = transformSpatialDataset({
+        sheet: params.sheet,
+        visibleRowIndices: params.visibleRowIndices,
+        profile: params.profile,
+        config: params.config,
+        mode: params.mode,
+        yColIndices: params.yColIndices,
+      });
+      if (this.latestSpatialId !== requestId) return null;
+      return derived;
+    }
+
+    const filterKey = buildFilterKey(params.searchQuery, params.sort);
+    const useAllRows =
+      params.searchQuery.trim().length === 0 &&
+      (params.sort.colIndex === null || params.sort.direction === null) &&
+      params.visibleRowIndices.length === params.sheet.rows.length;
+
+    const needsSheetUpload = this.syncedSheetVersion !== params.sheetVersion;
+    if (needsSheetUpload) {
+      this.syncedSheetVersion = params.sheetVersion;
+    }
+
+    const workerHasMatchingIndices =
+      !useAllRows &&
+      this.syncedFilterVersion === params.sheetVersion &&
+      this.syncedFilterKey === filterKey;
+
+    let visibleCopy: Int32Array | undefined;
+    if (!useAllRows && !workerHasMatchingIndices) {
+      visibleCopy =
+        params.visibleRowIndices instanceof Int32Array
+          ? params.visibleRowIndices.slice()
+          : Int32Array.from(params.visibleRowIndices);
+    }
+
+    return new Promise<DerivedSpatialDataset | null>((resolve) => {
+      this.pendingSpatial.set(requestId, {
+        requestId,
+        sheetVersion: params.sheetVersion,
+        resolve,
+      });
+
+      const msg: WorkerRequest = {
+        type: 'transform-spatial',
+        requestId,
+        sheetVersion: params.sheetVersion,
+        filterKey,
+        useAllRows,
+        ...(visibleCopy ? {visibleRowIndices: visibleCopy} : {}),
+        ...(needsSheetUpload ? {sheet: params.sheet} : {}),
+        profile: params.profile,
+        config: params.config,
+        mode: params.mode,
+        yColIndices: params.yColIndices,
+      };
+      if (visibleCopy) {
+        this.worker!.postMessage(msg, [visibleCopy.buffer as ArrayBuffer]);
+      } else {
+        this.worker!.postMessage(msg);
+      }
+    });
+  }
+
   private handleMessage(msg: WorkerResponse): void {
     if (msg.type === 'progress') {
       const pending = this.pendingParses.get(msg.requestId);
@@ -382,6 +486,19 @@ export class DataWorkerClient {
           pending.resolve(null);
         }
       }
+      return;
+    }
+
+    if (msg.type === 'spatial-result') {
+      const pending = this.pendingSpatial.get(msg.requestId);
+      if (pending) {
+        this.pendingSpatial.delete(msg.requestId);
+        if (msg.requestId === this.latestSpatialId) {
+          pending.resolve(msg.derived);
+        } else {
+          pending.resolve(null);
+        }
+      }
     }
   }
 
@@ -389,6 +506,7 @@ export class DataWorkerClient {
     this.settlePendingParsesAsNull();
     this.settlePendingFiltersAsNull();
     this.settlePendingStatsAsNull();
+    this.settlePendingSpatialAsNull();
     this.worker?.terminate();
     this.worker = null;
   }

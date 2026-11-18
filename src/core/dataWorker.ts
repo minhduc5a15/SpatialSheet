@@ -1,11 +1,16 @@
 import type {
   ColumnStats,
   ColumnType,
+  DatasetProfile,
+  DerivedSpatialDataset,
   SheetData,
   SortState,
+  SpatialChartMode,
+  SpatialConfig,
   WorkbookState,
 } from '../types';
 import {importTabularFile} from './excelIO';
+import {transformSpatialDataset} from './spatialTransform';
 import {computeColumnStats, filterAndSortRowsBuffer} from './tabular';
 
 export type WorkerRequest =
@@ -47,6 +52,19 @@ export type WorkerRequest =
       useAllRows: boolean;
       visibleRowIndices?: Int32Array;
       sheet?: SheetData;
+    }
+  | {
+      type: 'transform-spatial';
+      requestId: number;
+      sheetVersion: number;
+      filterKey: string;
+      useAllRows: boolean;
+      visibleRowIndices?: Int32Array;
+      sheet?: SheetData;
+      profile: DatasetProfile;
+      config: SpatialConfig;
+      mode: SpatialChartMode;
+      yColIndices?: number[];
     };
 
 export type WorkerResponse =
@@ -80,6 +98,13 @@ export type WorkerResponse =
       colIndex: number;
       filterKey: string;
       stats: ColumnStats;
+    }
+  | {
+      type: 'spatial-result';
+      requestId: number;
+      sheetVersion: number;
+      filterKey: string;
+      derived: DerivedSpatialDataset;
     };
 
 let cachedSheet: SheetData | null = null;
@@ -87,6 +112,38 @@ let cachedVersion = -1;
 let cachedIndices: Int32Array | null = null;
 let cachedIndicesVersion = -1;
 let cachedFilterKey = '';
+
+function resolveRowSourceForCachedSheet(
+  targetSheet: SheetData,
+  msg: {
+    sheetVersion: number;
+    filterKey: string;
+    useAllRows: boolean;
+    visibleRowIndices?: Int32Array;
+  }
+): Int32Array {
+  if (msg.useAllRows) {
+    const seq = new Int32Array(targetSheet.rows.length);
+    for (let i = 0; i < seq.length; i++) seq[i] = i;
+    return seq;
+  }
+  if (msg.visibleRowIndices) {
+    cachedIndices = msg.visibleRowIndices;
+    cachedIndicesVersion = msg.sheetVersion;
+    cachedFilterKey = msg.filterKey;
+    return msg.visibleRowIndices;
+  }
+  if (
+    cachedIndices &&
+    cachedIndicesVersion === msg.sheetVersion &&
+    cachedFilterKey === msg.filterKey
+  ) {
+    return cachedIndices;
+  }
+  const fallback = new Int32Array(targetSheet.rows.length);
+  for (let i = 0; i < fallback.length; i++) fallback[i] = i;
+  return fallback;
+}
 
 self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data;
@@ -195,18 +252,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
 
     let rowSource: Int32Array | undefined;
     if (!msg.useAllRows) {
-      if (msg.visibleRowIndices) {
-        rowSource = msg.visibleRowIndices;
-        cachedIndices = msg.visibleRowIndices;
-        cachedIndicesVersion = msg.sheetVersion;
-        cachedFilterKey = msg.filterKey;
-      } else if (
-        cachedIndices &&
-        cachedIndicesVersion === msg.sheetVersion &&
-        cachedFilterKey === msg.filterKey
-      ) {
-        rowSource = cachedIndices;
-      }
+      rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
     }
 
     const stats = computeColumnStats(targetSheet, msg.colIndex, rowSource);
@@ -217,6 +263,36 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
       colIndex: msg.colIndex,
       filterKey: msg.filterKey,
       stats,
+    };
+    self.postMessage(resp);
+    return;
+  }
+
+  if (msg.type === 'transform-spatial') {
+    if (msg.sheet) {
+      cachedSheet = msg.sheet;
+      cachedVersion = msg.sheetVersion;
+    }
+    const targetSheet =
+      cachedVersion === msg.sheetVersion ? cachedSheet : msg.sheet ?? null;
+    if (!targetSheet) return;
+
+    const rowSource = resolveRowSourceForCachedSheet(targetSheet, msg);
+    const derived = transformSpatialDataset({
+      sheet: targetSheet,
+      visibleRowIndices: rowSource,
+      profile: msg.profile,
+      config: msg.config,
+      mode: msg.mode,
+      yColIndices: msg.yColIndices,
+    });
+
+    const resp: WorkerResponse = {
+      type: 'spatial-result',
+      requestId: msg.requestId,
+      sheetVersion: msg.sheetVersion,
+      filterKey: msg.filterKey,
+      derived,
     };
     self.postMessage(resp);
   }

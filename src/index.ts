@@ -5,6 +5,7 @@ import {exportSheetAsCsv, exportWorkbookAsExcel} from './core/excelIO';
 import {AppStore} from './core/store';
 import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
+import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
 
@@ -23,6 +24,7 @@ class SpatialSheetApp {
   private spreadsheet!: SpreadsheetGrid;
   private chart2d!: InteractiveChart2D;
   private spatialStage!: SpatialDataStage;
+  private spatialOverlay!: SpatialInspectorOverlay;
 
   // Layout containers
   private gridHostEl!: HTMLElement;
@@ -232,18 +234,12 @@ class SpatialSheetApp {
             <div data-role="chart2d-host" class="flex-1 min-h-0"></div>
 
             <!-- 3D Spatial Stage Container -->
-            <div data-role="spatial-host" class="hidden flex-1 min-h-0 flex-col bg-slate-900 border border-slate-800 rounded-xl overflow-hidden relative">
-              <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-slate-900/95 border-b border-slate-800 text-xs text-slate-200 z-10">
-                <div class="flex items-center gap-1" role="group" aria-label="3D chart style">
-                  <button type="button" data-spatial-mode="bar3d" class="px-2.5 py-1 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer">3D Bars</button>
-                  <button type="button" data-spatial-mode="scatter3d" class="px-2.5 py-1 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer">3D Scatter</button>
-                  <button type="button" data-spatial-mode="ring3d" class="px-2.5 py-1 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer">3D Ring</button>
-                </div>
-                <span class="text-[11px] text-slate-400">Drag to orbit · Scroll to zoom</span>
-              </div>
-              <div data-role="xr-canvas-mount" class="relative flex-1 min-h-[260px] w-full">
+            <div data-role="spatial-host" class="hidden flex-1 min-h-0 flex-col bg-slate-950 border border-slate-800 rounded-xl overflow-hidden relative">
+              <div data-role="spatial-topbar" class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-slate-900 border-b border-slate-800 text-xs text-slate-200 z-10"></div>
+              <div data-role="xr-canvas-mount" class="relative flex-1 min-h-[260px] w-full overflow-hidden">
                 <canvas data-role="xr-canvas" class="block w-full h-full outline-none"></canvas>
               </div>
+              <div data-role="spatial-footer" class="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-slate-900 border-t border-slate-800 text-[11px] text-slate-300 z-10"></div>
             </div>
           </section>
         </main>
@@ -335,17 +331,43 @@ class SpatialSheetApp {
         this.store.highlightRowFromChart(rowIndex);
         this.spreadsheet.scrollToRow(rowIndex);
       },
+      onApplyRecommendation: (rec) => {
+        this.store.applyRecommendation(rec);
+      },
     });
 
     this.spatialStage = new SpatialDataStage({
-      onRowSelect: (rowIndex) => {
-        this.store.highlightRowFromChart(rowIndex);
-        this.spreadsheet.scrollToRow(rowIndex);
+      onItemSelect: (item) => {
+        this.store.selectSpatialItem(item);
+        if (item) {
+          this.spreadsheet.scrollToRow(item.firstRowIndex);
+        }
+      },
+      onItemHover: (item, clientX, clientY) => {
+        this.spatialOverlay.showTooltip(item, clientX, clientY);
       },
       onSpatialModeChange: (mode: SpatialChartMode) => {
         this.store.setSpatialMode(mode);
       },
     });
+
+    this.spatialOverlay = new SpatialInspectorOverlay(
+      this.spatialHostEl,
+      this.xrCanvasMountEl,
+      {
+        onModeChange: (mode) => this.store.setSpatialMode(mode),
+        onConfigChange: (partial) => this.store.setSpatialConfig(partial),
+        onOverrideColumnRole: (colIndex, role) =>
+          this.store.overrideColumnRole(colIndex, role),
+        onApplyRecommendation: (rec) => this.store.applyRecommendation(rec),
+        onSelectItem: (item) => this.store.selectSpatialItem(item),
+        onJumpToRow: (rowIndex) => {
+          this.store.jumpToRow(rowIndex);
+          this.spreadsheet.scrollToRow(rowIndex);
+        },
+        onResetCamera: () => this.spatialStage.resetCamera(),
+      }
+    );
 
     const options = new xb.Options();
     options.canvas = this.xrCanvasEl;
@@ -458,12 +480,13 @@ class SpatialSheetApp {
 
     // 6. 2D Chart updates (skip full rebuild on highlight-only changes)
     this.store.subscribe(
-      ['sheetData', 'visibleRows', 'chartConfig', 'chartHighlight'],
+      ['sheetData', 'visibleRows', 'chartConfig', 'profile', 'chartHighlight'],
       (changed) => {
         const dataOrConfigChanged =
           changed.has('sheetData') ||
           changed.has('visibleRows') ||
-          changed.has('chartConfig');
+          changed.has('chartConfig') ||
+          changed.has('profile');
 
         if (dataOrConfigChanged) {
           this.chart2d.setData({
@@ -471,6 +494,7 @@ class SpatialSheetApp {
             visibleRowIndices: this.store.visibleRowIndices,
             config: this.store.chartConfig,
             highlightedRowIndex: this.store.highlightedRowIndex,
+            recommendations: this.store.chartRecommendations,
           });
         } else if (changed.has('chartHighlight')) {
           this.chart2d.setHighlight(this.store.highlightedRowIndex);
@@ -478,27 +502,34 @@ class SpatialSheetApp {
       }
     );
 
-    // 7. 3D XR Stage updates (pooled & lazy-synced when hidden)
-    this.store.subscribe(
-      ['sheetData', 'visibleRows', 'chartConfig', 'chartHighlight'],
-      (changed) => {
-        const dataOrConfigChanged =
-          changed.has('sheetData') ||
-          changed.has('visibleRows') ||
-          changed.has('chartConfig');
-
-        if (dataOrConfigChanged) {
-          this.spatialStage.setData({
-            sheet: this.store.activeSheet,
-            visibleRowIndices: this.store.visibleRowIndices,
-            config: this.store.chartConfig,
-            highlightedRowIndex: this.store.highlightedRowIndex,
-          });
-        } else if (changed.has('chartHighlight')) {
-          this.spatialStage.setHighlight(this.store.highlightedRowIndex);
-        }
+    // 7. 3D Analytical Stage & Inspector Overlay updates
+    this.store.subscribe(['spatialData', 'profile', 'chartHighlight'], (changed) => {
+      if (changed.has('spatialData') || changed.has('profile')) {
+        this.syncSpatialViews();
+      } else if (changed.has('chartHighlight')) {
+        this.spatialStage.setHighlight(
+          this.store.selectedSpatialItem,
+          this.store.highlightedRowIndex
+        );
       }
-    );
+    });
+  }
+
+  private syncSpatialViews(): void {
+    this.spatialStage.setDerivedData({
+      derived: this.store.derivedSpatialData,
+      selectedItem: this.store.selectedSpatialItem,
+      highlightedRowIndex: this.store.highlightedRowIndex,
+      environmentMode: this.store.spatialConfig.environmentMode,
+    });
+    this.spatialOverlay.update({
+      sheet: this.store.activeSheet,
+      profile: this.store.datasetProfile,
+      config: this.store.spatialConfig,
+      derived: this.store.derivedSpatialData,
+      recommendations: this.store.chartRecommendations,
+      selectedItem: this.store.selectedSpatialItem,
+    });
   }
 
   private syncInitialViews(): void {
@@ -521,13 +552,9 @@ class SpatialSheetApp {
       visibleRowIndices: this.store.visibleRowIndices,
       config: this.store.chartConfig,
       highlightedRowIndex: this.store.highlightedRowIndex,
+      recommendations: this.store.chartRecommendations,
     });
-    this.spatialStage.setData({
-      sheet: this.store.activeSheet,
-      visibleRowIndices: this.store.visibleRowIndices,
-      config: this.store.chartConfig,
-      highlightedRowIndex: this.store.highlightedRowIndex,
-    });
+    this.syncSpatialViews();
   }
 
   private syncMetadataAndTabs(): void {
@@ -600,8 +627,7 @@ class SpatialSheetApp {
   }
 
   private syncLayoutAndVizVisibility(): void {
-    const {layout, chartPanelMode, chartConfig, isSimulatorFullscreen} =
-      this.store;
+    const {layout, chartPanelMode, isSimulatorFullscreen} = this.store;
 
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-layout]')
@@ -619,15 +645,6 @@ class SpatialSheetApp {
         btn.className = active
           ? 'px-3 py-1 text-xs rounded-md bg-white text-slate-900 font-semibold shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer'
           : 'px-3 py-1 text-xs rounded-md text-slate-600 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer';
-      });
-
-    this.root
-      .querySelectorAll<HTMLButtonElement>('[data-spatial-mode]')
-      .forEach((btn) => {
-        const active = btn.dataset.spatialMode === chartConfig.spatialMode;
-        btn.className = active
-          ? 'px-2.5 py-1 rounded-md bg-blue-600 text-white font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer'
-          : 'px-2.5 py-1 rounded-md text-slate-300 hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer';
       });
 
     if (layout === 'table') {
@@ -752,17 +769,6 @@ class SpatialSheetApp {
       .forEach((btn) => {
         btn.addEventListener('click', () => {
           this.store.setChartPanelMode(btn.dataset.vizTab as '2d' | '3d');
-        });
-      });
-
-    // Spatial 3D mode buttons
-    this.root
-      .querySelectorAll<HTMLButtonElement>('[data-spatial-mode]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.store.setSpatialMode(
-            btn.dataset.spatialMode as SpatialChartMode
-          );
         });
       });
 

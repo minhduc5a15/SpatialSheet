@@ -2,16 +2,33 @@ import type {
   AppDomain,
   CellCoord,
   ChartConfig,
+  ChartRecommendation,
   ColumnStats,
+  DatasetProfile,
+  DerivedSpatialDataset,
   LoadingState,
+  SemanticType,
   SheetData,
   SortState,
   SpatialChartMode,
+  SpatialConfig,
+  SpatialDataItem,
   VisibleRowsSource,
   WorkbookState,
   WorkspaceLayout,
 } from '../types';
+import {recommendCharts} from './chartRecommender';
+import {
+  applyColumnRoleOverride,
+  profileDataset,
+  reprofileColumn,
+} from './dataProfiler';
 import {WorkbookHistoryManager} from './history';
+import {
+  createDefaultSpatialConfig,
+  resolveModeSwitchConfig,
+  transformSpatialDataset,
+} from './spatialTransform';
 import {
   addSheetColumn,
   addSheetRow,
@@ -58,6 +75,12 @@ export class AppStore {
     stats: null,
     loading: false,
   };
+  public datasetProfile!: DatasetProfile;
+  public spatialConfig!: SpatialConfig;
+  public chartRecommendations: ChartRecommendation[] = [];
+  public derivedSpatialData!: DerivedSpatialDataset;
+  public selectedSpatialItem: SpatialDataItem | null = null;
+  public spatialTransformLoading = false;
 
   // Metadata about last cell patch for O(1) DOM updates
   public lastCellPatch: {
@@ -70,9 +93,12 @@ export class AppStore {
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
   private filterSeq = 0;
   private statsSeq = 0;
+  private spatialSeq = 0;
   private loadFileSeq = 0;
   private columnStatsCache = new Map<number, ColumnStats>();
   private columnStatsCacheFilterKey = '';
+  private derivedSpatialCacheKey = '';
+  private spatialStale = false;
 
   constructor(initialWorkbook?: WorkbookState, worker?: DataWorkerClient) {
     const initial = initialWorkbook ?? createBlankWorkbook();
@@ -84,6 +110,23 @@ export class AppStore {
     this.visibleRowIndices = this.buildSequentialIndices(firstSheet.rows.length);
     this.selectedCell =
       firstSheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
+
+    this.datasetProfile = profileDataset(firstSheet, this.sheetVersion);
+    this.spatialConfig = createDefaultSpatialConfig(
+      this.datasetProfile,
+      this.chartConfig
+    );
+    this.chartRecommendations = recommendCharts(this.datasetProfile);
+    this.derivedSpatialData = transformSpatialDataset({
+      sheet: firstSheet,
+      visibleRowIndices: this.visibleRowIndices,
+      profile: this.datasetProfile,
+      config: this.spatialConfig,
+      mode: this.chartConfig.spatialMode,
+      yColIndices: this.chartConfig.yColIndices,
+    });
+    this.derivedSpatialCacheKey = this.buildSpatialCacheKey();
+
     this.refreshActiveColumnStats(false);
   }
 
@@ -285,6 +328,157 @@ export class AppStore {
     return true;
   }
 
+  private isSpatialViewActive(): boolean {
+    return (
+      this.layout === 'spatial' ||
+      this.chartPanelMode === '3d' ||
+      this.isSimulatorFullscreen
+    );
+  }
+
+  private buildSpatialCacheKey(): string {
+    const cfg = this.spatialConfig;
+    const visKey = `${this.visibleRowIndices.length}:${buildFilterKey(this.searchQuery, this.sort)}`;
+    const overridesKey = this.datasetProfile.columns
+      .map((c) => `${c.colIndex}:${c.roleOverride ?? ''}`)
+      .join(',');
+    return `${this.sheetVersion}|${visKey}|${overridesKey}|${this.chartConfig.spatialMode}|${this.chartConfig.yColIndices.join(',')}|${cfg.xColIndex}|${cfg.yColIndex}|${cfg.zColIndex ?? ''}|${cfg.groupByColIndex ?? ''}|${cfg.colorColIndex ?? ''}|${cfg.aggregation}|${cfg.sortOrder}|${cfg.topK}|${cfg.samplingStrategy}|${cfg.sampleLimit}|${cfg.scaleType}`;
+  }
+
+  private rebuildProfileFull(resetSpatialDefaults: boolean): void {
+    const prevOverrides = resetSpatialDefaults
+      ? undefined
+      : new Map<number, SemanticType>(
+          this.datasetProfile.columns
+            .filter((c) => c.roleOverride !== undefined)
+            .map((c) => [c.colIndex, c.roleOverride!])
+        );
+    this.datasetProfile = profileDataset(
+      this.activeSheet,
+      this.sheetVersion,
+      prevOverrides
+    );
+    this.chartRecommendations = recommendCharts(this.datasetProfile);
+    if (resetSpatialDefaults) {
+      this.spatialConfig = createDefaultSpatialConfig(
+        this.datasetProfile,
+        this.chartConfig
+      );
+      this.selectedSpatialItem = null;
+    } else {
+      this.clampSpatialColumns();
+    }
+  }
+
+  private clampSpatialColumns(): void {
+    const maxCol = Math.max(0, this.activeSheet.columns.length - 1);
+    const clampNullable = (v: number | null): number | null =>
+      v !== null && v >= 0 && v <= maxCol ? v : null;
+    this.spatialConfig = {
+      ...this.spatialConfig,
+      xColIndex: Math.min(this.spatialConfig.xColIndex, maxCol),
+      yColIndex: Math.min(this.spatialConfig.yColIndex, maxCol),
+      zColIndex: clampNullable(this.spatialConfig.zColIndex),
+      groupByColIndex: clampNullable(this.spatialConfig.groupByColIndex),
+      colorColIndex: clampNullable(this.spatialConfig.colorColIndex),
+    };
+  }
+
+  private reconcileSelectedSpatialItem(): void {
+    if (!this.selectedSpatialItem) return;
+    const prev = this.selectedSpatialItem;
+    const match =
+      this.derivedSpatialData.items.find(
+        (it) =>
+          it.label === prev.label &&
+          it.seriesLabel === prev.seriesLabel &&
+          it.firstRowIndex === prev.firstRowIndex
+      ) ??
+      this.derivedSpatialData.items.find(
+        (it) => it.label === prev.label && it.seriesLabel === prev.seriesLabel
+      ) ??
+      null;
+    this.selectedSpatialItem = match;
+  }
+
+  private refreshDerivedSpatialData(emitOnAsyncComplete = true): boolean {
+    const nextKey = this.buildSpatialCacheKey();
+    if (nextKey === this.derivedSpatialCacheKey && !this.spatialStale) {
+      return false;
+    }
+
+    // Defer heavy >=2,500-row spatial aggregation when 3D view is hidden
+    if (
+      this.visibleRowIndices.length >= 2500 &&
+      !this.isSpatialViewActive()
+    ) {
+      this.spatialStale = true;
+      return false;
+    }
+
+    if (this.visibleRowIndices.length < 2500) {
+      this.spatialStale = false;
+      this.spatialTransformLoading = false;
+      this.derivedSpatialCacheKey = nextKey;
+      this.derivedSpatialData = transformSpatialDataset({
+        sheet: this.activeSheet,
+        visibleRowIndices: this.visibleRowIndices,
+        profile: this.datasetProfile,
+        config: this.spatialConfig,
+        mode: this.chartConfig.spatialMode,
+        yColIndices: this.chartConfig.yColIndices,
+      });
+      this.reconcileSelectedSpatialItem();
+      return true;
+    }
+
+    const seq = ++this.spatialSeq;
+    const reqVersion = this.sheetVersion;
+    const reqVisible = this.visibleRowIndices;
+    this.spatialStale = false;
+    this.spatialTransformLoading = true;
+
+    void this.worker
+      .transformSpatial({
+        sheet: this.activeSheet,
+        sheetVersion: reqVersion,
+        visibleRowIndices: reqVisible,
+        searchQuery: this.searchQuery,
+        sort: this.sort,
+        profile: this.datasetProfile,
+        config: this.spatialConfig,
+        mode: this.chartConfig.spatialMode,
+        yColIndices: this.chartConfig.yColIndices,
+      })
+      .then((derived) => {
+        if (
+          !derived ||
+          seq !== this.spatialSeq ||
+          reqVersion !== this.sheetVersion ||
+          reqVisible !== this.visibleRowIndices
+        ) {
+          return;
+        }
+        this.spatialTransformLoading = false;
+        this.derivedSpatialCacheKey = nextKey;
+        this.derivedSpatialData = derived;
+        this.reconcileSelectedSpatialItem();
+        if (emitOnAsyncComplete) {
+          this.emit(['spatialData']);
+        }
+      });
+
+    return true;
+  }
+
+  public ensureSpatialDataFresh(): void {
+    if (this.spatialStale) {
+      if (this.refreshDerivedSpatialData(true)) {
+        this.emit(['spatialData']);
+      }
+    }
+  }
+
   public selectCell(coord: CellCoord | null): void {
     const nextRow = coord ? coord.rowIndex : null;
     const sameCell =
@@ -327,12 +521,99 @@ export class AppStore {
 
     this.selectedCell = nextCoord;
     this.highlightedRowIndex = rowIndex;
+    const matchingItem =
+      this.derivedSpatialData.items.find(
+        (it) =>
+          it.firstRowIndex === rowIndex || it.rowIndices.includes(rowIndex)
+      ) ?? null;
+    this.selectedSpatialItem = matchingItem;
+
+    const statsChanged = this.refreshActiveColumnStats(true);
+    this.emit(
+      statsChanged
+        ? ['selection', 'chartHighlight', 'spatialData', 'stats']
+        : ['selection', 'chartHighlight', 'spatialData']
+    );
+  }
+
+  public selectSpatialItem(item: SpatialDataItem | null): void {
+    this.selectedSpatialItem = item;
+    if (!item) {
+      this.emit(['spatialData']);
+      return;
+    }
+
+    const targetRow = item.firstRowIndex;
+    const targetCol = this.spatialConfig.yColIndex ?? 0;
+    this.selectedCell = {rowIndex: targetRow, colIndex: targetCol};
+    this.highlightedRowIndex = targetRow;
+    const statsChanged = this.refreshActiveColumnStats(true);
+    this.emit(
+      statsChanged
+        ? ['selection', 'chartHighlight', 'spatialData', 'stats']
+        : ['selection', 'chartHighlight', 'spatialData']
+    );
+  }
+
+  public jumpToRow(rowIndex: number): void {
+    if (rowIndex < 0 || rowIndex >= this.activeSheet.rows.length) return;
+    const colIndex = this.spatialConfig.yColIndex ?? 0;
+    this.selectedCell = {rowIndex, colIndex};
+    this.highlightedRowIndex = rowIndex;
     const statsChanged = this.refreshActiveColumnStats(true);
     this.emit(
       statsChanged
         ? ['selection', 'chartHighlight', 'stats']
         : ['selection', 'chartHighlight']
     );
+  }
+
+  public setSpatialConfig(partial: Partial<SpatialConfig>): void {
+    this.spatialConfig = {...this.spatialConfig, ...partial};
+    this.clampSpatialColumns();
+    this.refreshDerivedSpatialData(true);
+    this.emit(['spatialData']);
+  }
+
+  public overrideColumnRole(colIndex: number, role: SemanticType | null): void {
+    const nextProfile = applyColumnRoleOverride(
+      this.datasetProfile,
+      colIndex,
+      role
+    );
+    if (nextProfile === this.datasetProfile) return;
+    this.datasetProfile = nextProfile;
+    this.chartRecommendations = recommendCharts(this.datasetProfile);
+    this.refreshDerivedSpatialData(true);
+    this.emit(['profile', 'spatialData']);
+  }
+
+  public applyRecommendation(rec: ChartRecommendation): void {
+    if (rec.targetSurface === '2d') {
+      this.chartConfig = {
+        ...this.chartConfig,
+        ...(rec.suggested2D ?? {}),
+        ...(rec.chartType ? {type: rec.chartType} : {}),
+      };
+      if (rec.suggestedSpatial) {
+        this.spatialConfig = {...this.spatialConfig, ...rec.suggestedSpatial};
+        this.clampSpatialColumns();
+        this.refreshDerivedSpatialData(true);
+      }
+      this.emit(['chartConfig', 'spatialData']);
+      return;
+    }
+
+    const nextMode = rec.spatialMode ?? this.chartConfig.spatialMode;
+    this.chartConfig = {...this.chartConfig, spatialMode: nextMode};
+    this.spatialConfig = {
+      ...this.spatialConfig,
+      ...(rec.suggestedSpatial ?? {}),
+    };
+    this.clampSpatialColumns();
+    this.selectedSpatialItem = null;
+    this.refreshDerivedSpatialData(true);
+    this.emit(['chartConfig', 'vizMode', 'spatialData']);
   }
 
   public commitCellEdit(
@@ -361,10 +642,20 @@ export class AppStore {
     if (!needsRequery) {
       this.filterSeq++;
     }
+    this.datasetProfile = reprofileColumn(
+      this.datasetProfile,
+      nextSheet,
+      colIndex,
+      this.sheetVersion
+    );
+    this.chartRecommendations = recommendCharts(this.datasetProfile);
     this.refreshActiveColumnStats(true);
+    if (!needsRequery) {
+      this.refreshDerivedSpatialData(true);
+    }
 
     this.lastCellPatch = {rowIndex, colIndex, needsRequery};
-    this.emit(['sheetData', 'history', 'stats']);
+    this.emit(['sheetData', 'history', 'stats', 'profile', 'spatialData']);
 
     if (needsRequery) {
       void this.recomputeVisibleRows();
@@ -422,7 +713,8 @@ export class AppStore {
     this.visibleRowIndices = indices;
     this.clearColumnStatsCache();
     this.refreshActiveColumnStats(true);
-    this.emit(['visibleRows', 'stats']);
+    this.refreshDerivedSpatialData(true);
+    this.emit(['visibleRows', 'stats', 'spatialData']);
   }
 
   public addRow(): number {
@@ -438,9 +730,11 @@ export class AppStore {
     this.selectedCell = {rowIndex: newRowIdx, colIndex: 0};
     this.highlightedRowIndex = newRowIdx;
 
+    this.rebuildProfileFull(false);
     if (!this.hasActiveFilterOrSort()) {
       this.visibleRowIndices = this.buildSequentialIndices(nextSheet.rows.length);
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -448,10 +742,19 @@ export class AppStore {
         'selection',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
     } else {
       this.refreshActiveColumnStats(true);
-      this.emit(['workbook', 'sheetData', 'selection', 'history', 'stats']);
+      this.emit([
+        'workbook',
+        'sheetData',
+        'selection',
+        'history',
+        'stats',
+        'profile',
+      ]);
       void this.recomputeVisibleRows();
     }
     return newRowIdx;
@@ -476,9 +779,11 @@ export class AppStore {
     }
     this.selectedCell = null;
 
+    this.rebuildProfileFull(false);
     if (!this.hasActiveFilterOrSort()) {
       this.visibleRowIndices = this.buildSequentialIndices(nextSheet.rows.length);
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -486,6 +791,8 @@ export class AppStore {
         'selection',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
     } else {
       // Immediately keep visibleRowIndices valid and index-aligned while async requery confirms
@@ -494,6 +801,7 @@ export class AppStore {
         rowIndex
       );
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -501,6 +809,8 @@ export class AppStore {
         'selection',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
       void this.recomputeVisibleRows();
     }
@@ -514,8 +824,18 @@ export class AppStore {
     this.filterSeq++;
     this.worker.invalidateCache();
     this.clearColumnStatsCache();
+    this.rebuildProfileFull(false);
     this.refreshActiveColumnStats(true);
-    this.emit(['workbook', 'sheetData', 'visibleRows', 'history', 'stats']);
+    this.refreshDerivedSpatialData(true);
+    this.emit([
+      'workbook',
+      'sheetData',
+      'visibleRows',
+      'history',
+      'stats',
+      'profile',
+      'spatialData',
+    ]);
     if (this.hasActiveFilterOrSort()) {
       void this.recomputeVisibleRows();
     }
@@ -529,6 +849,14 @@ export class AppStore {
       this.nextSheetVersion();
       this.filterSeq++;
       this.worker.invalidateCache();
+      this.datasetProfile = reprofileColumn(
+        this.datasetProfile,
+        nextSheet,
+        colIndex,
+        this.sheetVersion
+      );
+      this.chartRecommendations = recommendCharts(this.datasetProfile);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -536,6 +864,8 @@ export class AppStore {
         'chartConfig',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
     } else {
       this.emit(['visibleRows']);
@@ -566,12 +896,14 @@ export class AppStore {
     }
 
     this.chartConfig = suggestChartConfig(nextSheet);
+    this.rebuildProfileFull(true);
 
     if (this.hasActiveFilterOrSort() || sortWasInvalidated) {
       if (!this.hasActiveFilterOrSort()) {
         this.visibleRowIndices = this.buildSequentialIndices(nextSheet.rows.length);
       }
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -580,12 +912,15 @@ export class AppStore {
         'chartConfig',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
       if (this.hasActiveFilterOrSort()) {
         void this.recomputeVisibleRows();
       }
     } else {
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -594,19 +929,41 @@ export class AppStore {
         'chartConfig',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
     }
   }
 
   public setChartConfig(nextConfig: ChartConfig): void {
+    const prevX = this.chartConfig.xColIndex;
+    const prevY = this.chartConfig.yColIndices[0];
     this.chartConfig = nextConfig;
-    this.emit(['chartConfig']);
+    const updatedSpatial: Partial<SpatialConfig> = {};
+    if (nextConfig.xColIndex !== prevX) {
+      updatedSpatial.xColIndex = nextConfig.xColIndex;
+    }
+    if (nextConfig.yColIndices[0] !== undefined && nextConfig.yColIndices[0] !== prevY) {
+      updatedSpatial.yColIndex = nextConfig.yColIndices[0];
+    }
+    if (Object.keys(updatedSpatial).length > 0) {
+      this.spatialConfig = {...this.spatialConfig, ...updatedSpatial};
+    }
+    this.refreshDerivedSpatialData(true);
+    this.emit(['chartConfig', 'spatialData']);
   }
 
   public setSpatialMode(mode: SpatialChartMode): void {
     if (this.chartConfig.spatialMode === mode) return;
     this.chartConfig = {...this.chartConfig, spatialMode: mode};
-    this.emit(['chartConfig', 'vizMode']);
+    this.spatialConfig = resolveModeSwitchConfig(
+      this.datasetProfile,
+      this.spatialConfig,
+      mode
+    );
+    this.selectedSpatialItem = null;
+    this.refreshDerivedSpatialData(true);
+    this.emit(['chartConfig', 'vizMode', 'spatialData']);
   }
 
   public setLayout(layout: WorkspaceLayout): void {
@@ -616,17 +973,20 @@ export class AppStore {
     } else if (layout === 'charts') {
       this.chartPanelMode = '2d';
     }
+    this.ensureSpatialDataFresh();
     this.emit(['layout', 'vizMode']);
   }
 
   public setChartPanelMode(mode: '2d' | '3d'): void {
     if (this.chartPanelMode === mode) return;
     this.chartPanelMode = mode;
+    this.ensureSpatialDataFresh();
     this.emit(['vizMode']);
   }
 
   public setSimulatorFullscreen(active: boolean): void {
     this.isSimulatorFullscreen = active;
+    this.ensureSpatialDataFresh();
     this.emit(['layout', 'vizMode']);
   }
 
@@ -649,7 +1009,9 @@ export class AppStore {
     this.highlightedRowIndex = null;
     this.chartConfig = suggestChartConfig(sheet);
     this.visibleRowIndices = this.buildSequentialIndices(sheet.rows.length);
+    this.rebuildProfileFull(true);
     this.refreshActiveColumnStats(true);
+    this.refreshDerivedSpatialData(true);
 
     this.emit([
       'workbook',
@@ -659,6 +1021,8 @@ export class AppStore {
       'chartConfig',
       'history',
       'stats',
+      'profile',
+      'spatialData',
     ]);
   }
 
@@ -681,7 +1045,9 @@ export class AppStore {
     this.selectedCell = {rowIndex: 0, colIndex: 0};
     this.highlightedRowIndex = null;
     this.visibleRowIndices = this.buildSequentialIndices(blank.rows.length);
+    this.rebuildProfileFull(true);
     this.refreshActiveColumnStats(true);
+    this.refreshDerivedSpatialData(true);
 
     this.emit([
       'workbook',
@@ -691,6 +1057,8 @@ export class AppStore {
       'chartConfig',
       'history',
       'stats',
+      'profile',
+      'spatialData',
     ]);
   }
 
@@ -716,7 +1084,9 @@ export class AppStore {
     this.chartConfig = suggestChartConfig(sheet);
     this.clampChartColumns();
     this.visibleRowIndices = this.buildSequentialIndices(sheet.rows.length);
+    this.rebuildProfileFull(true);
     this.refreshActiveColumnStats(true);
+    this.refreshDerivedSpatialData(true);
 
     this.emit([
       'workbook',
@@ -726,6 +1096,8 @@ export class AppStore {
       'chartConfig',
       'history',
       'stats',
+      'profile',
+      'spatialData',
     ]);
   }
 
@@ -777,8 +1149,25 @@ export class AppStore {
         colIndex: entry.colIndex,
         needsRequery,
       };
+      this.datasetProfile = reprofileColumn(
+        this.datasetProfile,
+        this.activeSheet,
+        entry.colIndex,
+        this.sheetVersion
+      );
+      this.chartRecommendations = recommendCharts(this.datasetProfile);
       this.refreshActiveColumnStats(true);
-      this.emit(['sheetData', 'selection', 'history', 'stats']);
+      if (!needsRequery) {
+        this.refreshDerivedSpatialData(true);
+      }
+      this.emit([
+        'sheetData',
+        'selection',
+        'history',
+        'stats',
+        'profile',
+        'spatialData',
+      ]);
       if (needsRequery) {
         void this.recomputeVisibleRows();
       }
@@ -790,12 +1179,14 @@ export class AppStore {
     this.selectedCell = null;
     this.highlightedRowIndex = null;
     this.clampChartColumns();
+    this.rebuildProfileFull(false);
 
     if (!this.hasActiveFilterOrSort()) {
       this.visibleRowIndices = this.buildSequentialIndices(
         this.activeSheet.rows.length
       );
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -804,6 +1195,8 @@ export class AppStore {
         'chartConfig',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
     } else {
       // Ensure visibleRowIndices never exceeds current sheet bounds while async requery runs
@@ -812,6 +1205,7 @@ export class AppStore {
         this.activeSheet.rows.length
       );
       this.refreshActiveColumnStats(true);
+      this.refreshDerivedSpatialData(true);
       this.emit([
         'workbook',
         'sheetData',
@@ -820,6 +1214,8 @@ export class AppStore {
         'chartConfig',
         'history',
         'stats',
+        'profile',
+        'spatialData',
       ]);
       void this.recomputeVisibleRows();
     }

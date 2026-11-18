@@ -1,31 +1,8 @@
 import * as xb from 'xrblocks';
-import type {
-  CellCoord,
-  ChartConfig,
-  SheetData,
-  SortState,
-  SpatialChartMode,
-  WorkbookState,
-  WorkspaceLayout,
-} from './types';
-import {
-  HistoryManager,
-  addSheetColumn,
-  addSheetRow,
-  cloneWorkbook,
-  createBlankWorkbook,
-  deleteSheetColumn,
-  deleteSheetRow,
-  filterAndSortRows,
-  renameSheetColumn,
-  suggestChartConfig,
-  updateSheetCell,
-} from './core/tabular';
-import {
-  exportSheetAsCsv,
-  exportWorkbookAsExcel,
-  importTabularFile,
-} from './core/excelIO';
+import type {SpatialChartMode, WorkspaceLayout} from './types';
+import {createBlankWorkbook} from './core/tabular';
+import {exportSheetAsCsv, exportWorkbookAsExcel} from './core/excelIO';
+import {AppStore} from './core/store';
 import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
 import {SpatialDataStage} from './xr/SpatialDataStage';
@@ -41,28 +18,22 @@ function escapeHtml(str: string): string {
 
 class SpatialSheetApp {
   private root: HTMLElement;
-  private history: HistoryManager<WorkbookState>;
-  private layout: WorkspaceLayout = 'split';
-  private searchQuery = '';
-  private sort: SortState = {colIndex: null, direction: null};
-  private selectedCell: CellCoord | null = {rowIndex: 0, colIndex: 0};
-  private highlightedRowIndex: number | null = null;
-  private chartConfig: ChartConfig;
-  private chartPanelMode: '2d' | '3d' = '2d';
-  private isSimulatorFullscreen = false;
+  private store: AppStore;
 
   private spreadsheet!: SpreadsheetGrid;
   private chart2d!: InteractiveChart2D;
   private spatialStage!: SpatialDataStage;
 
+  // Layout containers
   private gridHostEl!: HTMLElement;
   private vizHostEl!: HTMLElement;
   private chart2dHostEl!: HTMLElement;
   private spatialHostEl!: HTMLElement;
-  private xrCanvasEl!: HTMLCanvasElement;
   private xrCanvasMountEl!: HTMLElement;
+  private xrCanvasEl!: HTMLCanvasElement;
   private sheetTabsEl!: HTMLElement;
   private fileMetaEl!: HTMLElement;
+  private loadingBadgeEl!: HTMLElement;
   private undoBtn!: HTMLButtonElement;
   private redoBtn!: HTMLButtonElement;
   private searchInput!: HTMLInputElement;
@@ -70,31 +41,23 @@ class SpatialSheetApp {
   private exitSimBtn!: HTMLButtonElement;
   private errorBannerEl!: HTMLElement;
 
+  private lastTabsKey = '';
+
   constructor(root: HTMLElement) {
     this.root = root;
-    const initialWorkbook = createBlankWorkbook();
-    this.history = new HistoryManager<WorkbookState>(initialWorkbook, 60);
-    this.chartConfig = suggestChartConfig(initialWorkbook.sheets[0]);
+    this.store = new AppStore(createBlankWorkbook());
 
     const params = new URLSearchParams(window.location.search);
     if (params.get('mode') === 'spatial') {
-      this.layout = 'spatial';
-      this.chartPanelMode = '3d';
+      this.store.layout = 'spatial';
+      this.store.chartPanelMode = '3d';
     }
 
     this.renderAppShell();
     this.initSubsystems();
+    this.bindStoreSubscriptions();
     this.bindGlobalEvents();
-    this.refreshAll();
-  }
-
-  private get workbook(): WorkbookState {
-    return this.history.current;
-  }
-
-  private get activeSheet(): SheetData {
-    const wb = this.workbook;
-    return wb.sheets[wb.activeSheetIndex] ?? wb.sheets[0];
+    this.syncInitialViews();
   }
 
   private renderAppShell(): void {
@@ -173,6 +136,11 @@ class SpatialSheetApp {
         <div class="shrink-0 bg-white border-b border-slate-200 px-4 lg:px-6 py-2 flex flex-wrap items-center justify-between gap-3">
           <div class="flex items-center gap-3 min-w-0">
             <div data-role="file-meta" class="text-xs text-slate-500 truncate"></div>
+            <div
+              data-role="loading-status"
+              aria-live="polite"
+              class="hidden items-center gap-1.5 px-2 py-0.5 rounded-md bg-blue-50 border border-blue-200 text-[11px] font-medium text-blue-700 whitespace-nowrap shrink-0"
+            ></div>
             <div class="h-4 w-px bg-slate-200 hidden sm:block" aria-hidden="true"></div>
             <div data-role="sheet-tabs" class="flex items-center gap-1 overflow-x-auto" role="tablist" aria-label="Sheet tabs"></div>
           </div>
@@ -313,6 +281,9 @@ class SpatialSheetApp {
     this.xrCanvasEl = this.root.querySelector('[data-role="xr-canvas"]')!;
     this.sheetTabsEl = this.root.querySelector('[data-role="sheet-tabs"]')!;
     this.fileMetaEl = this.root.querySelector('[data-role="file-meta"]')!;
+    this.loadingBadgeEl = this.root.querySelector(
+      '[data-role="loading-status"]'
+    )!;
     this.undoBtn = this.root.querySelector('[data-action="undo"]')!;
     this.redoBtn = this.root.querySelector('[data-action="redo"]')!;
     this.searchInput = this.root.querySelector('[data-role="search-input"]')!;
@@ -326,99 +297,53 @@ class SpatialSheetApp {
   private initSubsystems(): void {
     this.spreadsheet = new SpreadsheetGrid(this.gridHostEl, {
       onCellCommit: (rowIndex, colIndex, value) => {
-        const nextSheet = updateSheetCell(
-          this.activeSheet,
-          rowIndex,
-          colIndex,
-          value
-        );
-        this.commitSheetMutation(nextSheet);
+        this.store.commitCellEdit(rowIndex, colIndex, value);
       },
       onSelectCell: (coord) => {
-        this.selectedCell = coord;
-        this.highlightedRowIndex = coord ? coord.rowIndex : null;
-        this.refreshAll();
+        this.store.selectCell(coord);
       },
       onSortColumn: (colIndex) => {
-        if (this.sort.colIndex !== colIndex) {
-          this.sort = {colIndex, direction: 'asc'};
-        } else if (this.sort.direction === 'asc') {
-          this.sort = {colIndex, direction: 'desc'};
-        } else {
-          this.sort = {colIndex: null, direction: null};
-        }
-        this.refreshAll();
+        this.store.toggleSortColumn(colIndex);
       },
       onRenameColumn: (colIndex, newName) => {
-        const nextSheet = renameSheetColumn(this.activeSheet, colIndex, newName);
-        if (nextSheet !== this.activeSheet) {
-          this.commitSheetMutation(nextSheet);
-        } else {
-          this.refreshAll();
-        }
+        this.store.renameColumn(colIndex, newName);
       },
       onDeleteColumn: (colIndex) => {
-        const nextSheet = deleteSheetColumn(this.activeSheet, colIndex);
-        this.chartConfig = suggestChartConfig(nextSheet);
-        this.selectedCell = null;
-        this.commitSheetMutation(nextSheet);
+        this.store.deleteColumn(colIndex);
       },
       onDeleteRow: (rowIndex) => {
-        const nextSheet = deleteSheetRow(this.activeSheet, rowIndex);
-        if (this.highlightedRowIndex === rowIndex) {
-          this.highlightedRowIndex = null;
-        }
-        this.selectedCell = null;
-        this.commitSheetMutation(nextSheet);
+        this.store.deleteRow(rowIndex);
       },
       onAddRow: () => {
-        const nextSheet = addSheetRow(this.activeSheet);
-        const newRowIdx = nextSheet.rows.length - 1;
-        this.selectedCell = {rowIndex: newRowIdx, colIndex: 0};
-        this.highlightedRowIndex = newRowIdx;
-        this.commitSheetMutation(nextSheet);
+        const newRowIdx = this.store.addRow();
         this.spreadsheet.scrollToRow(newRowIdx);
       },
       onAddColumn: () => {
-        const nextSheet = addSheetColumn(this.activeSheet);
-        this.commitSheetMutation(nextSheet);
+        this.store.addColumn();
       },
       onClearSearch: () => {
-        this.searchQuery = '';
         this.searchInput.value = '';
-        this.refreshAll();
+        this.store.clearSearch();
       },
     });
 
     this.chart2d = new InteractiveChart2D(this.chart2dHostEl, {
       onConfigChange: (nextConfig) => {
-        this.chartConfig = nextConfig;
-        this.refreshAll();
+        this.store.setChartConfig(nextConfig);
       },
       onRowSelect: (rowIndex) => {
-        this.highlightedRowIndex = rowIndex;
-        this.selectedCell = {
-          rowIndex,
-          colIndex: this.chartConfig.yColIndices[0] ?? 0,
-        };
-        this.refreshAll();
+        this.store.highlightRowFromChart(rowIndex);
         this.spreadsheet.scrollToRow(rowIndex);
       },
     });
 
     this.spatialStage = new SpatialDataStage({
       onRowSelect: (rowIndex) => {
-        this.highlightedRowIndex = rowIndex;
-        this.selectedCell = {
-          rowIndex,
-          colIndex: this.chartConfig.yColIndices[0] ?? 0,
-        };
-        this.refreshAll();
+        this.store.highlightRowFromChart(rowIndex);
         this.spreadsheet.scrollToRow(rowIndex);
       },
       onSpatialModeChange: (mode: SpatialChartMode) => {
-        this.chartConfig = {...this.chartConfig, spatialMode: mode};
-        this.refreshAll();
+        this.store.setSpatialMode(mode);
       },
     });
 
@@ -445,320 +370,164 @@ class SpatialSheetApp {
     });
   }
 
-  private syncSpatialSize(): void {
-    if (this.isSimulatorFullscreen) {
-      this.spatialStage.resizeToContainer(
-        window.innerWidth,
-        window.innerHeight
-      );
-      return;
-    }
-    const rect = this.xrCanvasMountEl.getBoundingClientRect();
-    if (rect.width > 10 && rect.height > 10) {
-      this.spatialStage.resizeToContainer(rect.width, rect.height);
-    }
-  }
-
-  private bindGlobalEvents(): void {
-    // File input
-    const fileInput = this.root.querySelector<HTMLInputElement>(
-      '[data-role="file-input"]'
-    );
-    fileInput?.addEventListener('change', async () => {
-      const file = fileInput.files?.[0];
-      if (!file) return;
-      await this.loadFile(file);
-      fileInput.value = '';
+  private bindStoreSubscriptions(): void {
+    // 1. Top metadata + Sheet tabs + Search input sync
+    this.store.subscribe(['workbook', 'sheetData'], (changed) => {
+      this.syncMetadataAndTabs();
+      if (changed.has('workbook') && this.searchInput.value !== this.store.searchQuery) {
+        this.searchInput.value = this.store.searchQuery;
+      }
     });
 
-    // New blank sheet button
-    this.root
-      .querySelector('[data-action="new-blank"]')
-      ?.addEventListener('click', () => {
-        this.resetWithWorkbook(createBlankWorkbook());
-      });
-
-    // Exports
-    this.root
-      .querySelector('[data-action="export-csv"]')
-      ?.addEventListener('click', () => {
-        exportSheetAsCsv(this.activeSheet, this.workbook.fileName);
-      });
-    this.root
-      .querySelector('[data-action="export-xlsx"]')
-      ?.addEventListener('click', () => {
-        exportWorkbookAsExcel(this.workbook);
-      });
-
-    // Undo / Redo
-    this.undoBtn.addEventListener('click', () => this.performUndo());
-    this.redoBtn.addEventListener('click', () => this.performRedo());
-
-    // Search
-    this.searchInput.addEventListener('input', () => {
-      this.searchQuery = this.searchInput.value;
-      this.refreshAll();
+    // 2. Undo / Redo buttons
+    this.store.subscribe(['history'], () => {
+      this.undoBtn.disabled = !this.store.history.canUndo;
+      this.redoBtn.disabled = !this.store.history.canRedo;
     });
 
-    // Layout mode switches
-    this.root
-      .querySelectorAll<HTMLButtonElement>('[data-layout]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.layout = btn.dataset.layout as WorkspaceLayout;
-          if (this.layout === 'spatial') {
-            this.chartPanelMode = '3d';
-          } else if (this.layout === 'charts') {
-            this.chartPanelMode = '2d';
-          }
-          this.refreshAll();
-          requestAnimationFrame(() => this.syncSpatialSize());
+    // 3. Loading & error states
+    this.store.subscribe(['loading'], () => this.syncLoadingBanner());
+    this.store.subscribe(['error'], () => this.syncErrorBanner());
+
+    // 4. Layout & 2D/3D visibility
+    this.store.subscribe(['layout', 'vizMode'], () => {
+      this.syncLayoutAndVizVisibility();
+    });
+
+    // 5. Spreadsheet Grid (fine-grained: cell patch vs full window vs selection only)
+    this.store.subscribe(['sheetData', 'visibleRows', 'selection'], (changed) => {
+      if (changed.has('visibleRows')) {
+        this.spreadsheet.setData({
+          sheet: this.store.activeSheet,
+          visibleRowIndices: this.store.visibleRowIndices,
+          sort: this.store.sort,
+          selectedCell: this.store.selectedCell,
+          highlightedRowIndex: this.store.highlightedRowIndex,
         });
-      });
+        return;
+      }
 
-    // Viz sub-tabs (2D vs 3D inside split view)
-    this.root
-      .querySelectorAll<HTMLButtonElement>('[data-viz-tab]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.chartPanelMode = btn.dataset.vizTab as '2d' | '3d';
-          this.refreshAll();
-          requestAnimationFrame(() => this.syncSpatialSize());
+      if (changed.has('sheetData') && this.store.lastCellPatch) {
+        const patch = this.store.lastCellPatch;
+        this.store.lastCellPatch = null;
+        this.spreadsheet.updateSingleCellInPlace(
+          this.store.activeSheet,
+          patch.rowIndex,
+          patch.colIndex
+        );
+        if (changed.has('selection')) {
+          this.spreadsheet.setSelection(
+            this.store.selectedCell,
+            this.store.highlightedRowIndex
+          );
+        }
+        return;
+      }
+
+      if (changed.has('sheetData')) {
+        this.spreadsheet.setData({
+          sheet: this.store.activeSheet,
+          visibleRowIndices: this.store.visibleRowIndices,
+          sort: this.store.sort,
+          selectedCell: this.store.selectedCell,
+          highlightedRowIndex: this.store.highlightedRowIndex,
         });
-      });
+        return;
+      }
 
-    // Spatial 3D mode buttons
-    this.root
-      .querySelectorAll<HTMLButtonElement>('[data-spatial-mode]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const mode = btn.dataset.spatialMode as SpatialChartMode;
-          this.chartConfig = {...this.chartConfig, spatialMode: mode};
-          this.refreshAll();
-        });
-      });
-
-    // XR / Simulator launcher
-    this.root
-      .querySelector('[data-action="toggle-xr"]')
-      ?.addEventListener('click', () => {
-        void this.launchXRorSimulator();
-      });
-
-    this.exitSimBtn.addEventListener('click', () => {
-      this.exitSimulatorMode();
-    });
-
-    // Global keyboard shortcuts (Undo/Redo)
-    window.addEventListener('keydown', (e) => {
-      const target = e.target as HTMLElement | null;
-      const isTextInput =
-        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA';
-      if (isTextInput) return;
-
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        if (e.shiftKey) this.performRedo();
-        else this.performUndo();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-        e.preventDefault();
-        this.performRedo();
+      if (changed.has('selection')) {
+        this.spreadsheet.setSelection(
+          this.store.selectedCell,
+          this.store.highlightedRowIndex
+        );
       }
     });
 
-    // Drag and Drop file upload
-    let dragDepth = 0;
-    window.addEventListener('dragenter', (e) => {
-      if (e.dataTransfer?.types.includes('Files')) {
-        dragDepth++;
-        this.dropOverlayEl.classList.remove('hidden');
+    // 6. 2D Chart updates (skip full rebuild on highlight-only changes)
+    this.store.subscribe(
+      ['sheetData', 'visibleRows', 'chartConfig', 'chartHighlight'],
+      (changed) => {
+        const dataOrConfigChanged =
+          changed.has('sheetData') ||
+          changed.has('visibleRows') ||
+          changed.has('chartConfig');
+
+        if (dataOrConfigChanged) {
+          this.chart2d.setData({
+            sheet: this.store.activeSheet,
+            visibleRowIndices: this.store.visibleRowIndices,
+            config: this.store.chartConfig,
+            highlightedRowIndex: this.store.highlightedRowIndex,
+          });
+        } else if (changed.has('chartHighlight')) {
+          this.chart2d.setHighlight(this.store.highlightedRowIndex);
+        }
       }
-    });
-    window.addEventListener('dragleave', () => {
-      dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) {
-        this.dropOverlayEl.classList.add('hidden');
-      }
-    });
-    window.addEventListener('dragover', (e) => {
-      e.preventDefault();
-    });
-    window.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      dragDepth = 0;
-      this.dropOverlayEl.classList.add('hidden');
-      const file = e.dataTransfer?.files?.[0];
-      if (file) {
-        await this.loadFile(file);
-      }
-    });
-  }
-
-  private async launchXRorSimulator(): Promise<void> {
-    const sessionManager = xb.core.webXRSessionManager;
-    const isXRSupported =
-      typeof navigator !== 'undefined' &&
-      'xr' in navigator &&
-      (await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false));
-
-    if (isXRSupported && sessionManager) {
-      await sessionManager.startSession();
-      return;
-    }
-
-    // Desktop Simulator fullscreen mode
-    this.isSimulatorFullscreen = true;
-    this.spatialHostEl.classList.remove('hidden');
-    this.spatialHostEl.classList.add(
-      'fixed',
-      'inset-0',
-      'z-50',
-      'rounded-none'
-    );
-    this.exitSimBtn.classList.remove('hidden');
-    this.exitSimBtn.classList.add('inline-flex');
-    this.spatialStage.setEmbeddedVisible(true);
-    this.syncSpatialSize();
-    xb.core.options.enableSimulator = true;
-    await xb.core.startSimulator();
-  }
-
-  private exitSimulatorMode(): void {
-    this.isSimulatorFullscreen = false;
-    this.spatialHostEl.classList.remove(
-      'fixed',
-      'inset-0',
-      'z-50',
-      'rounded-none'
-    );
-    this.exitSimBtn.classList.add('hidden');
-    this.exitSimBtn.classList.remove('inline-flex');
-    this.spatialStage.onXRSessionEnded();
-    this.refreshAll();
-    requestAnimationFrame(() => this.syncSpatialSize());
-  }
-
-  private async loadFile(file: File): Promise<void> {
-    this.hideError();
-    try {
-      const wb = await importTabularFile(file);
-      this.resetWithWorkbook(wb);
-    } catch (err) {
-      const msg =
-        err instanceof Error ? err.message : 'Unable to read the selected file.';
-      this.showError(`Error reading "${file.name}": ${msg}`);
-    }
-  }
-
-  private showError(message: string): void {
-    this.errorBannerEl.innerHTML = `
-      <span>${escapeHtml(message)}</span>
-      <button type="button" data-close-err class="text-rose-700 font-semibold hover:underline cursor-pointer">Dismiss</button>
-    `;
-    this.errorBannerEl.classList.remove('hidden');
-    this.errorBannerEl.classList.add('flex');
-    this.errorBannerEl
-      .querySelector('[data-close-err]')
-      ?.addEventListener('click', () => this.hideError());
-  }
-
-  private hideError(): void {
-    this.errorBannerEl.classList.add('hidden');
-    this.errorBannerEl.classList.remove('flex');
-  }
-
-  private resetWithWorkbook(wb: WorkbookState): void {
-    this.history.reset(wb);
-    this.searchQuery = '';
-    this.searchInput.value = '';
-    this.sort = {colIndex: null, direction: null};
-    this.selectedCell = wb.sheets[0].rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
-    this.highlightedRowIndex = null;
-    this.chartConfig = suggestChartConfig(wb.sheets[0]);
-    this.refreshAll();
-  }
-
-  private commitSheetMutation(nextSheet: SheetData): void {
-    const nextWb = cloneWorkbook(this.workbook);
-    nextWb.sheets[nextWb.activeSheetIndex] = nextSheet;
-    this.history.push(nextWb);
-    this.refreshAll();
-  }
-
-  private performUndo(): void {
-    if (this.history.undo()) {
-      this.selectedCell = null;
-      this.highlightedRowIndex = null;
-      this.refreshAll();
-    }
-  }
-
-  private performRedo(): void {
-    if (this.history.redo()) {
-      this.selectedCell = null;
-      this.highlightedRowIndex = null;
-      this.refreshAll();
-    }
-  }
-
-  private switchSheet(index: number): void {
-    if (index < 0 || index >= this.workbook.sheets.length) return;
-    const nextWb = cloneWorkbook(this.workbook);
-    nextWb.activeSheetIndex = index;
-    this.history.push(nextWb);
-    this.searchQuery = '';
-    this.searchInput.value = '';
-    this.sort = {colIndex: null, direction: null};
-    this.selectedCell = {rowIndex: 0, colIndex: 0};
-    this.highlightedRowIndex = null;
-    this.chartConfig = suggestChartConfig(this.activeSheet);
-    this.refreshAll();
-  }
-
-  private addNewSheet(): void {
-    const nextWb = cloneWorkbook(this.workbook);
-    const num = nextWb.sheets.length + 1;
-    const blank = createBlankWorkbook().sheets[0];
-    blank.id = `sheet-${Date.now()}`;
-    blank.name = `Sheet ${num}`;
-    nextWb.sheets.push(blank);
-    nextWb.activeSheetIndex = nextWb.sheets.length - 1;
-    this.history.push(nextWb);
-    this.chartConfig = suggestChartConfig(blank);
-    this.selectedCell = {rowIndex: 0, colIndex: 0};
-    this.refreshAll();
-  }
-
-  private refreshAll(): void {
-    const sheet = this.activeSheet;
-    const visibleRowIndices = filterAndSortRows(
-      sheet,
-      this.searchQuery,
-      this.sort
     );
 
-    // Clamp chart axis indices if columns were deleted
-    const maxCol = Math.max(0, sheet.columns.length - 1);
-    const clampedX = Math.min(this.chartConfig.xColIndex, maxCol);
-    const validY = this.chartConfig.yColIndices.filter((c) => c <= maxCol);
-    if (
-      clampedX !== this.chartConfig.xColIndex ||
-      validY.length !== this.chartConfig.yColIndices.length
-    ) {
-      this.chartConfig = {
-        ...this.chartConfig,
-        xColIndex: clampedX,
-        yColIndices: validY.length > 0 ? validY : [Math.min(1, maxCol)],
-      };
-    }
+    // 7. 3D XR Stage updates (pooled & lazy-synced when hidden)
+    this.store.subscribe(
+      ['sheetData', 'visibleRows', 'chartConfig', 'chartHighlight'],
+      (changed) => {
+        const dataOrConfigChanged =
+          changed.has('sheetData') ||
+          changed.has('visibleRows') ||
+          changed.has('chartConfig');
 
-    // Update top metadata (unboxed clean text with typographic separators)
-    this.fileMetaEl.textContent = `${this.workbook.fileName} · ${sheet.rows.length} rows · ${sheet.columns.length} cols`;
+        if (dataOrConfigChanged) {
+          this.spatialStage.setData({
+            sheet: this.store.activeSheet,
+            visibleRowIndices: this.store.visibleRowIndices,
+            config: this.store.chartConfig,
+            highlightedRowIndex: this.store.highlightedRowIndex,
+          });
+        } else if (changed.has('chartHighlight')) {
+          this.spatialStage.setHighlight(this.store.highlightedRowIndex);
+        }
+      }
+    );
+  }
 
-    // Update sheet tabs
-    const tabsHtml = this.workbook.sheets
+  private syncInitialViews(): void {
+    this.syncMetadataAndTabs();
+    this.undoBtn.disabled = !this.store.history.canUndo;
+    this.redoBtn.disabled = !this.store.history.canRedo;
+    this.syncLayoutAndVizVisibility();
+
+    const params = {
+      sheet: this.store.activeSheet,
+      visibleRowIndices: this.store.visibleRowIndices,
+      sort: this.store.sort,
+      selectedCell: this.store.selectedCell,
+      highlightedRowIndex: this.store.highlightedRowIndex,
+    };
+    this.spreadsheet.setData(params);
+    this.chart2d.setData({
+      sheet: this.store.activeSheet,
+      visibleRowIndices: this.store.visibleRowIndices,
+      config: this.store.chartConfig,
+      highlightedRowIndex: this.store.highlightedRowIndex,
+    });
+    this.spatialStage.setData({
+      sheet: this.store.activeSheet,
+      visibleRowIndices: this.store.visibleRowIndices,
+      config: this.store.chartConfig,
+      highlightedRowIndex: this.store.highlightedRowIndex,
+    });
+  }
+
+  private syncMetadataAndTabs(): void {
+    const wb = this.store.workbook;
+    const sheet = this.store.activeSheet;
+    this.fileMetaEl.textContent = `${wb.fileName} · ${sheet.rows.length.toLocaleString('en-US')} rows · ${sheet.columns.length} cols`;
+
+    const tabsKey = `${wb.activeSheetIndex}|${wb.sheets.map((s) => `${s.id}:${s.name}`).join('\x00')}`;
+    if (tabsKey === this.lastTabsKey) return;
+    this.lastTabsKey = tabsKey;
+
+    const tabsHtml = wb.sheets
       .map((s, idx) => {
-        const active = idx === this.workbook.activeSheetIndex;
+        const active = idx === wb.activeSheetIndex;
         const cls = active
           ? 'bg-blue-50 text-blue-700 font-semibold border-blue-200'
           : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50';
@@ -784,100 +553,304 @@ class SpatialSheetApp {
         class="p-1 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 cursor-pointer shrink-0"
       >${svgIcon('plus', 'w-3.5 h-3.5')}</button>
     `;
+  }
 
-    this.sheetTabsEl
-      .querySelectorAll<HTMLButtonElement>('[data-sheet-tab]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.switchSheet(Number(btn.dataset.sheetTab));
-        });
-      });
-    this.sheetTabsEl
-      .querySelector('[data-action="add-sheet"]')
-      ?.addEventListener('click', () => this.addNewSheet());
+  private syncLoadingBanner(): void {
+    const {active, message, progress} = this.store.loading;
+    if (!active) {
+      this.loadingBadgeEl.classList.add('hidden');
+      this.loadingBadgeEl.classList.remove('inline-flex');
+      this.loadingBadgeEl.textContent = '';
+      return;
+    }
+    const pct =
+      progress !== null ? ` (${Math.round(progress * 100)}%)` : '';
+    this.loadingBadgeEl.textContent = `${message}${pct}`;
+    this.loadingBadgeEl.classList.remove('hidden');
+    this.loadingBadgeEl.classList.add('inline-flex');
+  }
 
-    // Undo / Redo state
-    this.undoBtn.disabled = !this.history.canUndo;
-    this.redoBtn.disabled = !this.history.canRedo;
+  private syncErrorBanner(): void {
+    const msg = this.store.errorMessage;
+    if (!msg) {
+      this.errorBannerEl.classList.add('hidden');
+      this.errorBannerEl.classList.remove('flex');
+      return;
+    }
+    this.errorBannerEl.innerHTML = `
+      <span>${escapeHtml(msg)}</span>
+      <button type="button" data-close-err class="text-rose-700 font-semibold hover:underline cursor-pointer">Dismiss</button>
+    `;
+    this.errorBannerEl.classList.remove('hidden');
+    this.errorBannerEl.classList.add('flex');
+  }
 
-    // Layout button styling
+  private syncLayoutAndVizVisibility(): void {
+    const {layout, chartPanelMode, chartConfig, isSimulatorFullscreen} =
+      this.store;
+
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-layout]')
       .forEach((btn) => {
-        const active = btn.dataset.layout === this.layout;
+        const active = btn.dataset.layout === layout;
         btn.className = active
           ? 'inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md bg-white text-blue-700 font-semibold shadow-xs whitespace-nowrap shrink-0 cursor-pointer'
           : 'inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md text-slate-600 hover:text-slate-900 whitespace-nowrap shrink-0 cursor-pointer';
       });
 
-    // Viz sub-tab styling
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-viz-tab]')
       .forEach((btn) => {
-        const active = btn.dataset.vizTab === this.chartPanelMode;
+        const active = btn.dataset.vizTab === chartPanelMode;
         btn.className = active
           ? 'px-3 py-1 text-xs rounded-md bg-white text-slate-900 font-semibold shadow-xs transition-colors whitespace-nowrap shrink-0 cursor-pointer'
           : 'px-3 py-1 text-xs rounded-md text-slate-600 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer';
       });
 
-    // Spatial mode button styling
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-spatial-mode]')
       .forEach((btn) => {
-        const active = btn.dataset.spatialMode === this.chartConfig.spatialMode;
+        const active = btn.dataset.spatialMode === chartConfig.spatialMode;
         btn.className = active
           ? 'px-2.5 py-1 rounded-md bg-blue-600 text-white font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer'
           : 'px-2.5 py-1 rounded-md text-slate-300 hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer';
       });
 
-    // Apply layout grid visibility
-    if (this.layout === 'table') {
-      this.gridHostEl.className = 'lg:col-span-12 min-h-0 h-full flex flex-col';
+    if (layout === 'table') {
+      this.gridHostEl.className =
+        'lg:col-span-12 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col';
       this.vizHostEl.classList.add('hidden');
-    } else if (this.layout === 'charts' || this.layout === 'spatial') {
+    } else if (layout === 'charts' || layout === 'spatial') {
       this.gridHostEl.classList.add('hidden');
       this.vizHostEl.className =
-        'lg:col-span-12 min-h-0 h-full flex flex-col gap-2';
+        'lg:col-span-12 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col gap-2';
     } else {
-      this.gridHostEl.className = 'lg:col-span-7 min-h-0 h-full flex flex-col';
+      this.gridHostEl.className =
+        'lg:col-span-7 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col';
       this.vizHostEl.className =
-        'lg:col-span-5 min-h-0 h-full flex flex-col gap-2';
+        'lg:col-span-5 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col gap-2';
     }
 
     const show3D =
-      this.layout === 'spatial' ||
-      (this.layout !== 'table' && this.chartPanelMode === '3d');
-    const show2D = this.layout !== 'table' && !show3D;
+      layout === 'spatial' || (layout !== 'table' && chartPanelMode === '3d');
+    const show2D = layout !== 'table' && !show3D;
 
     this.chart2dHostEl.classList.toggle('hidden', !show2D);
-    if (!this.isSimulatorFullscreen) {
+    if (!isSimulatorFullscreen) {
       this.spatialHostEl.classList.toggle('hidden', !show3D);
       this.spatialHostEl.classList.toggle('flex', show3D);
     }
 
-    // Update components
-    this.spreadsheet.setData({
-      sheet,
-      visibleRowIndices,
-      sort: this.sort,
-      selectedCell: this.selectedCell,
-      highlightedRowIndex: this.highlightedRowIndex,
+    this.spatialStage.setEmbeddedVisible(show3D || isSimulatorFullscreen);
+    if (show3D) {
+      requestAnimationFrame(() => this.syncSpatialSize());
+    }
+  }
+
+  private syncSpatialSize(): void {
+    if (this.store.isSimulatorFullscreen) {
+      this.spatialStage.resizeToContainer(
+        window.innerWidth,
+        window.innerHeight
+      );
+      return;
+    }
+    const rect = this.xrCanvasMountEl.getBoundingClientRect();
+    if (rect.width > 10 && rect.height > 10) {
+      this.spatialStage.resizeToContainer(rect.width, rect.height);
+    }
+  }
+
+  private bindGlobalEvents(): void {
+    // Delegated sheet tabs
+    this.sheetTabsEl.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const tabBtn = target.closest<HTMLElement>('[data-sheet-tab]');
+      if (tabBtn) {
+        this.store.switchSheet(Number(tabBtn.dataset.sheetTab));
+        return;
+      }
+      if (target.closest('[data-action="add-sheet"]')) {
+        this.store.addNewSheet();
+      }
     });
 
-    this.chart2d.setData({
-      sheet,
-      visibleRowIndices,
-      config: this.chartConfig,
-      highlightedRowIndex: this.highlightedRowIndex,
+    // Delegated error dismiss
+    this.errorBannerEl.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-close-err]')) {
+        this.store.dismissError();
+      }
     });
 
-    this.spatialStage.setEmbeddedVisible(show3D);
-    this.spatialStage.setData({
-      sheet,
-      visibleRowIndices,
-      config: this.chartConfig,
-      highlightedRowIndex: this.highlightedRowIndex,
+    // File input
+    const fileInput = this.root.querySelector<HTMLInputElement>(
+      '[data-role="file-input"]'
+    );
+    fileInput?.addEventListener('change', async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      await this.store.loadFile(file);
+      fileInput.value = '';
     });
+
+    // New blank sheet button
+    this.root
+      .querySelector('[data-action="new-blank"]')
+      ?.addEventListener('click', () => {
+        this.store.resetWithWorkbook(createBlankWorkbook());
+      });
+
+    // Exports
+    this.root
+      .querySelector('[data-action="export-csv"]')
+      ?.addEventListener('click', () => {
+        exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName);
+      });
+    this.root
+      .querySelector('[data-action="export-xlsx"]')
+      ?.addEventListener('click', () => {
+        exportWorkbookAsExcel(this.store.workbook);
+      });
+
+    // Undo / Redo
+    this.undoBtn.addEventListener('click', () => this.store.undo());
+    this.redoBtn.addEventListener('click', () => this.store.redo());
+
+    // Debounced Search
+    this.searchInput.addEventListener('input', () => {
+      this.store.setSearchQueryDebounced(this.searchInput.value);
+    });
+
+    // Layout mode switches
+    this.root
+      .querySelectorAll<HTMLButtonElement>('[data-layout]')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          this.store.setLayout(btn.dataset.layout as WorkspaceLayout);
+        });
+      });
+
+    // Viz sub-tabs
+    this.root
+      .querySelectorAll<HTMLButtonElement>('[data-viz-tab]')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          this.store.setChartPanelMode(btn.dataset.vizTab as '2d' | '3d');
+        });
+      });
+
+    // Spatial 3D mode buttons
+    this.root
+      .querySelectorAll<HTMLButtonElement>('[data-spatial-mode]')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          this.store.setSpatialMode(
+            btn.dataset.spatialMode as SpatialChartMode
+          );
+        });
+      });
+
+    // XR / Simulator launcher
+    this.root
+      .querySelector('[data-action="toggle-xr"]')
+      ?.addEventListener('click', () => {
+        void this.launchXRorSimulator();
+      });
+
+    this.exitSimBtn.addEventListener('click', () => {
+      this.exitSimulatorMode();
+    });
+
+    // Global keyboard shortcuts (Undo/Redo)
+    window.addEventListener('keydown', (e) => {
+      const target = e.target as HTMLElement | null;
+      const isTextInput =
+        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA';
+      if (isTextInput) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) this.store.redo();
+        else this.store.undo();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault();
+        this.store.redo();
+      }
+    });
+
+    // Drag and Drop file upload
+    let dragDepth = 0;
+    window.addEventListener('dragenter', (e) => {
+      if (e.dataTransfer?.types.includes('Files')) {
+        dragDepth++;
+        this.dropOverlayEl.classList.remove('hidden');
+        this.dropOverlayEl.classList.add('flex');
+      }
+    });
+    window.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) {
+        this.dropOverlayEl.classList.add('hidden');
+        this.dropOverlayEl.classList.remove('flex');
+      }
+    });
+    window.addEventListener('dragover', (e) => {
+      e.preventDefault();
+    });
+    window.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      this.dropOverlayEl.classList.add('hidden');
+      this.dropOverlayEl.classList.remove('flex');
+      const file = e.dataTransfer?.files?.[0];
+      if (file) {
+        await this.store.loadFile(file);
+      }
+    });
+  }
+
+  private async launchXRorSimulator(): Promise<void> {
+    const sessionManager = xb.core.webXRSessionManager;
+    const isXRSupported =
+      typeof navigator !== 'undefined' &&
+      'xr' in navigator &&
+      (await navigator.xr?.isSessionSupported('immersive-ar').catch(() => false));
+
+    if (isXRSupported && sessionManager) {
+      await sessionManager.startSession();
+      return;
+    }
+
+    this.store.setSimulatorFullscreen(true);
+    this.spatialHostEl.classList.remove('hidden');
+    this.spatialHostEl.classList.add(
+      'fixed',
+      'inset-0',
+      'z-50',
+      'rounded-none',
+      'flex'
+    );
+    this.exitSimBtn.classList.remove('hidden');
+    this.exitSimBtn.classList.add('inline-flex');
+    this.syncSpatialSize();
+    xb.core.options.enableSimulator = true;
+    await xb.core.startSimulator();
+  }
+
+  private exitSimulatorMode(): void {
+    this.spatialHostEl.classList.remove(
+      'fixed',
+      'inset-0',
+      'z-50',
+      'rounded-none'
+    );
+    this.exitSimBtn.classList.add('hidden');
+    this.exitSimBtn.classList.remove('inline-flex');
+    this.spatialStage.onXRSessionEnded();
+    this.store.setSimulatorFullscreen(false);
+    requestAnimationFrame(() => this.syncSpatialSize());
   }
 }
 

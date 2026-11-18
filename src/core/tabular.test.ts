@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {WorkbookHistoryManager} from './history';
 import {
   HistoryManager,
   addSheetColumn,
@@ -10,12 +11,21 @@ import {
   deleteSheetColumn,
   deleteSheetRow,
   filterAndSortRows,
+  filterAndSortRowsBuffer,
+  normalizeRecordsToSheet,
+  parseCsvRecords,
   parseCsvText,
   parseNumericValue,
   serializeCsv,
   suggestChartConfig,
   updateSheetCell,
 } from './tabular';
+import {
+  computeColumnVirtualWindow,
+  computeRowVirtualWindow,
+  computeScrollTopForRow,
+  sampleChartIndices,
+} from './virtualWindow';
 
 test('columnIndexToLetter maps Excel-style columns', () => {
   assert.equal(columnIndexToLetter(0), 'A');
@@ -23,10 +33,10 @@ test('columnIndexToLetter maps Excel-style columns', () => {
   assert.equal(columnIndexToLetter(26), 'AA');
 });
 
-test('parseCsvText handles UTF-8 BOM, Vietnamese text, and quoted commas', () => {
+test('parseCsvText handles UTF-8 BOM, multiline quoted fields, escaped quotes, and quoted commas', () => {
   const csv = [
     '\uFEFFKhu vực,Doanh thu,"Ghi chú, chi tiết",Tăng trưởng',
-    '"Hà Nội",1250,"Tăng mạnh, quý 1",18.5%',
+    '"Hà Nội",1250,"Tăng mạnh,\n""quý 1""",18.5%',
     '"TP. Hồ Chí Minh",2400,"Ổn định",24%',
   ].join('\n');
 
@@ -39,7 +49,7 @@ test('parseCsvText handles UTF-8 BOM, Vietnamese text, and quoted commas', () =>
     'Tăng trưởng',
   ]);
   assert.equal(sheet.rows.length, 2);
-  assert.equal(sheet.rows[0][2], 'Tăng mạnh, quý 1');
+  assert.equal(sheet.rows[0][2], 'Tăng mạnh,\n"quý 1"');
   assert.deepEqual(sheet.types, ['text', 'number', 'text', 'percent']);
 });
 
@@ -91,9 +101,9 @@ test('computeColumnStats calculates sum, avg, min, max accurately', () => {
   assert.equal(stats.max, 250);
 });
 
-test('filterAndSortRows maps filtered & sorted indices back to original rows', () => {
+test('filterAndSortRows and filterAndSortRowsBuffer map filtered & sorted indices accurately', () => {
   const sheet = parseCsvText(
-    'Tên,Điểm\nAn,80\nBình,95\nChâu,70\nBảo,88'
+    'Tên,Điểm,Tỷ lệ\nAn,80,10%\nBình,95,25%\nChâu,70,5%\nBảo,88,18%'
   );
   const filtered = filterAndSortRows(sheet, 'B', {
     colIndex: 1,
@@ -101,6 +111,12 @@ test('filterAndSortRows maps filtered & sorted indices back to original rows', (
   });
   // Matches Bình (row 1, 95) and Bảo (row 3, 88) -> ascending order: [3, 1]
   assert.deepEqual(filtered, [3, 1]);
+
+  const bufDesc = filterAndSortRowsBuffer(sheet, '', {
+    colIndex: 2,
+    direction: 'desc',
+  });
+  assert.deepEqual(Array.from(bufDesc), [1, 3, 0, 2]);
 });
 
 test('editing cells, adding/deleting rows & columns, and HistoryManager undo/redo work', () => {
@@ -141,6 +157,131 @@ test('editing cells, adding/deleting rows & columns, and HistoryManager undo/red
   assert.equal(history.canRedo, true);
 });
 
+test('updateSheetCell preserves structural sharing for untouched rows', () => {
+  const sheet = parseCsvText('ColA,ColB\n1,2\n3,4\n5,6');
+  const updated = updateSheetCell(sheet, 1, 0, '99');
+  assert.notEqual(updated.rows, sheet.rows);
+  assert.notEqual(updated.rows[1], sheet.rows[1]);
+  assert.equal(updated.rows[0], sheet.rows[0]);
+  assert.equal(updated.rows[2], sheet.rows[2]);
+  assert.equal(updated.rows[1][0], '99');
+});
+
+test('normalizeRecordsToSheet handles 100,000 rows x 20 columns without stack overflow', () => {
+  const cols = 20;
+  const rowCount = 100_000;
+  const records: string[][] = new Array(rowCount + 1);
+  records[0] = Array.from({length: cols}, (_, c) => `Col_${c}`);
+  for (let r = 1; r <= rowCount; r++) {
+    const row = new Array<string>(cols);
+    row[0] = `Row ${r}`;
+    for (let c = 1; c < cols; c++) {
+      row[c] = String((r * c) % 1000);
+    }
+    records[r] = row;
+  }
+
+  const sheet = normalizeRecordsToSheet(records, 'BigSheet', 'big-1');
+  assert.equal(sheet.rows.length, rowCount);
+  assert.equal(sheet.columns.length, cols);
+  assert.equal(sheet.types[0], 'text');
+  assert.equal(sheet.types[1], 'number');
+
+  const parsed = parseCsvRecords('a,b\n1,2\n3,4');
+  assert.equal(parsed.length, 3);
+});
+
+test('virtualWindow computes row/column ranges, scroll targets, and chart sampling accurately', () => {
+  const rowWin = computeRowVirtualWindow({
+    totalRows: 100_000,
+    scrollTop: 36 * 50_000,
+    viewportHeight: 540,
+    rowHeight: 36,
+    overscan: 8,
+  });
+  assert.equal(rowWin.start, 49_992);
+  assert.equal(rowWin.end, 50_023);
+  assert.equal(rowWin.offsetTop, 49_992 * 36);
+  assert.equal(rowWin.offsetBottom, (100_000 - 50_023) * 36);
+
+  const nonVirtCols = computeColumnVirtualWindow({
+    totalCols: 10,
+    scrollLeft: 0,
+    viewportWidth: 1000,
+    colWidths: new Array(10).fill(140),
+    fixedLeftWidth: 120,
+    overscan: 2,
+  });
+  assert.equal(nonVirtCols.virtualized, false);
+  assert.equal(nonVirtCols.start, 0);
+  assert.equal(nonVirtCols.end, 10);
+
+  const virtCols = computeColumnVirtualWindow({
+    totalCols: 20,
+    scrollLeft: 600,
+    viewportWidth: 920,
+    colWidths: new Array(20).fill(150),
+    fixedLeftWidth: 120,
+    overscan: 2,
+  });
+  assert.equal(virtCols.virtualized, true);
+  assert.equal(virtCols.start, 2);
+  assert.equal(virtCols.end, 12);
+  assert.equal(virtCols.leftWidth, 300);
+  assert.equal(virtCols.rightWidth, 8 * 150);
+
+  const scrollTargetDown = computeScrollTopForRow({
+    displayIndex: 30,
+    rowHeight: 36,
+    currentScrollTop: 0,
+    viewportHeight: 400,
+    headerHeight: 40,
+  });
+  assert.equal(scrollTargetDown, 31 * 36 - 360);
+
+  const scrollInView = computeScrollTopForRow({
+    displayIndex: 2,
+    rowHeight: 36,
+    currentScrollTop: 0,
+    viewportHeight: 400,
+    headerHeight: 40,
+  });
+  assert.equal(scrollInView, null);
+
+  const big = new Int32Array(100_000);
+  for (let i = 0; i < 100_000; i++) big[i] = i;
+  const sampled = sampleChartIndices(big, 32);
+  assert.equal(sampled.length, 32);
+  assert.equal(sampled[0], 0);
+  assert.equal(sampled[31], 99_999);
+});
+
+test('WorkbookHistoryManager commits O(1) cell patches, structural edits, undo/redo, and caps depth', () => {
+  const wb = createBlankWorkbook();
+  const history = new WorkbookHistoryManager(wb, 3);
+  const initialRow1 = history.current.sheets[0].rows[1];
+
+  assert.equal(history.commitCellEdit(0, 0, 'Alpha'), true);
+  assert.equal(history.commitCellEdit(0, 0, 'Alpha'), false); // no-op
+  assert.equal(history.current.sheets[0].rows[0][0], 'Alpha');
+  assert.equal(history.current.sheets[0].rows[1], initialRow1); // structural sharing
+
+  const undo1 = history.undo();
+  assert.ok(undo1);
+  assert.equal(history.current.sheets[0].rows[0][0], '');
+  assert.equal(history.current.sheets[0].rows[1], initialRow1);
+
+  const redo1 = history.redo();
+  assert.ok(redo1);
+  assert.equal(history.current.sheets[0].rows[0][0], 'Alpha');
+
+  history.commitCellEdit(0, 1, 'Beta');
+  history.commitCellEdit(1, 0, 'Gamma');
+  history.commitSheetSnapshot(addSheetRow(history.current.sheets[0]));
+  // maxDepth = 3, so oldest entry dropped
+  assert.equal(history.depth, 3);
+});
+
 test('suggestChartConfig selects text X column and numeric Y columns', () => {
   const sheet = parseCsvText('Tháng,Doanh thu,Lợi nhuận\nT1,100,30\nT2,120,40');
   const cfg = suggestChartConfig(sheet);
@@ -157,3 +298,4 @@ test('createBlankWorkbook creates an empty editable workbook without sample data
   assert.equal(wb.sheets[0].rows.length, 6);
   assert.equal(wb.sheets[0].rows.flat().every((cell) => cell === ''), true);
 });
+

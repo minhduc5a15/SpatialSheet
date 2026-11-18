@@ -11,7 +11,10 @@ function stripExtension(fileName: string): string {
   return dot > 0 ? fileName.slice(0, dot) : fileName;
 }
 
-export async function importTabularFile(file: File): Promise<WorkbookState> {
+export async function importTabularFile(
+  file: File,
+  onProgress?: (progress: number, message: string) => void
+): Promise<WorkbookState> {
   const nameLower = file.name.toLowerCase();
 
   if (
@@ -19,8 +22,11 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
     nameLower.endsWith('.tsv') ||
     nameLower.endsWith('.txt')
   ) {
+    onProgress?.(0.15, `Reading ${file.name}…`);
     const text = await file.text();
+    onProgress?.(0.55, `Parsing CSV rows…`);
     const sheet = parseCsvText(text, stripExtension(file.name), 'sheet-0');
+    onProgress?.(1, 'Ready');
     return {
       fileName: file.name,
       fileFormat: nameLower.endsWith('.tsv') ? 'tsv' : 'csv',
@@ -30,7 +36,9 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
   }
 
   if (nameLower.endsWith('.json')) {
+    onProgress?.(0.15, `Reading ${file.name}…`);
     const raw = await file.text();
+    onProgress?.(0.5, `Parsing JSON records…`);
     const parsed: unknown = JSON.parse(raw);
     const records: unknown[][] = [];
 
@@ -60,6 +68,7 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
       stripExtension(file.name),
       'sheet-0'
     );
+    onProgress?.(1, 'Ready');
     return {
       fileName: file.name,
       fileFormat: 'json',
@@ -69,8 +78,11 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
   }
 
   // Excel / ODS via SheetJS
+  onProgress?.(0.15, `Reading ${file.name}…`);
   const buffer = await file.arrayBuffer();
+  onProgress?.(0.45, `Decoding spreadsheet…`);
   const wb = XLSX.read(buffer, {type: 'array'});
+  const totalSheets = Math.max(1, wb.SheetNames.length);
   const sheets: SheetData[] = wb.SheetNames.map((sheetName, idx) => {
     const ws = wb.Sheets[sheetName];
     const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, {
@@ -78,6 +90,10 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
       defval: '',
       raw: false,
     });
+    onProgress?.(
+      0.5 + ((idx + 1) / totalSheets) * 0.45,
+      `Normalizing ${sheetName}…`
+    );
     return normalizeRecordsToSheet(aoa, sheetName, `sheet-${idx}`);
   });
 
@@ -85,6 +101,7 @@ export async function importTabularFile(file: File): Promise<WorkbookState> {
     sheets.push(normalizeRecordsToSheet([], 'Sheet1', 'sheet-0'));
   }
 
+  onProgress?.(1, 'Ready');
   return {
     fileName: file.name,
     fileFormat: 'xlsx',

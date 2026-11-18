@@ -50,3 +50,42 @@ export interface ChartConfig {
   yColIndices: number[];
   spatialMode: SpatialChartMode;
 }
+
+export interface VirtualRange {
+  start: number;
+  end: number;
+  total: number;
+  offsetTop: number;
+  offsetBottom: number;
+}
+
+export interface ColumnVirtualRange {
+  start: number;
+  end: number;
+  total: number;
+  leftWidth: number;
+  rightWidth: number;
+  virtualized: boolean;
+}
+
+export interface LoadingState {
+  active: boolean;
+  message: string;
+  progress: number | null;
+}
+
+export type AppDomain =
+  | 'workbook'
+  | 'sheetData'
+  | 'visibleRows'
+  | 'selection'
+  | 'stats'
+  | 'chartConfig'
+  | 'chartHighlight'
+  | 'layout'
+  | 'vizMode'
+  | 'loading'
+  | 'error'
+  | 'history';
+
+export type VisibleRowsSource = number[] | Int32Array;

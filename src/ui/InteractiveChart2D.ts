@@ -1,10 +1,18 @@
-import type {ChartConfig, ChartType, SheetData} from '../types';
+import type {
+  ChartConfig,
+  ChartType,
+  SheetData,
+  VisibleRowsSource,
+} from '../types';
 import {
   CHART_PALETTE,
   formatDisplayNumber,
   parseNumericValue,
 } from '../core/tabular';
+import {sampleChartIndices} from '../core/virtualWindow';
 import {svgIcon} from './icons';
+
+const MAX_CHART_POINTS = 32;
 
 export interface Chart2DCallbacks {
   onConfigChange: (config: ChartConfig) => void;
@@ -15,6 +23,7 @@ interface DataPointRow {
   rowIndex: number;
   label: string;
   values: number[];
+  hasAnyNumeric: boolean;
   xNumeric: number | null;
 }
 
@@ -34,7 +43,7 @@ export class InteractiveChart2D {
   private container: HTMLElement;
   private callbacks: Chart2DCallbacks;
   private sheet: SheetData | null = null;
-  private visibleRowIndices: number[] = [];
+  private visibleRowIndices: VisibleRowsSource = [];
   private config: ChartConfig = {
     type: 'bar',
     xColIndex: 0,
@@ -47,6 +56,18 @@ export class InteractiveChart2D {
   private chartCanvasWrapEl: HTMLElement | null = null;
   private legendEl: HTMLElement | null = null;
   private tooltipEl: HTMLElement | null = null;
+
+  // Memoization keys & caches
+  private lastControlsKey = '';
+  private lastPointsKey: {
+    sheet: SheetData | null;
+    visibleRowIndices: VisibleRowsSource | null;
+    xColIndex: number;
+    yKey: string;
+  } | null = null;
+  private cachedPoints: DataPointRow[] = [];
+  private cachedHasNumeric = false;
+  private activeTooltipTarget: Element | null = null;
 
   constructor(container: HTMLElement, callbacks: Chart2DCallbacks) {
     this.container = container;
@@ -75,7 +96,7 @@ export class InteractiveChart2D {
         <!-- Chart Legend -->
         <div
           data-role="chart-legend"
-          class="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-700"
+          class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-3 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-700"
         ></div>
       </div>
     `;
@@ -90,11 +111,108 @@ export class InteractiveChart2D {
     this.tooltipEl = this.container.querySelector(
       '[data-role="chart-tooltip"]'
     );
+
+    this.bindDelegatedEvents();
+  }
+
+  private bindDelegatedEvents(): void {
+    if (this.chartControlsEl) {
+      this.chartControlsEl.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+
+        const typeBtn = target.closest<HTMLButtonElement>('[data-chart-type]');
+        if (typeBtn) {
+          const nextType = typeBtn.dataset.chartType as ChartType;
+          if (nextType !== this.config.type) {
+            this.callbacks.onConfigChange({
+              ...this.config,
+              type: nextType,
+            });
+          }
+          return;
+        }
+
+        const yBtn = target.closest<HTMLButtonElement>('[data-y-col]');
+        if (yBtn) {
+          const colIdx = Number(yBtn.dataset.yCol);
+          const exists = this.config.yColIndices.includes(colIdx);
+          let nextY: number[];
+          if (exists) {
+            if (this.config.yColIndices.length === 1) return;
+            nextY = this.config.yColIndices.filter((c) => c !== colIdx);
+          } else {
+            nextY = [...this.config.yColIndices, colIdx].slice(-4);
+          }
+          this.callbacks.onConfigChange({
+            ...this.config,
+            yColIndices: nextY,
+          });
+        }
+      });
+
+      this.chartControlsEl.addEventListener('change', (e) => {
+        const target = e.target as HTMLElement | null;
+        if (
+          target instanceof HTMLSelectElement &&
+          target.dataset.role === 'x-axis-select'
+        ) {
+          this.callbacks.onConfigChange({
+            ...this.config,
+            xColIndex: Number(target.value),
+          });
+        }
+      });
+    }
+
+    if (this.chartCanvasWrapEl) {
+      this.chartCanvasWrapEl.addEventListener('click', (e) => {
+        const target = e.target as Element | null;
+        const pointEl = target?.closest<SVGElement>('[data-point-row]');
+        if (pointEl) {
+          const rowIndex = Number(pointEl.dataset.pointRow);
+          this.callbacks.onRowSelect(rowIndex);
+        }
+      });
+
+      this.chartCanvasWrapEl.addEventListener('mouseover', (e) => {
+        const target = e.target as Element | null;
+        const pointEl = target?.closest<SVGElement>('[data-point-row]');
+        if (!pointEl) {
+          if (this.activeTooltipTarget) {
+            this.activeTooltipTarget = null;
+            this.tooltipEl?.classList.add('hidden');
+          }
+          return;
+        }
+        if (pointEl !== this.activeTooltipTarget && this.tooltipEl) {
+          this.activeTooltipTarget = pointEl;
+          const title = pointEl.dataset.tipTitle;
+          const sub = pointEl.dataset.tipSub;
+          if (title) {
+            this.tooltipEl.innerHTML = `<div class="font-semibold">${escapeHtml(title)}</div><div class="text-slate-300 font-mono-tabular">${escapeHtml(sub ?? '')}</div>`;
+            this.tooltipEl.classList.remove('hidden');
+          }
+        }
+        this.positionTooltip(e as MouseEvent);
+      });
+
+      this.chartCanvasWrapEl.addEventListener('mousemove', (e) => {
+        if (this.activeTooltipTarget) {
+          this.positionTooltip(e as MouseEvent);
+        }
+      });
+
+      this.chartCanvasWrapEl.addEventListener('mouseleave', () => {
+        this.activeTooltipTarget = null;
+        this.tooltipEl?.classList.add('hidden');
+      });
+    }
   }
 
   public setData(params: {
     sheet: SheetData;
-    visibleRowIndices: number[];
+    visibleRowIndices: VisibleRowsSource;
     config: ChartConfig;
     highlightedRowIndex: number | null;
   }): void {
@@ -103,15 +221,31 @@ export class InteractiveChart2D {
     this.config = params.config;
     this.highlightedRowIndex = params.highlightedRowIndex;
 
-    this.renderControls();
+    this.renderControlsIfNeeded();
     this.renderChart();
   }
 
-  private renderControls(): void {
+  /** Fast highlight update without touching controls or re-sampling dataset. */
+  public setHighlight(highlightedRowIndex: number | null): void {
+    if (this.highlightedRowIndex === highlightedRowIndex) return;
+    this.highlightedRowIndex = highlightedRowIndex;
+    if (this.sheet && this.cachedHasNumeric) {
+      this.renderChart();
+    }
+  }
+
+  private renderControlsIfNeeded(): void {
     if (!this.chartControlsEl || !this.sheet) return;
     const sheet = this.sheet;
+    const controlsKey = `${sheet.id}|${sheet.columns.join('\x00')}|${sheet.types.join(',')}|${this.config.type}|${this.config.xColIndex}|${this.config.yColIndices.join(',')}`;
+    if (controlsKey === this.lastControlsKey) return;
+    this.lastControlsKey = controlsKey;
 
-    const chartTypes: {type: ChartType; label: string; icon: 'barChart' | 'lineChart' | 'pieChart' | 'scatterChart'}[] = [
+    const chartTypes: {
+      type: ChartType;
+      label: string;
+      icon: 'barChart' | 'lineChart' | 'pieChart' | 'scatterChart';
+    }[] = [
       {type: 'bar', label: 'Bar', icon: 'barChart'},
       {type: 'line', label: 'Line', icon: 'lineChart'},
       {type: 'pie', label: 'Pie', icon: 'pieChart'},
@@ -203,82 +337,81 @@ export class InteractiveChart2D {
         </div>
       </div>
     `;
-
-    this.chartControlsEl
-      .querySelectorAll<HTMLButtonElement>('[data-chart-type]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const nextType = btn.dataset.chartType as ChartType;
-          this.callbacks.onConfigChange({
-            ...this.config,
-            type: nextType,
-          });
-        });
-      });
-
-    const xSelect = this.chartControlsEl.querySelector<HTMLSelectElement>(
-      '[data-role="x-axis-select"]'
-    );
-    xSelect?.addEventListener('change', () => {
-      this.callbacks.onConfigChange({
-        ...this.config,
-        xColIndex: Number(xSelect.value),
-      });
-    });
-
-    this.chartControlsEl
-      .querySelectorAll<HTMLButtonElement>('[data-y-col]')
-      .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const colIdx = Number(btn.dataset.yCol);
-          const exists = this.config.yColIndices.includes(colIdx);
-          let nextY: number[];
-          if (exists) {
-            if (this.config.yColIndices.length === 1) return; // Keep at least 1 Y series
-            nextY = this.config.yColIndices.filter((c) => c !== colIdx);
-          } else {
-            nextY = [...this.config.yColIndices, colIdx].slice(-4);
-          }
-          this.callbacks.onConfigChange({
-            ...this.config,
-            yColIndices: nextY,
-          });
-        });
-      });
   }
 
-  private extractPoints(): DataPointRow[] {
-    if (!this.sheet) return [];
+  private getMemoizedPoints(): {points: DataPointRow[]; hasAnyNumeric: boolean} {
+    if (!this.sheet) return {points: [], hasAnyNumeric: false};
+
+    const yKey = this.config.yColIndices.join(',');
+    if (
+      this.lastPointsKey &&
+      this.lastPointsKey.sheet === this.sheet &&
+      this.lastPointsKey.visibleRowIndices === this.visibleRowIndices &&
+      this.lastPointsKey.xColIndex === this.config.xColIndex &&
+      this.lastPointsKey.yKey === yKey
+    ) {
+      return {points: this.cachedPoints, hasAnyNumeric: this.cachedHasNumeric};
+    }
+
     const sheet = this.sheet;
     const {xColIndex, yColIndices} = this.config;
+    const sampledIndices = sampleChartIndices(
+      this.visibleRowIndices,
+      MAX_CHART_POINTS
+    );
 
-    return this.visibleRowIndices.slice(0, 32).map((rowIndex) => {
+    let hasAnyNumeric = false;
+    const points: DataPointRow[] = new Array<DataPointRow>(
+      sampledIndices.length
+    );
+
+    for (let i = 0; i < sampledIndices.length; i++) {
+      const rowIndex = sampledIndices[i];
       const row = sheet.rows[rowIndex] ?? [];
       const rawLabel = (row[xColIndex] ?? '').trim() || `Row ${rowIndex + 1}`;
       const xParsed = parseNumericValue(rawLabel).value;
-      const values = yColIndices.map((yIdx) => {
-        const p = parseNumericValue(row[yIdx] ?? '');
-        return p.value ?? 0;
-      });
-      return {
+      const values = new Array<number>(yColIndices.length);
+      let rowHasNum = false;
+      for (let s = 0; s < yColIndices.length; s++) {
+        const p = parseNumericValue(row[yColIndices[s]] ?? '');
+        if (p.value !== null) {
+          values[s] = p.value;
+          rowHasNum = true;
+          hasAnyNumeric = true;
+        } else {
+          values[s] = 0;
+        }
+      }
+      points[i] = {
         rowIndex,
         label: rawLabel,
         values,
+        hasAnyNumeric: rowHasNum,
         xNumeric: xParsed,
       };
-    });
+    }
+
+    this.lastPointsKey = {
+      sheet: this.sheet,
+      visibleRowIndices: this.visibleRowIndices,
+      xColIndex,
+      yKey,
+    };
+    this.cachedPoints = points;
+    this.cachedHasNumeric = hasAnyNumeric;
+
+    return {points, hasAnyNumeric};
   }
 
   private renderChart(): void {
     if (!this.chartCanvasWrapEl || !this.legendEl || !this.sheet) return;
-    const points = this.extractPoints();
+    this.activeTooltipTarget = null;
+    this.tooltipEl?.classList.add('hidden');
+
+    const {points, hasAnyNumeric} = this.getMemoizedPoints();
     const yCols = this.config.yColIndices;
 
-    const hasAnyNumericData = this.visibleRowIndices.some((rIdx) =>
-      yCols.some((cIdx) => parseNumericValue(this.sheet!.rows[rIdx]?.[cIdx] ?? '').value !== null)
-    );
-
-    if (points.length === 0 || yCols.length === 0 || !hasAnyNumericData) {
+    if (points.length === 0 || yCols.length === 0 || !hasAnyNumeric) {
       this.chartCanvasWrapEl.innerHTML = `
         <div class="flex flex-col items-center justify-center h-full text-center px-6">
           <p class="text-sm font-medium text-slate-700">No chart data yet</p>
@@ -289,8 +422,8 @@ export class InteractiveChart2D {
       return;
     }
 
-    // Legend
-    this.legendEl.innerHTML = yCols
+    // Legend + sampling indicator for large sheets
+    const legendItemsHtml = yCols
       .map((colIdx, sIdx) => {
         const name = this.sheet!.columns[colIdx] ?? `Series ${sIdx + 1}`;
         const color = CHART_PALETTE[sIdx % CHART_PALETTE.length];
@@ -303,6 +436,17 @@ export class InteractiveChart2D {
       })
       .join('');
 
+    const totalVisible = this.visibleRowIndices.length;
+    const sampleNoteHtml =
+      totalVisible > MAX_CHART_POINTS
+        ? `<span class="text-[11px] text-slate-400 font-mono-tabular">Sampled ${points.length} of ${totalVisible.toLocaleString('en-US')} rows</span>`
+        : '';
+
+    this.legendEl.innerHTML = `
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-1">${legendItemsHtml}</div>
+      ${sampleNoteHtml}
+    `;
+
     if (this.config.type === 'pie') {
       this.renderPieChart(points);
     } else if (this.config.type === 'line') {
@@ -314,6 +458,20 @@ export class InteractiveChart2D {
     }
   }
 
+  private getMinMaxValues(points: DataPointRow[]): {minVal: number; maxVal: number} {
+    let minVal = 0;
+    let maxVal = 1;
+    for (let i = 0; i < points.length; i++) {
+      const vals = points[i].values;
+      for (let j = 0; j < vals.length; j++) {
+        const v = vals[j];
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
+      }
+    }
+    return {minVal, maxVal};
+  }
+
   private renderBarChart(points: DataPointRow[]): void {
     const wrap = this.chartCanvasWrapEl!;
     const W = 580;
@@ -322,9 +480,7 @@ export class InteractiveChart2D {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
-    const allVals = points.flatMap((p) => p.values);
-    const maxVal = Math.max(1, ...allVals, 0);
-    const minVal = Math.min(0, ...allVals);
+    const {minVal, maxVal} = this.getMinMaxValues(points);
     const span = Math.max(1e-6, maxVal - minVal);
     const zeroY = pad.top + ((maxVal - 0) / span) * plotH;
 
@@ -388,15 +544,17 @@ export class InteractiveChart2D {
 
       const labelX = gx + groupW / 2;
       const rotate = points.length > 7;
-      xLabelsHtml.push(`
-        <text
-          x="${labelX}"
-          y="${H - pad.bottom + 16}"
-          text-anchor="${rotate ? 'end' : 'middle'}"
-          transform="${rotate ? `rotate(-25 ${labelX} ${H - pad.bottom + 16})` : ''}"
-          class="fill-slate-600 text-[11px] ${isRowSelected ? 'font-bold fill-blue-700' : ''}"
-        >${escapeHtml(truncateLabel(pt.label, points.length > 10 ? 9 : 14))}</text>
-      `);
+      if (points.length <= 16 || idx % 2 === 0 || isRowSelected) {
+        xLabelsHtml.push(`
+          <text
+            x="${labelX}"
+            y="${H - pad.bottom + 16}"
+            text-anchor="${rotate ? 'end' : 'middle'}"
+            transform="${rotate ? `rotate(-25 ${labelX} ${H - pad.bottom + 16})` : ''}"
+            class="fill-slate-600 text-[11px] ${isRowSelected ? 'font-bold fill-blue-700' : ''}"
+          >${escapeHtml(truncateLabel(pt.label, points.length > 10 ? 9 : 14))}</text>
+        `);
+      }
     });
 
     wrap.innerHTML = `
@@ -407,8 +565,6 @@ export class InteractiveChart2D {
         ${xLabelsHtml.join('')}
       </svg>
     `;
-
-    this.bindSvgPointEvents();
   }
 
   private renderLineChart(points: DataPointRow[]): void {
@@ -419,9 +575,7 @@ export class InteractiveChart2D {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
-    const allVals = points.flatMap((p) => p.values);
-    const maxVal = Math.max(1, ...allVals);
-    const minVal = Math.min(0, ...allVals);
+    const {minVal, maxVal} = this.getMinMaxValues(points);
     const span = Math.max(1e-6, maxVal - minVal);
 
     const gridLines: string[] = [];
@@ -491,15 +645,17 @@ export class InteractiveChart2D {
     points.forEach((pt, idx) => {
       const x = getX(idx);
       const rotate = points.length > 7;
-      xLabelsHtml.push(`
-        <text
-          x="${x}"
-          y="${H - pad.bottom + 16}"
-          text-anchor="${rotate ? 'end' : 'middle'}"
-          transform="${rotate ? `rotate(-25 ${x} ${H - pad.bottom + 16})` : ''}"
-          class="fill-slate-600 text-[11px]"
-        >${escapeHtml(truncateLabel(pt.label, points.length > 10 ? 9 : 14))}</text>
-      `);
+      if (points.length <= 16 || idx % 2 === 0) {
+        xLabelsHtml.push(`
+          <text
+            x="${x}"
+            y="${H - pad.bottom + 16}"
+            text-anchor="${rotate ? 'end' : 'middle'}"
+            transform="${rotate ? `rotate(-25 ${x} ${H - pad.bottom + 16})` : ''}"
+            class="fill-slate-600 text-[11px]"
+          >${escapeHtml(truncateLabel(pt.label, points.length > 10 ? 9 : 14))}</text>
+        `);
+      }
     });
 
     wrap.innerHTML = `
@@ -510,8 +666,6 @@ export class InteractiveChart2D {
         ${xLabelsHtml.join('')}
       </svg>
     `;
-
-    this.bindSvgPointEvents();
   }
 
   private renderPieChart(points: DataPointRow[]): void {
@@ -521,6 +675,7 @@ export class InteractiveChart2D {
     const colType = this.sheet!.types[yColIdx] ?? 'number';
 
     const slices = points
+      .slice(0, 12)
       .map((pt, idx) => ({
         rowIndex: pt.rowIndex,
         label: pt.label,
@@ -607,8 +762,6 @@ export class InteractiveChart2D {
         ${sliceListHtml.join('')}
       </svg>
     `;
-
-    this.bindSvgPointEvents();
   }
 
   private renderScatterChart(points: DataPointRow[]): void {
@@ -619,12 +772,23 @@ export class InteractiveChart2D {
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
 
-    const xCoords = points.map((p, i) => p.xNumeric ?? i + 1);
-    const xMin = Math.min(...xCoords);
-    const xMax = Math.max(...xCoords, xMin + 1);
-    const yVals = points.map((p) => p.values[0] ?? 0);
-    const yMin = Math.min(0, ...yVals);
-    const yMax = Math.max(1, ...yVals);
+    let xMin = Infinity;
+    let xMax = -Infinity;
+    let yMin = 0;
+    let yMax = 1;
+    const xCoords = new Array<number>(points.length);
+
+    for (let i = 0; i < points.length; i++) {
+      const xv = points[i].xNumeric ?? i + 1;
+      const yv = points[i].values[0] ?? 0;
+      xCoords[i] = xv;
+      if (xv < xMin) xMin = xv;
+      if (xv > xMax) xMax = xv;
+      if (yv < yMin) yMin = yv;
+      if (yv > yMax) yMax = yv;
+    }
+    if (!Number.isFinite(xMin)) xMin = 0;
+    if (xMax <= xMin) xMax = xMin + 1;
 
     const gridLines: string[] = [];
     for (let i = 0; i <= 4; i++) {
@@ -667,7 +831,7 @@ export class InteractiveChart2D {
               data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(yv, colType))}"
               class="cursor-pointer"
             />
-            <text x="${cx}" y="${cy - 10}" text-anchor="middle" class="fill-slate-600 text-[10px] pointer-events-none">${escapeHtml(truncateLabel(pt.label, 10))}</text>
+            ${points.length <= 18 || isSel ? `<text x="${cx}" y="${cy - 10}" text-anchor="middle" class="fill-slate-600 text-[10px] pointer-events-none">${escapeHtml(truncateLabel(pt.label, 10))}</text>` : ''}
           </g>
         `;
       })
@@ -680,39 +844,6 @@ export class InteractiveChart2D {
         ${dotsHtml}
       </svg>
     `;
-
-    this.bindSvgPointEvents();
-  }
-
-  private bindSvgPointEvents(): void {
-    const wrap = this.chartCanvasWrapEl;
-    const tip = this.tooltipEl;
-    if (!wrap) return;
-
-    wrap.querySelectorAll<SVGElement>('[data-point-row]').forEach((el) => {
-      el.addEventListener('click', () => {
-        const rowIndex = Number(el.dataset.pointRow);
-        this.callbacks.onRowSelect(rowIndex);
-      });
-
-      el.addEventListener('mouseenter', (e) => {
-        if (!tip) return;
-        const title = el.dataset.tipTitle;
-        const sub = el.dataset.tipSub;
-        if (!title) return;
-        tip.innerHTML = `<div class="font-semibold">${escapeHtml(title)}</div><div class="text-slate-300 font-mono-tabular">${escapeHtml(sub ?? '')}</div>`;
-        tip.classList.remove('hidden');
-        this.positionTooltip(e as MouseEvent);
-      });
-
-      el.addEventListener('mousemove', (e) => {
-        this.positionTooltip(e as MouseEvent);
-      });
-
-      el.addEventListener('mouseleave', () => {
-        tip?.classList.add('hidden');
-      });
-    });
   }
 
   private positionTooltip(e: MouseEvent): void {

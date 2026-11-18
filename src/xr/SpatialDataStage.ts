@@ -2,12 +2,18 @@ import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
 import * as xb from 'xrblocks';
-import type {ChartConfig, SheetData, SpatialChartMode} from '../types';
+import type {
+  ChartConfig,
+  SheetData,
+  SpatialChartMode,
+  VisibleRowsSource,
+} from '../types';
 import {
   CHART_PALETTE,
   formatDisplayNumber,
   parseNumericValue,
 } from '../core/tabular';
+import {sampleChartIndices} from '../core/virtualWindow';
 
 export interface SpatialStageCallbacks {
   onRowSelect: (rowIndex: number) => void;
@@ -18,17 +24,18 @@ interface BarNodeEntry {
   group: THREE.Group;
   bodyMesh: THREE.Mesh;
   capMesh: THREE.Mesh;
-  hitMesh: THREE.Mesh;
+  bodyMat: THREE.MeshStandardMaterial;
+  capMat: THREE.MeshStandardMaterial;
   rowIndex: number;
   seriesIndex: number;
-  label: string;
-  seriesName: string;
-  formattedValue: string;
   targetHeight: number;
   currentHeight: number;
-  targetPos: THREE.Vector3;
   baseColor: THREE.Color;
+  isSphere: boolean;
 }
+
+const BLACK_COLOR = new THREE.Color(0x000000);
+const WHITE_COLOR = new THREE.Color(0xffffff);
 
 export function detectSoftwareWebGL(): boolean {
   try {
@@ -51,18 +58,26 @@ export class SpatialDataStage extends xb.Script {
   private stageRoot = new THREE.Group();
   private dataGroup = new THREE.Group();
   private pedestalGroup = new THREE.Group();
-  private bars: BarNodeEntry[] = [];
+
+  // Reusable object/material pool (eliminates per-update GPU material allocation)
+  private barPool: BarNodeEntry[] = [];
+  private activeBarCount = 0;
+  private pickTargetsCache: THREE.Object3D[] = [];
+
   private sharedBarGeo = new THREE.BoxGeometry(1, 1, 1);
   private sharedCapGeo = new THREE.BoxGeometry(1.04, 0.06, 1.04);
   private sharedSphereGeo = new THREE.SphereGeometry(0.5, 20, 14);
   private sharedStemGeo = new THREE.CylinderGeometry(0.08, 0.08, 1, 10);
+  private pedestalGeos: THREE.BufferGeometry[] = [];
+  private pedestalMats: THREE.Material[] = [];
+
   private gridTexture: THREE.CanvasTexture | null = null;
   private shadowTexture: THREE.CanvasTexture | null = null;
   private envTexture: THREE.Texture | null = null;
   private orbitControls: OrbitControls | null = null;
 
   private sheet: SheetData | null = null;
-  private visibleRowIndices: number[] = [];
+  private visibleRowIndices: VisibleRowsSource = [];
   private config: ChartConfig = {
     type: 'bar',
     xColIndex: 0,
@@ -74,6 +89,8 @@ export class SpatialDataStage extends xb.Script {
   private embeddedVisible = false;
   private xrOrSimActive = false;
   private dirtyFrames = 15;
+  private pendingMeshSync = false;
+  private lastMeshKey = '';
 
   // Built-in XR Blocks Spatial UI
   private spatialCard!: xb.UICard;
@@ -126,7 +143,8 @@ export class SpatialDataStage extends xb.Script {
       onInput: (val: number) => {
         this.heightScale = val;
         this.scaleLabelText.text = `Height Scale: ${val.toFixed(1)}x`;
-        this.rebuildChartMeshes();
+        this.lastMeshKey = '';
+        this.requestMeshSync();
       },
     });
 
@@ -178,7 +196,7 @@ export class SpatialDataStage extends xb.Script {
     this.spatialCard.name = 'Spatial Data Inspector Card';
     this.spatialCard.position.set(1.05, 1.32, -1.55);
     this.spatialCard.rotation.y = -0.32;
-    this.spatialCard.visible = false; // Shown inside XR / Simulator mode
+    this.spatialCard.visible = false;
   }
 
   init(): void {
@@ -199,23 +217,20 @@ export class SpatialDataStage extends xb.Script {
       scene.environment = this.envTexture;
       pmrem.dispose();
 
-      // Throttle software WebGL renders when idle or hidden
-      if (this.isSoftwareGl) {
-        xb.core.renderSceneOverride = (r, s, c) => {
-          if (!this.embeddedVisible && !this.xrOrSimActive) return;
-          if (this.dirtyFrames <= 0) return;
-          this.dirtyFrames--;
-          if (r instanceof THREE.WebGLRenderer) {
-            r.render(s, c);
-          }
-        };
-      }
+      // Skip all WebGL rendering when 3D view is hidden; throttle idle draws on software WebGL
+      xb.core.renderSceneOverride = (r, s, c) => {
+        if (!this.embeddedVisible && !this.xrOrSimActive) return;
+        if (this.isSoftwareGl && this.dirtyFrames <= 0) return;
+        if (this.dirtyFrames > 0) this.dirtyFrames--;
+        if (r instanceof THREE.WebGLRenderer) {
+          r.render(s, c);
+        }
+      };
     }
 
     scene.background = new THREE.Color(0x0f172a);
     scene.fog = new THREE.FogExp2(0x0f172a, 0.08);
 
-    // Three-point studio lighting (warm key + cool hemisphere fill + rim)
     const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 1.6);
     this.add(hemiLight);
 
@@ -232,7 +247,6 @@ export class SpatialDataStage extends xb.Script {
     rimLight.position.set(-3.0, 2.5, -3.5);
     this.add(rimLight);
 
-    // Stage diorama positioning in front of XR user
     this.stageRoot.position.set(0, 0.85, -1.55);
     this.add(this.stageRoot);
     this.stageRoot.add(this.pedestalGroup);
@@ -252,12 +266,12 @@ export class SpatialDataStage extends xb.Script {
     renderer.domElement.style.height = '100%';
 
     camera.fov = 46;
-    camera.position.set(1.55, 2.22, 0.32);
-    camera.lookAt(0, 1.16, -1.55);
+    camera.position.set(1.88, 2.38, 0.72);
+    camera.lookAt(0, 1.12, -1.55);
     camera.updateProjectionMatrix();
 
     this.orbitControls = new OrbitControls(camera, renderer.domElement);
-    this.orbitControls.target.set(0, 1.16, -1.55);
+    this.orbitControls.target.set(0, 1.12, -1.55);
     this.orbitControls.enableDamping = !this.isSoftwareGl;
     this.orbitControls.dampingFactor = 0.08;
     this.orbitControls.minDistance = 1.1;
@@ -276,7 +290,6 @@ export class SpatialDataStage extends xb.Script {
         ? renderer.capabilities.getMaxAnisotropy()
         : 4;
 
-    // 1. Soft radial contact shadow beneath plinth
     const shadowCanvas = document.createElement('canvas');
     shadowCanvas.width = 256;
     shadowCanvas.height = 256;
@@ -290,44 +303,48 @@ export class SpatialDataStage extends xb.Script {
       sctx.fillRect(0, 0, 256, 256);
     }
     this.shadowTexture = new THREE.CanvasTexture(shadowCanvas);
-    const contactShadow = new THREE.Mesh(
-      new THREE.CircleGeometry(1.45, 36),
-      new THREE.MeshBasicMaterial({
-        map: this.shadowTexture,
-        transparent: true,
-        depthWrite: false,
-      })
-    );
+
+    const shadowGeo = new THREE.CircleGeometry(1.45, 36);
+    const shadowMat = new THREE.MeshBasicMaterial({
+      map: this.shadowTexture,
+      transparent: true,
+      depthWrite: false,
+    });
+    this.pedestalGeos.push(shadowGeo);
+    this.pedestalMats.push(shadowMat);
+
+    const contactShadow = new THREE.Mesh(shadowGeo, shadowMat);
     contactShadow.rotation.x = -Math.PI / 2;
     contactShadow.position.y = -0.095;
     contactShadow.xb = {pointerEvents: 'none'};
 
-    // 2. Primary dark slate plinth (matte)
-    const plinth = new THREE.Mesh(
-      new THREE.BoxGeometry(1.86, 0.09, 1.36),
-      new THREE.MeshStandardMaterial({
-        color: 0x1e293b,
-        roughness: 0.78,
-        metalness: 0.12,
-      })
-    );
+    const plinthGeo = new THREE.BoxGeometry(1.86, 0.09, 1.36);
+    const plinthMat = new THREE.MeshStandardMaterial({
+      color: 0x1e293b,
+      roughness: 0.78,
+      metalness: 0.12,
+    });
+    this.pedestalGeos.push(plinthGeo);
+    this.pedestalMats.push(plinthMat);
+
+    const plinth = new THREE.Mesh(plinthGeo, plinthMat);
     plinth.position.y = -0.05;
     plinth.receiveShadow = !this.isSoftwareGl;
     plinth.xb = {pointerEvents: 'none'};
 
-    // 3. Brushed metallic bevel trim rim
-    const trim = new THREE.Mesh(
-      new THREE.BoxGeometry(1.9, 0.024, 1.4),
-      new THREE.MeshStandardMaterial({
-        color: 0x64748b,
-        roughness: 0.28,
-        metalness: 0.78,
-      })
-    );
+    const trimGeo = new THREE.BoxGeometry(1.9, 0.024, 1.4);
+    const trimMat = new THREE.MeshStandardMaterial({
+      color: 0x64748b,
+      roughness: 0.28,
+      metalness: 0.78,
+    });
+    this.pedestalGeos.push(trimGeo);
+    this.pedestalMats.push(trimMat);
+
+    const trim = new THREE.Mesh(trimGeo, trimMat);
     trim.position.y = -0.008;
     trim.xb = {pointerEvents: 'none'};
 
-    // 4. Procedural calibrated grid deck
     const gridCanvas = document.createElement('canvas');
     gridCanvas.width = 512;
     gridCanvas.height = 512;
@@ -360,26 +377,30 @@ export class SpatialDataStage extends xb.Script {
     this.gridTexture.colorSpace = THREE.SRGBColorSpace;
     this.gridTexture.anisotropy = maxAniso;
 
-    const deck = new THREE.Mesh(
-      new THREE.BoxGeometry(1.76, 0.014, 1.26),
-      new THREE.MeshStandardMaterial({
-        color: 0xffffff,
-        map: this.gridTexture,
-        roughness: 0.42,
-        metalness: 0.15,
-      })
-    );
+    const deckGeo = new THREE.BoxGeometry(1.76, 0.014, 1.26);
+    const deckMat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      map: this.gridTexture,
+      roughness: 0.42,
+      metalness: 0.15,
+    });
+    this.pedestalGeos.push(deckGeo);
+    this.pedestalMats.push(deckMat);
+
+    const deck = new THREE.Mesh(deckGeo, deckMat);
     deck.position.y = 0.008;
     deck.receiveShadow = !this.isSoftwareGl;
     deck.xb = {pointerEvents: 'none'};
 
-    // 5. Four corner calibration posts
     const postGeo = new THREE.CylinderGeometry(0.012, 0.015, 0.09, 12);
     const postMat = new THREE.MeshStandardMaterial({
       color: 0x94a3b8,
       roughness: 0.22,
       metalness: 0.82,
     });
+    this.pedestalGeos.push(postGeo);
+    this.pedestalMats.push(postMat);
+
     const corners: [number, number][] = [
       [-0.86, -0.61],
       [0.86, -0.61],
@@ -397,8 +418,12 @@ export class SpatialDataStage extends xb.Script {
   }
 
   public setEmbeddedVisible(visible: boolean): void {
+    const becameVisible = !this.embeddedVisible && visible;
     this.embeddedVisible = visible;
     if (visible) {
+      if (this.pendingMeshSync || becameVisible) {
+        this.flushPendingSync();
+      }
       this.markDirty(12);
     }
   }
@@ -420,10 +445,16 @@ export class SpatialDataStage extends xb.Script {
 
   public setData(params: {
     sheet: SheetData;
-    visibleRowIndices: number[];
+    visibleRowIndices: VisibleRowsSource;
     config: ChartConfig;
     highlightedRowIndex: number | null;
   }): void {
+    const meshKey = `${params.sheet.id}|${params.sheet.rows.length}|${params.visibleRowIndices.length}|${params.config.xColIndex}|${params.config.yColIndices.join(',')}|${params.config.spatialMode}|${this.heightScale.toFixed(2)}`;
+    const dataChanged =
+      this.sheet !== params.sheet ||
+      this.visibleRowIndices !== params.visibleRowIndices ||
+      meshKey !== this.lastMeshKey;
+
     this.sheet = params.sheet;
     this.visibleRowIndices = params.visibleRowIndices;
     this.config = params.config;
@@ -431,8 +462,38 @@ export class SpatialDataStage extends xb.Script {
 
     this.cardTitleText.text = params.sheet.name;
     this.updateSpatialReadout();
-    this.rebuildChartMeshes();
-    this.markDirty(35);
+
+    if (dataChanged) {
+      this.lastMeshKey = meshKey;
+      this.requestMeshSync();
+    } else {
+      this.applyHighlightStyles();
+    }
+  }
+
+  /** Fast highlight-only update (zero mesh rebuild or height reset). */
+  public setHighlight(highlightedRowIndex: number | null): void {
+    if (this.highlightedRowIndex === highlightedRowIndex) return;
+    this.highlightedRowIndex = highlightedRowIndex;
+    this.updateSpatialReadout();
+    if (this.embeddedVisible || this.xrOrSimActive) {
+      this.applyHighlightStyles();
+      this.markDirty(6);
+    }
+  }
+
+  private requestMeshSync(): void {
+    if (!this.embeddedVisible && !this.xrOrSimActive) {
+      this.pendingMeshSync = true;
+      return;
+    }
+    this.flushPendingSync();
+  }
+
+  private flushPendingSync(): void {
+    this.pendingMeshSync = false;
+    this.syncChartNodes();
+    this.markDirty(30);
   }
 
   private updateSpatialReadout(): void {
@@ -450,34 +511,121 @@ export class SpatialDataStage extends xb.Script {
         .join('\n');
       this.cardReadoutText.text = `Selected: ${xLabel}\n${metrics}`;
     } else {
-      this.cardReadoutText.text = `${this.visibleRowIndices.length} rows · Tap a 3D bar for details.`;
+      this.cardReadoutText.text = `${this.visibleRowIndices.length.toLocaleString('en-US')} rows · Tap a 3D bar for details.`;
     }
   }
 
-  private clearDataGroup(): void {
-    for (const entry of this.bars) {
-      if (entry.bodyMesh.material instanceof THREE.Material) {
-        entry.bodyMesh.material.dispose();
-      }
-      if (entry.capMesh.material instanceof THREE.Material) {
-        entry.capMesh.material.dispose();
-      }
+  private getOrAcquirePoolEntry(index: number): BarNodeEntry {
+    if (index < this.barPool.length) {
+      const existing = this.barPool[index];
+      existing.group.visible = true;
+      return existing;
     }
-    this.bars = [];
-    while (this.dataGroup.children.length > 0) {
-      this.dataGroup.remove(this.dataGroup.children[0]);
-    }
+
+    const group = new THREE.Group();
+    const bodyMat = new THREE.MeshStandardMaterial({
+      color: 0x2563eb,
+      roughness: 0.32,
+      metalness: 0.2,
+      emissive: 0x000000,
+      emissiveIntensity: 0,
+    });
+    const capMat = new THREE.MeshStandardMaterial({
+      color: 0x60a5fa,
+      roughness: 0.15,
+      metalness: 0.45,
+    });
+
+    const bodyMesh = new THREE.Mesh(this.sharedBarGeo, bodyMat);
+    bodyMesh.castShadow = !this.isSoftwareGl;
+    bodyMesh.receiveShadow = !this.isSoftwareGl;
+
+    const capMesh = new THREE.Mesh(this.sharedCapGeo, capMat);
+    capMesh.castShadow = !this.isSoftwareGl;
+
+    group.xb = {interactionEnabled: true};
+    group.add(bodyMesh, capMesh);
+    this.dataGroup.add(group);
+
+    const entry: BarNodeEntry = {
+      group,
+      bodyMesh,
+      capMesh,
+      bodyMat,
+      capMat,
+      rowIndex: 0,
+      seriesIndex: 0,
+      targetHeight: 0.02,
+      currentHeight: 0.02,
+      baseColor: new THREE.Color(0x2563eb),
+      isSphere: false,
+    };
+    this.barPool.push(entry);
+    return entry;
   }
 
-  private rebuildChartMeshes(): void {
-    this.clearDataGroup();
-    if (!this.sheet) return;
+  private configurePoolEntry(
+    idx: number,
+    opts: {
+      rowIndex: number;
+      seriesIndex: number;
+      height: number;
+      width: number;
+      depth: number;
+      px: number;
+      py: number;
+      pz: number;
+      colorHex: string;
+      isSphere: boolean;
+    }
+  ): void {
+    const entry = this.getOrAcquirePoolEntry(idx);
+    const prevSphere = entry.isSphere;
+    entry.isSphere = opts.isSphere;
+    entry.rowIndex = opts.rowIndex;
+    entry.seriesIndex = opts.seriesIndex;
+    entry.targetHeight = opts.height;
+    entry.baseColor.set(opts.colorHex);
 
-    const rows = this.visibleRowIndices.slice(0, 16);
+    if (prevSphere !== opts.isSphere) {
+      entry.bodyMesh.geometry = opts.isSphere
+        ? this.sharedStemGeo
+        : this.sharedBarGeo;
+      entry.capMesh.geometry = opts.isSphere
+        ? this.sharedSphereGeo
+        : this.sharedCapGeo;
+    }
+
+    entry.group.position.set(opts.px, opts.py, opts.pz);
+    entry.bodyMesh.scale.set(
+      opts.isSphere ? 0.14 : opts.width,
+      entry.currentHeight,
+      opts.isSphere ? 0.14 : opts.depth
+    );
+    entry.capMesh.scale.set(
+      opts.width,
+      opts.isSphere ? opts.width : 0.02,
+      opts.depth
+    );
+
+    entry.bodyMesh.userData.rowIndex = opts.rowIndex;
+    entry.capMesh.userData.rowIndex = opts.rowIndex;
+    entry.group.userData.rowIndex = opts.rowIndex;
+  }
+
+  private syncChartNodes(): void {
+    if (!this.sheet) {
+      this.hideUnusedPoolEntries(0);
+      return;
+    }
+
+    const rows = sampleChartIndices(this.visibleRowIndices, 16);
     const yCols = this.config.yColIndices;
-    if (rows.length === 0 || yCols.length === 0) return;
+    if (rows.length === 0 || yCols.length === 0) {
+      this.hideUnusedPoolEntries(0);
+      return;
+    }
 
-    // Collect numeric values & global max
     let maxVal = 1;
     const matrix: number[][] = rows.map((rowIndex) =>
       yCols.map((colIdx) => {
@@ -494,176 +642,123 @@ export class SpatialDataStage extends xb.Script {
     const deckW = 1.56;
     const deckD = 1.04;
     const maxBarHeight = 0.85 * this.heightScale;
+    let poolIdx = 0;
 
     if (mode === 'ring3d') {
       const radius = 0.44;
       const totalItems = rows.length;
       const arcStep = (Math.PI * 2) / Math.max(1, totalItems);
-      const colSize = Math.min(0.11, (Math.PI * 2 * radius) / (totalItems * 2.2));
+      const colSize = Math.min(
+        0.11,
+        (Math.PI * 2 * radius) / (totalItems * 2.2)
+      );
 
-      rows.forEach((rowIndex, rIdx) => {
+      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+        const rowIndex = rows[rIdx];
         const angle = rIdx * arcStep - Math.PI / 2;
         const val = matrix[rIdx][0] ?? 0;
         const h = Math.max(0.04, (val / maxVal) * maxBarHeight);
-        const px = Math.cos(angle) * radius;
-        const pz = Math.sin(angle) * radius;
-        const colorHex = CHART_PALETTE[rIdx % CHART_PALETTE.length];
-        const yColIdx = yCols[0];
-
-        this.createNode({
+        this.configurePoolEntry(poolIdx++, {
           rowIndex,
           seriesIndex: 0,
-          colIdx: yColIdx,
-          val,
           height: h,
           width: colSize,
           depth: colSize,
-          pos: new THREE.Vector3(px, 0.015, pz),
-          colorHex,
+          px: Math.cos(angle) * radius,
+          py: 0.015,
+          pz: Math.sin(angle) * radius,
+          colorHex: CHART_PALETTE[rIdx % CHART_PALETTE.length],
           isSphere: false,
         });
-      });
+      }
     } else if (mode === 'scatter3d') {
       const xStep = rows.length > 1 ? deckW / (rows.length - 1) : 0;
       const zStep = yCols.length > 1 ? (deckD * 0.65) / (yCols.length - 1) : 0;
 
-      rows.forEach((rowIndex, rIdx) => {
+      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+        const rowIndex = rows[rIdx];
         const px = rows.length > 1 ? -deckW / 2 + rIdx * xStep : 0;
-        yCols.forEach((yColIdx, sIdx) => {
+        for (let sIdx = 0; sIdx < yCols.length; sIdx++) {
           const val = matrix[rIdx][sIdx] ?? 0;
           const h = Math.max(0.08, (val / maxVal) * maxBarHeight);
           const pz = yCols.length > 1 ? -deckD * 0.32 + sIdx * zStep : 0;
-          const colorHex = CHART_PALETTE[sIdx % CHART_PALETTE.length];
-
-          this.createNode({
+          this.configurePoolEntry(poolIdx++, {
             rowIndex,
             seriesIndex: sIdx,
-            colIdx: yColIdx,
-            val,
             height: h,
             width: 0.085,
             depth: 0.085,
-            pos: new THREE.Vector3(px, 0.015, pz),
-            colorHex,
+            px,
+            py: 0.015,
+            pz,
+            colorHex: CHART_PALETTE[sIdx % CHART_PALETTE.length],
             isSphere: true,
           });
-        });
-      });
+        }
+      }
     } else {
-      // bar3d
       const xStep = deckW / Math.max(1, rows.length);
       const zStep = deckD / Math.max(1, yCols.length);
       const barW = Math.min(0.14, xStep * 0.64);
       const barD = Math.min(0.18, zStep * 0.64);
 
-      rows.forEach((rowIndex, rIdx) => {
+      for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+        const rowIndex = rows[rIdx];
         const px = -deckW / 2 + (rIdx + 0.5) * xStep;
-        yCols.forEach((yColIdx, sIdx) => {
+        for (let sIdx = 0; sIdx < yCols.length; sIdx++) {
           const val = matrix[rIdx][sIdx] ?? 0;
           const h = Math.max(0.035, (val / maxVal) * maxBarHeight);
           const pz = -deckD / 2 + (sIdx + 0.5) * zStep;
-          const colorHex = CHART_PALETTE[sIdx % CHART_PALETTE.length];
-
-          this.createNode({
+          this.configurePoolEntry(poolIdx++, {
             rowIndex,
             seriesIndex: sIdx,
-            colIdx: yColIdx,
-            val,
             height: h,
             width: barW,
             depth: barD,
-            pos: new THREE.Vector3(px, 0.015, pz),
-            colorHex,
+            px,
+            py: 0.015,
+            pz,
+            colorHex: CHART_PALETTE[sIdx % CHART_PALETTE.length],
             isSphere: false,
           });
-        });
-      });
+        }
+      }
+    }
+
+    this.hideUnusedPoolEntries(poolIdx);
+    this.applyHighlightStyles();
+  }
+
+  private hideUnusedPoolEntries(activeCount: number): void {
+    this.activeBarCount = activeCount;
+    this.pickTargetsCache.length = 0;
+    for (let i = 0; i < this.barPool.length; i++) {
+      const entry = this.barPool[i];
+      if (i < activeCount) {
+        entry.group.visible = true;
+        this.pickTargetsCache.push(entry.bodyMesh, entry.capMesh);
+      } else {
+        entry.group.visible = false;
+      }
     }
   }
 
-  private createNode(opts: {
-    rowIndex: number;
-    seriesIndex: number;
-    colIdx: number;
-    val: number;
-    height: number;
-    width: number;
-    depth: number;
-    pos: THREE.Vector3;
-    colorHex: string;
-    isSphere: boolean;
-  }): void {
-    const isSel = this.highlightedRowIndex === opts.rowIndex;
-    const baseColor = new THREE.Color(opts.colorHex);
-    const label =
-      this.sheet?.rows[opts.rowIndex]?.[this.config.xColIndex] ??
-      `Row ${opts.rowIndex + 1}`;
-    const seriesName = this.sheet?.columns[opts.colIdx] ?? '';
-    const colType = this.sheet?.types[opts.colIdx] ?? 'number';
-    const formattedValue = formatDisplayNumber(opts.val, colType);
+  private applyHighlightStyles(): void {
+    for (let i = 0; i < this.activeBarCount; i++) {
+      const entry = this.barPool[i];
+      const isSel = this.highlightedRowIndex === entry.rowIndex;
 
-    const group = new THREE.Group();
-    group.position.copy(opts.pos);
+      entry.bodyMat.color.copy(entry.baseColor);
+      entry.bodyMat.roughness = isSel ? 0.18 : 0.32;
+      entry.bodyMat.emissive.copy(isSel ? entry.baseColor : BLACK_COLOR);
+      entry.bodyMat.emissiveIntensity = isSel ? 0.35 : 0;
 
-    const bodyMat = new THREE.MeshStandardMaterial({
-      color: baseColor,
-      roughness: isSel ? 0.18 : 0.32,
-      metalness: 0.2,
-      emissive: isSel ? baseColor : new THREE.Color(0x000000),
-      emissiveIntensity: isSel ? 0.35 : 0,
-    });
-
-    const capMat = new THREE.MeshStandardMaterial({
-      color: isSel ? 0xffffff : baseColor.clone().offsetHSL(0, 0, 0.14),
-      roughness: 0.15,
-      metalness: 0.45,
-    });
-
-    const bodyMesh = new THREE.Mesh(
-      opts.isSphere ? this.sharedStemGeo : this.sharedBarGeo,
-      bodyMat
-    );
-    bodyMesh.scale.set(
-      opts.isSphere ? 0.14 : opts.width,
-      0.02,
-      opts.isSphere ? 0.14 : opts.depth
-    );
-    bodyMesh.position.y = 0.01;
-    bodyMesh.castShadow = !this.isSoftwareGl;
-    bodyMesh.receiveShadow = !this.isSoftwareGl;
-
-    const capMesh = new THREE.Mesh(
-      opts.isSphere ? this.sharedSphereGeo : this.sharedCapGeo,
-      capMat
-    );
-    capMesh.scale.set(opts.width, opts.isSphere ? opts.width : 0.02, opts.depth);
-    capMesh.position.y = 0.02;
-    capMesh.castShadow = !this.isSoftwareGl;
-
-    // Attach metadata for XR & desktop picking
-    bodyMesh.userData = {rowIndex: opts.rowIndex};
-    capMesh.userData = {rowIndex: opts.rowIndex};
-    group.userData = {rowIndex: opts.rowIndex};
-    group.xb = {interactionEnabled: true};
-
-    group.add(bodyMesh, capMesh);
-    this.dataGroup.add(group);
-
-    this.bars.push({
-      group,
-      bodyMesh,
-      capMesh,
-      hitMesh: opts.isSphere ? capMesh : bodyMesh,
-      rowIndex: opts.rowIndex,
-      seriesIndex: opts.seriesIndex,
-      label,
-      seriesName,
-      formattedValue,
-      targetHeight: opts.height,
-      currentHeight: 0.02,
-      targetPos: opts.pos.clone(),
-      baseColor,
-    });
+      if (isSel) {
+        entry.capMat.color.copy(WHITE_COLOR);
+      } else {
+        entry.capMat.color.copy(entry.baseColor).offsetHSL(0, 0, 0.14);
+      }
+    }
   }
 
   private handleCanvasClick(event: PointerEvent): void {
@@ -679,8 +774,7 @@ export class SpatialDataStage extends xb.Script {
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
     this.raycaster.setFromCamera(this.pointer, camera);
-    const pickTargets = this.bars.flatMap((b) => [b.bodyMesh, b.capMesh]);
-    const hits = this.raycaster.intersectObjects(pickTargets, false);
+    const hits = this.raycaster.intersectObjects(this.pickTargetsCache, false);
     if (hits.length > 0) {
       const rowIndex = hits[0].object.userData?.rowIndex;
       if (typeof rowIndex === 'number') {
@@ -707,6 +801,9 @@ export class SpatialDataStage extends xb.Script {
     if (this.orbitControls) {
       this.orbitControls.enabled = false;
     }
+    if (this.pendingMeshSync) {
+      this.flushPendingSync();
+    }
     this.markDirty(20);
   }
 
@@ -718,6 +815,9 @@ export class SpatialDataStage extends xb.Script {
     }
     if (this.orbitControls) {
       this.orbitControls.enabled = false;
+    }
+    if (this.pendingMeshSync) {
+      this.flushPendingSync();
     }
     this.markDirty(20);
   }
@@ -733,10 +833,13 @@ export class SpatialDataStage extends xb.Script {
   }
 
   update(): void {
+    if (!this.embeddedVisible && !this.xrOrSimActive) return;
+
     const dt = Math.min(0.05, Math.max(0.001, xb.getDeltaTime()));
     let moving = false;
 
-    for (const entry of this.bars) {
+    for (let i = 0; i < this.activeBarCount; i++) {
+      const entry = this.barPool[i];
       const diff = Math.abs(entry.currentHeight - entry.targetHeight);
       if (diff > 0.001) {
         entry.currentHeight = THREE.MathUtils.damp(
@@ -750,7 +853,7 @@ export class SpatialDataStage extends xb.Script {
         entry.currentHeight = entry.targetHeight;
       }
 
-      if (this.config.spatialMode === 'scatter3d') {
+      if (entry.isSphere) {
         entry.bodyMesh.scale.y = entry.currentHeight;
         entry.bodyMesh.position.y = entry.currentHeight * 0.5;
         entry.capMesh.position.y = entry.currentHeight;
@@ -775,7 +878,19 @@ export class SpatialDataStage extends xb.Script {
   }
 
   dispose(): void {
-    this.clearDataGroup();
+    for (const entry of this.barPool) {
+      entry.bodyMat.dispose();
+      entry.capMat.dispose();
+    }
+    this.barPool = [];
+    this.pickTargetsCache = [];
+    this.activeBarCount = 0;
+
+    for (const g of this.pedestalGeos) g.dispose();
+    for (const m of this.pedestalMats) m.dispose();
+    this.pedestalGeos = [];
+    this.pedestalMats = [];
+
     this.sharedBarGeo.dispose();
     this.sharedCapGeo.dispose();
     this.sharedSphereGeo.dispose();
@@ -784,6 +899,7 @@ export class SpatialDataStage extends xb.Script {
     this.shadowTexture?.dispose();
     this.envTexture?.dispose();
     this.orbitControls?.dispose();
+
     const renderer = xb.core.renderer;
     if (renderer instanceof THREE.WebGLRenderer) {
       renderer.domElement.removeEventListener(

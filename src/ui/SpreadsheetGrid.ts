@@ -19,6 +19,7 @@ import {
   computeScrollTopForRow,
 } from '../core/virtualWindow';
 import {svgIcon} from './icons';
+import {renderBrandLogoHtml} from './branding';
 
 export const GRID_ROW_HEIGHT = 36;
 const GRID_HEADER_HEIGHT = 38;
@@ -826,6 +827,12 @@ export class SpreadsheetGrid {
       this.clearTableRefs();
       this.tableContainerEl.innerHTML = `
         <div class="flex flex-col items-center justify-center h-full min-h-[260px] p-8 text-center">
+          ${renderBrandLogoHtml({
+            variant: 'empty',
+            sizePx: 48,
+            decorative: true,
+            className: 'w-12 h-12 mb-3 opacity-90',
+          })}
           <p class="text-sm font-medium text-slate-900">This sheet has no rows yet</p>
           <p class="text-xs text-slate-500 mt-1">Click below to add the first row or open a CSV / Excel file.</p>
           <button

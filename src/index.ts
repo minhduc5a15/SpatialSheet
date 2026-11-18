@@ -8,6 +8,7 @@ import {InteractiveChart2D} from './ui/InteractiveChart2D';
 import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
+import {renderBrandLogoHtml} from './ui/branding';
 
 function escapeHtml(str: string): string {
   return str
@@ -67,9 +68,22 @@ class SpatialSheetApp {
       <div class="flex flex-col min-h-screen lg:h-screen w-full lg:overflow-hidden bg-slate-50 text-slate-900">
         <!-- Top Bar (3-zone contract) -->
         <header class="h-14 shrink-0 bg-white border-b border-slate-200 px-3 sm:px-4 lg:px-6 flex items-center justify-between gap-2 sm:gap-4 lg:gap-6">
-          <!-- Zone 1: Brand wordmark -->
-          <a href="#top" class="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 no-underline">
-            SpatialSheet
+          <!-- Zone 1: Brand lockup -->
+          <a
+            href="#top"
+            data-action="brand-home"
+            aria-label="SpatialSheet home"
+            class="inline-flex items-center gap-2 sm:gap-2.5 whitespace-nowrap shrink-0 no-underline rounded-lg pr-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+          >
+            ${renderBrandLogoHtml({
+              variant: 'header',
+              sizePx: 36,
+              alt: 'SpatialSheet logo',
+              className: 'w-8 h-8 sm:w-9 sm:h-9',
+            })}
+            <span class="font-display text-base sm:text-lg font-bold tracking-tight text-slate-900 leading-none">
+              SpatialSheet
+            </span>
           </a>
 
           <!-- Zone 2: File Actions -->
@@ -141,7 +155,7 @@ class SpatialSheetApp {
             <div
               data-role="loading-status"
               aria-live="polite"
-              class="hidden items-center gap-1.5 px-2 py-0.5 rounded-md bg-blue-50 border border-blue-200 text-[11px] font-medium text-blue-700 whitespace-nowrap shrink-0"
+              class="hidden items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-[11px] font-medium text-emerald-800 whitespace-nowrap shrink-0"
             ></div>
             <div class="h-4 w-px bg-slate-200 hidden sm:block" aria-hidden="true"></div>
             <div data-role="sheet-tabs" class="flex items-center gap-1 overflow-x-auto" role="tablist" aria-label="Sheet tabs"></div>
@@ -249,7 +263,13 @@ class SpatialSheetApp {
           data-role="drop-overlay"
           class="hidden fixed inset-0 z-50 bg-slate-900/55 items-center justify-center p-6 pointer-events-none"
         >
-          <div class="bg-white border-2 border-dashed border-blue-500 rounded-2xl px-10 py-8 text-center max-w-md shadow-xl">
+          <div class="bg-white border-2 border-dashed border-emerald-500 rounded-2xl px-10 py-8 text-center max-w-md shadow-xl flex flex-col items-center">
+            ${renderBrandLogoHtml({
+              variant: 'empty',
+              sizePx: 48,
+              decorative: true,
+              className: 'w-12 h-12 mb-3',
+            })}
             <p class="font-display text-lg font-semibold text-slate-900">Drop spreadsheet file here</p>
             <p class="text-xs text-slate-500 mt-1.5">Supports CSV, TSV, Excel (.xlsx, .xls), ODS, and JSON</p>
           </div>
@@ -601,12 +621,18 @@ class SpatialSheetApp {
     if (!active) {
       this.loadingBadgeEl.classList.add('hidden');
       this.loadingBadgeEl.classList.remove('inline-flex');
-      this.loadingBadgeEl.textContent = '';
+      this.loadingBadgeEl.innerHTML = '';
       return;
     }
     const pct =
       progress !== null ? ` (${Math.round(progress * 100)}%)` : '';
-    this.loadingBadgeEl.textContent = `${message}${pct}`;
+    const badgeLogo = renderBrandLogoHtml({
+      variant: 'badge',
+      sizePx: 16,
+      decorative: true,
+      className: 'w-4 h-4',
+    });
+    this.loadingBadgeEl.innerHTML = `${badgeLogo}<span>${escapeHtml(message)}${pct}</span>`;
     this.loadingBadgeEl.classList.remove('hidden');
     this.loadingBadgeEl.classList.add('inline-flex');
   }

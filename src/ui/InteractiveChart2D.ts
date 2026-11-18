@@ -12,6 +12,7 @@ import {
 } from '../core/tabular';
 import {sampleChartIndices} from '../core/virtualWindow';
 import {svgIcon} from './icons';
+import {renderBrandLogoHtml} from './branding';
 
 const MAX_CHART_POINTS = 32;
 
@@ -443,6 +444,12 @@ export class InteractiveChart2D {
     if (points.length === 0 || yCols.length === 0 || !hasAnyNumeric) {
       this.chartCanvasWrapEl.innerHTML = `
         <div class="flex flex-col items-center justify-center h-full text-center px-6">
+          ${renderBrandLogoHtml({
+            variant: 'empty',
+            sizePx: 48,
+            decorative: true,
+            className: 'w-12 h-12 mb-3 opacity-90',
+          })}
           <p class="text-sm font-medium text-slate-700">No chart data yet</p>
           <p class="text-xs text-slate-500 mt-1">Open a CSV or Excel file, or enter numeric values in the spreadsheet to visualize charts.</p>
         </div>

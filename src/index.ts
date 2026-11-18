@@ -394,54 +394,67 @@ class SpatialSheetApp {
       this.syncLayoutAndVizVisibility();
     });
 
-    // 5. Spreadsheet Grid (fine-grained: cell patch vs full window vs selection only)
-    this.store.subscribe(['sheetData', 'visibleRows', 'selection'], (changed) => {
-      if (changed.has('visibleRows')) {
-        this.spreadsheet.setData({
-          sheet: this.store.activeSheet,
-          visibleRowIndices: this.store.visibleRowIndices,
-          sort: this.store.sort,
-          selectedCell: this.store.selectedCell,
-          highlightedRowIndex: this.store.highlightedRowIndex,
-        });
-        return;
-      }
+    // 5. Spreadsheet Grid (fine-grained: cell patch vs full window vs selection only vs stats)
+    this.store.subscribe(
+      ['sheetData', 'visibleRows', 'selection', 'stats'],
+      (changed) => {
+        if (changed.has('visibleRows')) {
+          this.spreadsheet.setData({
+            sheet: this.store.activeSheet,
+            visibleRowIndices: this.store.visibleRowIndices,
+            sort: this.store.sort,
+            selectedCell: this.store.selectedCell,
+            highlightedRowIndex: this.store.highlightedRowIndex,
+            columnStats: this.store.activeColumnStats,
+          });
+          return;
+        }
 
-      if (changed.has('sheetData') && this.store.lastCellPatch) {
-        const patch = this.store.lastCellPatch;
-        this.store.lastCellPatch = null;
-        this.spreadsheet.updateSingleCellInPlace(
-          this.store.activeSheet,
-          patch.rowIndex,
-          patch.colIndex
-        );
+        if (changed.has('sheetData') && this.store.lastCellPatch) {
+          const patch = this.store.lastCellPatch;
+          this.store.lastCellPatch = null;
+          this.spreadsheet.updateSingleCellInPlace(
+            this.store.activeSheet,
+            patch.rowIndex,
+            patch.colIndex,
+            this.store.activeColumnStats
+          );
+          if (changed.has('selection')) {
+            this.spreadsheet.setSelection(
+              this.store.selectedCell,
+              this.store.highlightedRowIndex,
+              this.store.activeColumnStats
+            );
+          }
+          return;
+        }
+
+        if (changed.has('sheetData')) {
+          this.spreadsheet.setData({
+            sheet: this.store.activeSheet,
+            visibleRowIndices: this.store.visibleRowIndices,
+            sort: this.store.sort,
+            selectedCell: this.store.selectedCell,
+            highlightedRowIndex: this.store.highlightedRowIndex,
+            columnStats: this.store.activeColumnStats,
+          });
+          return;
+        }
+
         if (changed.has('selection')) {
           this.spreadsheet.setSelection(
             this.store.selectedCell,
-            this.store.highlightedRowIndex
+            this.store.highlightedRowIndex,
+            this.store.activeColumnStats
           );
+          return;
         }
-        return;
-      }
 
-      if (changed.has('sheetData')) {
-        this.spreadsheet.setData({
-          sheet: this.store.activeSheet,
-          visibleRowIndices: this.store.visibleRowIndices,
-          sort: this.store.sort,
-          selectedCell: this.store.selectedCell,
-          highlightedRowIndex: this.store.highlightedRowIndex,
-        });
-        return;
+        if (changed.has('stats')) {
+          this.spreadsheet.setColumnStats(this.store.activeColumnStats);
+        }
       }
-
-      if (changed.has('selection')) {
-        this.spreadsheet.setSelection(
-          this.store.selectedCell,
-          this.store.highlightedRowIndex
-        );
-      }
-    });
+    );
 
     // 6. 2D Chart updates (skip full rebuild on highlight-only changes)
     this.store.subscribe(
@@ -500,6 +513,7 @@ class SpatialSheetApp {
       sort: this.store.sort,
       selectedCell: this.store.selectedCell,
       highlightedRowIndex: this.store.highlightedRowIndex,
+      columnStats: this.store.activeColumnStats,
     };
     this.spreadsheet.setData(params);
     this.chart2d.setData({

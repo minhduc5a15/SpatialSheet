@@ -7,6 +7,7 @@ import type {
   VirtualRange,
   VisibleRowsSource,
 } from '../types';
+import type {ActiveColumnStatsState} from '../core/store';
 import {
   columnIndexToLetter,
   computeColumnStats,
@@ -80,16 +81,12 @@ export class SpreadsheetGrid {
   private scrollRafId = 0;
   private resizeObserver: ResizeObserver | null = null;
 
-  // Caches to avoid re-scanning 100k rows on cell clicks
-  private statsCache: {
-    sheet: SheetData | null;
-    visibleRows: VisibleRowsSource;
-    colIndex: number;
-    stats: ColumnStats;
-  } | null = null;
-  private lastStatsCol = -1;
-  private lastStatsSheet: SheetData | null = null;
-  private lastStatsVisible: VisibleRowsSource | null = null;
+  // Multi-column stats cache + optional store-provided async stats state
+  private externalStatsState: ActiveColumnStatsState | null = null;
+  private statsCacheSheet: SheetData | null = null;
+  private statsCacheVisible: VisibleRowsSource | null = null;
+  private statsCacheMap = new Map<number, ColumnStats>();
+  private lastStatsSignature = '';
 
   // Track currently committed/escaped input to ignore duplicate focusout
   private activeCellInputCommitted = false;
@@ -407,20 +404,31 @@ export class SpreadsheetGrid {
     sort: SortState;
     selectedCell: CellCoord | null;
     highlightedRowIndex: number | null;
+    columnStats?: ActiveColumnStatsState;
   }): void {
     const sheetChanged = this.sheet !== params.sheet;
     const visibleChanged = this.visibleRowIndices !== params.visibleRowIndices;
     const sortChanged =
       this.sort.colIndex !== params.sort.colIndex ||
       this.sort.direction !== params.sort.direction;
+    const selectionChanged =
+      this.selectedCell?.rowIndex !== params.selectedCell?.rowIndex ||
+      this.selectedCell?.colIndex !== params.selectedCell?.colIndex;
+    const highlightChanged =
+      this.highlightedRowIndex !== params.highlightedRowIndex;
 
     this.sheet = params.sheet;
     this.visibleRowIndices = params.visibleRowIndices;
     this.sort = params.sort;
     this.selectedCell = params.selectedCell;
     this.highlightedRowIndex = params.highlightedRowIndex;
+    if (params.columnStats !== undefined) {
+      this.externalStatsState = params.columnStats;
+    }
 
-    if (
+    if (sheetChanged || sortChanged) {
+      this.editingCell = null;
+    } else if (
       this.editingCell &&
       (this.editingCell.rowIndex >= params.sheet.rows.length ||
         this.editingCell.colIndex >= params.sheet.columns.length)
@@ -429,11 +437,15 @@ export class SpreadsheetGrid {
     }
 
     if (sheetChanged || visibleChanged) {
-      this.statsCache = null;
+      this.statsCacheMap.clear();
+      this.statsCacheSheet = params.sheet;
+      this.statsCacheVisible = params.visibleRowIndices;
+      this.lastStatsSignature = '';
     }
 
     const structKey = `${params.sheet.id}:${params.sheet.columns.length}:${params.sheet.columns.join('\x00')}`;
-    if (structKey !== this.lastStructureKey) {
+    const structChanged = structKey !== this.lastStructureKey;
+    if (structChanged) {
       this.lastStructureKey = structKey;
       this.computeColumnWidths();
       if (this.tableContainerEl && sheetChanged) {
@@ -442,9 +454,18 @@ export class SpreadsheetGrid {
       }
     }
 
-    this.renderTableStructureAndWindow(
-      sheetChanged || visibleChanged || sortChanged || true
-    );
+    const needsWindowRebuild =
+      sheetChanged || visibleChanged || sortChanged || structChanged || !this.tableEl;
+
+    if (needsWindowRebuild) {
+      this.renderTableStructureAndWindow(true);
+    } else {
+      this.renderTableStructureAndWindow(false);
+      if (selectionChanged || highlightChanged) {
+        this.updateSelectionDomClasses();
+      }
+    }
+
     this.syncFormulaBar();
     this.renderStatsStrip();
   }
@@ -455,20 +476,42 @@ export class SpreadsheetGrid {
    */
   public setSelection(
     selectedCell: CellCoord | null,
-    highlightedRowIndex: number | null
+    highlightedRowIndex: number | null,
+    columnStats?: ActiveColumnStatsState
   ): void {
+    const sameCell =
+      this.selectedCell?.rowIndex === selectedCell?.rowIndex &&
+      this.selectedCell?.colIndex === selectedCell?.colIndex;
+    const sameRow = this.highlightedRowIndex === highlightedRowIndex;
+    const statsProvided = columnStats !== undefined;
+
+    if (columnStats !== undefined) {
+      this.externalStatsState = columnStats;
+    }
+
+    if (sameCell && sameRow && !statsProvided) {
+      return;
+    }
+
     const prevCol = this.selectedCell?.colIndex ?? -1;
     const nextCol = selectedCell?.colIndex ?? -1;
 
     this.selectedCell = selectedCell;
     this.highlightedRowIndex = highlightedRowIndex;
 
-    this.updateSelectionDomClasses();
-    this.syncFormulaBar();
+    if (!sameCell || !sameRow) {
+      this.updateSelectionDomClasses();
+      this.syncFormulaBar();
+    }
 
-    if (prevCol !== nextCol || this.statsCache === null) {
+    if (prevCol !== nextCol || statsProvided || this.statsCacheMap.size === 0) {
       this.renderStatsStrip();
     }
+  }
+
+  public setColumnStats(columnStats: ActiveColumnStatsState): void {
+    this.externalStatsState = columnStats;
+    this.renderStatsStrip();
   }
 
   /**
@@ -477,14 +520,20 @@ export class SpreadsheetGrid {
   public updateSingleCellInPlace(
     nextSheet: SheetData,
     rowIndex: number,
-    colIndex: number
+    colIndex: number,
+    columnStats?: ActiveColumnStatsState
   ): void {
     const oldTypes = this.sheet?.types;
     this.sheet = nextSheet;
-    this.statsCache = null;
+    this.statsCacheMap.delete(colIndex);
+    this.statsCacheSheet = nextSheet;
+    this.lastStatsSignature = '';
+    if (columnStats !== undefined) {
+      this.externalStatsState = columnStats;
+    }
 
     if (oldTypes && oldTypes[colIndex] !== nextSheet.types[colIndex]) {
-      this.renderHeader(true);
+      this.renderHeader(false);
     }
 
     if (this.tbodyEl) {
@@ -678,43 +727,44 @@ export class SpreadsheetGrid {
     const visibleCount = this.visibleRowIndices.length;
 
     const activeCol = this.selectedCell?.colIndex ?? this.findFirstNumericCol();
-    if (
-      this.lastStatsSheet === this.sheet &&
-      this.lastStatsVisible === this.visibleRowIndices &&
-      this.lastStatsCol === activeCol &&
-      this.statsCache
-    ) {
-      return;
-    }
-
     const colName = this.sheet.columns[activeCol] ?? '';
+
     let stats: ColumnStats | null = null;
-    if (activeCol >= 0 && activeCol < this.sheet.columns.length) {
+    let isLoading = false;
+
+    if (
+      this.externalStatsState &&
+      this.externalStatsState.colIndex === activeCol
+    ) {
+      stats = this.externalStatsState.stats;
+      isLoading = this.externalStatsState.loading;
+    } else if (activeCol >= 0 && activeCol < this.sheet.columns.length) {
       if (
-        this.statsCache &&
-        this.statsCache.sheet === this.sheet &&
-        this.statsCache.visibleRows === this.visibleRowIndices &&
-        this.statsCache.colIndex === activeCol
+        this.statsCacheSheet !== this.sheet ||
+        this.statsCacheVisible !== this.visibleRowIndices
       ) {
-        stats = this.statsCache.stats;
+        this.statsCacheMap.clear();
+        this.statsCacheSheet = this.sheet;
+        this.statsCacheVisible = this.visibleRowIndices;
+      }
+      const cached = this.statsCacheMap.get(activeCol);
+      if (cached) {
+        stats = cached;
       } else {
         stats = computeColumnStats(
           this.sheet,
           activeCol,
           this.visibleRowIndices
         );
-        this.statsCache = {
-          sheet: this.sheet,
-          visibleRows: this.visibleRowIndices,
-          colIndex: activeCol,
-          stats,
-        };
+        this.statsCacheMap.set(activeCol, stats);
       }
     }
 
-    this.lastStatsSheet = this.sheet;
-    this.lastStatsVisible = this.visibleRowIndices;
-    this.lastStatsCol = activeCol;
+    const sig = `${totalRows}:${visibleCount}:${this.sheet.columns.length}:${activeCol}:${isLoading ? 'loading' : stats ? `${stats.numericCount}:${stats.sum}:${stats.nonEmptyCount}:${stats.uniqueCount}` : 'none'}`;
+    if (sig === this.lastStatsSignature) {
+      return;
+    }
+    this.lastStatsSignature = sig;
 
     const leftText =
       visibleCount === totalRows
@@ -722,7 +772,13 @@ export class SpreadsheetGrid {
         : `Showing ${visibleCount.toLocaleString('en-US')} of ${totalRows.toLocaleString('en-US')} rows · ${this.sheet.columns.length} cols`;
 
     let rightHtml = '';
-    if (stats && stats.numericCount > 0) {
+    if (isLoading) {
+      rightHtml = `
+        <div class="text-slate-400">
+          <span>${escapeHtml(colName)}: Calculating stats…</span>
+        </div>
+      `;
+    } else if (stats && stats.numericCount > 0) {
       const colType = this.sheet.types[activeCol] ?? 'number';
       rightHtml = `
         <div class="flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono-tabular text-slate-700">

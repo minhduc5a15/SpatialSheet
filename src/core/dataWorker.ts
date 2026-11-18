@@ -1,6 +1,12 @@
-import type {ColumnType, SheetData, SortState, WorkbookState} from '../types';
+import type {
+  ColumnStats,
+  ColumnType,
+  SheetData,
+  SortState,
+  WorkbookState,
+} from '../types';
 import {importTabularFile} from './excelIO';
-import {filterAndSortRowsBuffer} from './tabular';
+import {computeColumnStats, filterAndSortRowsBuffer} from './tabular';
 
 export type WorkerRequest =
   | {
@@ -29,6 +35,17 @@ export type WorkerRequest =
       sheetVersion: number;
       searchQuery: string;
       sort: SortState;
+      filterKey: string;
+      sheet?: SheetData;
+    }
+  | {
+      type: 'compute-stats';
+      requestId: number;
+      sheetVersion: number;
+      colIndex: number;
+      filterKey: string;
+      useAllRows: boolean;
+      visibleRowIndices?: Int32Array;
       sheet?: SheetData;
     };
 
@@ -55,10 +72,21 @@ export type WorkerResponse =
       requestId: number;
       sheetVersion: number;
       indicesBuffer: ArrayBuffer;
+    }
+  | {
+      type: 'stats-result';
+      requestId: number;
+      sheetVersion: number;
+      colIndex: number;
+      filterKey: string;
+      stats: ColumnStats;
     };
 
 let cachedSheet: SheetData | null = null;
 let cachedVersion = -1;
+let cachedIndices: Int32Array | null = null;
+let cachedIndicesVersion = -1;
+let cachedFilterKey = '';
 
 self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data;
@@ -80,6 +108,9 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
 
       cachedSheet = workbook.sheets[workbook.activeSheetIndex] ?? null;
       cachedVersion = msg.initialSheetVersion;
+      cachedIndices = null;
+      cachedIndicesVersion = -1;
+      cachedFilterKey = '';
 
       const resp: WorkerResponse = {
         type: 'parsed',
@@ -102,6 +133,9 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
   if (msg.type === 'cache-sheet') {
     cachedSheet = msg.sheet;
     cachedVersion = msg.sheetVersion;
+    cachedIndices = null;
+    cachedIndicesVersion = -1;
+    cachedFilterKey = '';
     return;
   }
 
@@ -112,6 +146,9 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
         row[msg.colIndex] = msg.value;
         cachedSheet.types[msg.colIndex] = msg.colType;
         cachedVersion = msg.sheetVersion;
+        cachedIndices = null;
+        cachedIndicesVersion = -1;
+        cachedFilterKey = '';
       }
     }
     return;
@@ -131,7 +168,12 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
       msg.searchQuery,
       msg.sort
     );
-    const buffer = indices.buffer as ArrayBuffer;
+    cachedIndices = indices;
+    cachedIndicesVersion = msg.sheetVersion;
+    cachedFilterKey = msg.filterKey;
+
+    const transferCopy = indices.slice();
+    const buffer = transferCopy.buffer as ArrayBuffer;
     const resp: WorkerResponse = {
       type: 'filter-sort-result',
       requestId: msg.requestId,
@@ -139,5 +181,43 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
       indicesBuffer: buffer,
     };
     (self as unknown as Worker).postMessage(resp, [buffer]);
+    return;
+  }
+
+  if (msg.type === 'compute-stats') {
+    if (msg.sheet) {
+      cachedSheet = msg.sheet;
+      cachedVersion = msg.sheetVersion;
+    }
+    const targetSheet =
+      cachedVersion === msg.sheetVersion ? cachedSheet : msg.sheet ?? null;
+    if (!targetSheet) return;
+
+    let rowSource: Int32Array | undefined;
+    if (!msg.useAllRows) {
+      if (msg.visibleRowIndices) {
+        rowSource = msg.visibleRowIndices;
+        cachedIndices = msg.visibleRowIndices;
+        cachedIndicesVersion = msg.sheetVersion;
+        cachedFilterKey = msg.filterKey;
+      } else if (
+        cachedIndices &&
+        cachedIndicesVersion === msg.sheetVersion &&
+        cachedFilterKey === msg.filterKey
+      ) {
+        rowSource = cachedIndices;
+      }
+    }
+
+    const stats = computeColumnStats(targetSheet, msg.colIndex, rowSource);
+    const resp: WorkerResponse = {
+      type: 'stats-result',
+      requestId: msg.requestId,
+      sheetVersion: msg.sheetVersion,
+      colIndex: msg.colIndex,
+      filterKey: msg.filterKey,
+      stats,
+    };
+    self.postMessage(resp);
   }
 });

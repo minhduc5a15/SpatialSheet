@@ -218,11 +218,18 @@ export interface CellCoord {
   colIndex: number;
 }
 
+export type ChartAggregationMode = 'none' | 'sum' | 'avg' | 'count';
+
+export type ChartSortOrder = 'source' | 'value-desc' | 'value-asc';
+
 export interface ChartConfig {
   type: ChartType;
   xColIndex: number;
   yColIndices: number[];
   spatialMode: SpatialChartMode;
+  aggregation?: ChartAggregationMode;
+  sortOrder?: ChartSortOrder;
+  maxPoints?: number;
 }
 
 export interface VirtualRange {
@@ -242,6 +249,37 @@ export interface ColumnVirtualRange {
   virtualized: boolean;
 }
 
+export interface ColumnViewState {
+  /** Visual display order of source column indices */
+  order: number[];
+  /** Hidden source column indices */
+  hidden: number[];
+  /** Left-pinned source column indices */
+  pinned: number[];
+  /** Explicit / measured widths keyed by source column index */
+  widths: Record<number, number>;
+}
+
+export interface VisibleColumnPlan {
+  /** Ordered visible source column indices (pinned left first, then unpinned) */
+  visibleCols: number[];
+  /** Left-pinned subset actually kept sticky for current viewport width */
+  pinnedCols: number[];
+  /** Remaining visible columns that scroll horizontally */
+  unpinnedCols: number[];
+  /** Sticky left offsets in px per pinned source column index */
+  pinnedLeftOffsets: Record<number, number>;
+  /** Total pixel width of pinned columns */
+  pinnedTotalWidth: number;
+  /** Number of pinned columns downgraded due to narrow viewport */
+  downgradedPinCount: number;
+}
+
+export interface PinnedColumnVirtualRange extends ColumnVirtualRange {
+  /** Source column indices rendered in the virtualized unpinned tail */
+  visibleUnpinnedCols: number[];
+}
+
 export interface LoadingState {
   active: boolean;
   message: string;
@@ -252,6 +290,7 @@ export type AppDomain =
   | 'workbook'
   | 'sheetData'
   | 'visibleRows'
+  | 'columnView'
   | 'selection'
   | 'stats'
   | 'profile'

@@ -1,11 +1,16 @@
 import * as xb from 'xrblocks';
 import type {SpatialChartMode, WorkspaceLayout} from './types';
 import {createBlankWorkbook} from './core/tabular';
+import {
+  computeSplitPaneWidths,
+  isDesktopSplitViewport,
+} from './core/workspaceLayout';
 import {exportSheetAsCsv, exportWorkbookAsExcel} from './core/excelIO';
 import {AppStore} from './core/store';
 import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
 import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
+import {WorkspaceSplitter} from './ui/WorkspaceSplitter';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
 import {renderBrandLogoHtml} from './ui/branding';
@@ -24,11 +29,14 @@ class SpatialSheetApp {
 
   private spreadsheet!: SpreadsheetGrid;
   private chart2d!: InteractiveChart2D;
+  private splitter!: WorkspaceSplitter;
   private spatialStage!: SpatialDataStage;
   private spatialOverlay!: SpatialInspectorOverlay;
 
   // Layout containers
+  private mainEl!: HTMLElement;
   private gridHostEl!: HTMLElement;
+  private splitterEl!: HTMLElement;
   private vizHostEl!: HTMLElement;
   private chart2dHostEl!: HTMLElement;
   private spatialHostEl!: HTMLElement;
@@ -45,6 +53,7 @@ class SpatialSheetApp {
   private errorBannerEl!: HTMLElement;
 
   private lastTabsKey = '';
+  private previewSplitRatio: number | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -221,12 +230,15 @@ class SpatialSheetApp {
         </div>
 
         <!-- Main Workspace Canvas -->
-        <main class="flex-1 min-h-0 p-3 lg:p-4 grid grid-cols-1 lg:grid-cols-12 gap-4 overflow-y-auto lg:overflow-hidden">
+        <main data-role="workspace-main" class="flex-1 min-h-0 p-3 lg:p-4 flex flex-col lg:flex-row gap-4 lg:gap-0 overflow-y-auto lg:overflow-hidden">
           <!-- Spreadsheet Pane -->
-          <section data-role="grid-host" class="lg:col-span-7 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col"></section>
+          <section data-role="grid-host" class="w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col"></section>
+
+          <!-- Resizable Split Divider (Desktop >= 1024px in Split mode) -->
+          <div data-role="workspace-splitter" class="hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20"></div>
 
           <!-- Visualization Pane (2D Interactive Charts + 3D XR Blocks Stage) -->
-          <section data-role="viz-host" class="lg:col-span-5 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col gap-2">
+          <section data-role="viz-host" class="w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col gap-2">
             <!-- Sub-switcher between 2D Chart and 3D Spatial Stage inside Split Mode -->
             <div class="flex items-center justify-between gap-2 shrink-0">
               <div class="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg" role="group" aria-label="Visualization mode">
@@ -287,7 +299,9 @@ class SpatialSheetApp {
       </div>
     `;
 
+    this.mainEl = this.root.querySelector('[data-role="workspace-main"]')!;
     this.gridHostEl = this.root.querySelector('[data-role="grid-host"]')!;
+    this.splitterEl = this.root.querySelector('[data-role="workspace-splitter"]')!;
     this.vizHostEl = this.root.querySelector('[data-role="viz-host"]')!;
     this.chart2dHostEl = this.root.querySelector('[data-role="chart2d-host"]')!;
     this.spatialHostEl = this.root.querySelector('[data-role="spatial-host"]')!;
@@ -311,6 +325,20 @@ class SpatialSheetApp {
   }
 
   private initSubsystems(): void {
+    this.splitter = new WorkspaceSplitter(this.splitterEl, {
+      getContainerRect: () => this.getWorkspaceContentRect(),
+      getRatio: () => this.previewSplitRatio ?? this.store.splitRatio,
+      onRatioPreview: (ratio) => {
+        this.previewSplitRatio = ratio;
+        this.applySplitWidths(ratio);
+      },
+      onRatioCommit: (ratio) => {
+        this.previewSplitRatio = null;
+        this.store.setSplitRatio(ratio, true);
+        this.applySplitWidths(this.store.splitRatio);
+      },
+    });
+
     this.spreadsheet = new SpreadsheetGrid(this.gridHostEl, {
       onCellCommit: (rowIndex, colIndex, value) => {
         this.store.commitCellEdit(rowIndex, colIndex, value);
@@ -340,6 +368,27 @@ class SpatialSheetApp {
       onClearSearch: () => {
         this.searchInput.value = '';
         this.store.clearSearch();
+      },
+      onResizeColumn: (colIndex, width) => {
+        this.store.setColumnWidth(colIndex, width);
+      },
+      onAutoFitColumn: (colIndex) => {
+        this.store.autoFitColumn(colIndex);
+      },
+      onTogglePinColumn: (colIndex) => {
+        this.store.toggleColumnPin(colIndex);
+      },
+      onToggleHideColumn: (colIndex) => {
+        this.store.toggleColumnVisibility(colIndex);
+      },
+      onRestoreAllColumns: () => {
+        this.store.restoreAllColumns();
+      },
+      onResetColumnView: () => {
+        this.store.resetColumnView();
+      },
+      onMoveColumnVisual: (colIndex, direction) => {
+        this.store.moveColumnVisual(colIndex, direction);
       },
     });
 
@@ -407,8 +456,17 @@ class SpatialSheetApp {
       this.syncSpatialSize();
     });
     ro.observe(this.xrCanvasMountEl);
+
+    const mainRo = new ResizeObserver(() => {
+      this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
+    });
+    mainRo.observe(this.mainEl);
+
     window.addEventListener('resize', () => {
-      requestAnimationFrame(() => this.syncSpatialSize());
+      requestAnimationFrame(() => {
+        this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
+        this.syncSpatialSize();
+      });
     });
   }
 
@@ -436,9 +494,9 @@ class SpatialSheetApp {
       this.syncLayoutAndVizVisibility();
     });
 
-    // 5. Spreadsheet Grid (fine-grained: cell patch vs full window vs selection only vs stats)
+    // 5. Spreadsheet Grid (fine-grained: cell patch vs columnView vs full window vs selection only vs stats)
     this.store.subscribe(
-      ['sheetData', 'visibleRows', 'selection', 'stats'],
+      ['sheetData', 'visibleRows', 'columnView', 'profile', 'selection', 'stats'],
       (changed) => {
         if (changed.has('visibleRows')) {
           this.spreadsheet.setData({
@@ -448,6 +506,8 @@ class SpatialSheetApp {
             selectedCell: this.store.selectedCell,
             highlightedRowIndex: this.store.highlightedRowIndex,
             columnStats: this.store.activeColumnStats,
+            columnView: this.store.activeColumnView,
+            profile: this.store.datasetProfile,
           });
           return;
         }
@@ -479,7 +539,17 @@ class SpatialSheetApp {
             selectedCell: this.store.selectedCell,
             highlightedRowIndex: this.store.highlightedRowIndex,
             columnStats: this.store.activeColumnStats,
+            columnView: this.store.activeColumnView,
+            profile: this.store.datasetProfile,
           });
+          return;
+        }
+
+        if (changed.has('columnView') || changed.has('profile')) {
+          this.spreadsheet.setColumnView(
+            this.store.activeColumnView,
+            this.store.datasetProfile
+          );
           return;
         }
 
@@ -515,6 +585,7 @@ class SpatialSheetApp {
             config: this.store.chartConfig,
             highlightedRowIndex: this.store.highlightedRowIndex,
             recommendations: this.store.chartRecommendations,
+            profile: this.store.datasetProfile,
           });
         } else if (changed.has('chartHighlight')) {
           this.chart2d.setHighlight(this.store.highlightedRowIndex);
@@ -565,6 +636,8 @@ class SpatialSheetApp {
       selectedCell: this.store.selectedCell,
       highlightedRowIndex: this.store.highlightedRowIndex,
       columnStats: this.store.activeColumnStats,
+      columnView: this.store.activeColumnView,
+      profile: this.store.datasetProfile,
     };
     this.spreadsheet.setData(params);
     this.chart2d.setData({
@@ -573,6 +646,7 @@ class SpatialSheetApp {
       config: this.store.chartConfig,
       highlightedRowIndex: this.store.highlightedRowIndex,
       recommendations: this.store.chartRecommendations,
+      profile: this.store.datasetProfile,
     });
     this.syncSpatialViews();
   }
@@ -675,18 +749,24 @@ class SpatialSheetApp {
 
     if (layout === 'table') {
       this.gridHostEl.className =
-        'lg:col-span-12 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col';
+        'w-full min-h-[340px] lg:min-h-0 lg:h-full flex-1 flex flex-col';
       this.vizHostEl.classList.add('hidden');
+      this.splitterEl.className = 'hidden';
     } else if (layout === 'charts' || layout === 'spatial') {
       this.gridHostEl.classList.add('hidden');
+      this.splitterEl.className = 'hidden';
       this.vizHostEl.className =
-        'lg:col-span-12 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col gap-2';
+        'w-full min-h-[340px] lg:min-h-0 lg:h-full flex-1 flex flex-col gap-2';
     } else {
       this.gridHostEl.className =
-        'lg:col-span-7 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col';
+        'w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col';
+      this.splitterEl.className =
+        'hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20';
       this.vizHostEl.className =
-        'lg:col-span-5 min-h-[340px] lg:min-h-0 lg:h-full flex flex-col gap-2';
+        'w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col gap-2';
     }
+
+    this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
 
     const show3D =
       layout === 'spatial' || (layout !== 'table' && chartPanelMode === '3d');
@@ -702,6 +782,57 @@ class SpatialSheetApp {
     if (show3D) {
       requestAnimationFrame(() => this.syncSpatialSize());
     }
+  }
+
+  private getWorkspaceContentRect(): DOMRect | null {
+    if (!this.mainEl) return null;
+    const rect = this.mainEl.getBoundingClientRect();
+    const cs = window.getComputedStyle(this.mainEl);
+    const padL = parseFloat(cs.paddingLeft) || 0;
+    const padR = parseFloat(cs.paddingRight) || 0;
+    const contentWidth = Math.max(0, rect.width - padL - padR);
+    return new DOMRect(rect.left + padL, rect.top, contentWidth, rect.height);
+  }
+
+  private applySplitWidths(ratio: number): void {
+    const {layout} = this.store;
+    if (layout === 'table') {
+      this.gridHostEl.style.width = '';
+      this.gridHostEl.style.flex = '1 1 0%';
+      this.vizHostEl.style.width = '';
+      this.vizHostEl.style.flex = '';
+      return;
+    }
+    if (layout === 'charts' || layout === 'spatial') {
+      this.gridHostEl.style.width = '';
+      this.gridHostEl.style.flex = '';
+      this.vizHostEl.style.width = '';
+      this.vizHostEl.style.flex = '1 1 0%';
+      return;
+    }
+
+    const desktopSplit = isDesktopSplitViewport(window.innerWidth);
+    if (!desktopSplit) {
+      this.gridHostEl.style.width = '';
+      this.gridHostEl.style.flex = '';
+      this.vizHostEl.style.width = '';
+      this.vizHostEl.style.flex = '';
+      return;
+    }
+
+    const contentRect = this.getWorkspaceContentRect();
+    const containerWidth = contentRect?.width ?? 0;
+    if (containerWidth <= 0) return;
+
+    const {leftWidthPx, clampedRatio} = computeSplitPaneWidths({
+      containerWidth,
+      splitRatio: ratio,
+    });
+    this.gridHostEl.style.flex = '0 0 auto';
+    this.gridHostEl.style.width = `${leftWidthPx}px`;
+    this.vizHostEl.style.flex = '1 1 0%';
+    this.vizHostEl.style.width = '';
+    this.splitter.syncRatio(clampedRatio);
   }
 
   private syncSpatialSize(): void {

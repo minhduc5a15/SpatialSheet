@@ -4,6 +4,7 @@ import type {
   ChartConfig,
   ChartRecommendation,
   ColumnStats,
+  ColumnViewState,
   DatasetProfile,
   DerivedSpatialDataset,
   LoadingState,
@@ -17,6 +18,23 @@ import type {
   WorkbookState,
   WorkspaceLayout,
 } from '../types';
+import {
+  computeAutoFitColumnWidth,
+  createColumnViewState,
+  moveColumnVisualInView,
+  normalizeColumnViewState,
+  reconcileColumnViewOnAdd,
+  reconcileColumnViewOnDelete,
+  restoreAllColumnsInView,
+  setColumnWidthInView,
+  toggleColumnPinInView,
+  toggleColumnVisibilityInView,
+} from './columnView';
+import {
+  clampSplitRatio,
+  loadWorkspaceSplitRatio,
+  saveWorkspaceSplitRatio,
+} from './workspaceLayout';
 import {recommendCharts} from './chartRecommender';
 import {
   applyColumnRoleOverride,
@@ -67,6 +85,7 @@ export class AppStore {
   public highlightedRowIndex: number | null = null;
   public chartConfig: ChartConfig;
   public layout: WorkspaceLayout = 'split';
+  public splitRatio: number;
   public chartPanelMode: '2d' | '3d' = '2d';
   public isSimulatorFullscreen = false;
   public loading: LoadingState = {active: false, message: '', progress: null};
@@ -98,6 +117,7 @@ export class AppStore {
   private loadFileSeq = 0;
   private columnStatsCache = new Map<number, ColumnStats>();
   private columnStatsCacheFilterKey = '';
+  private columnViewsBySheetId = new Map<string, ColumnViewState>();
   private derivedSpatialCacheKey = '';
   private spatialStale = false;
   private nextSheetIdSeq = 1;
@@ -108,6 +128,8 @@ export class AppStore {
     this.worker = worker ?? new DataWorkerClient();
 
     const firstSheet = this.activeSheet;
+    this.splitRatio = loadWorkspaceSplitRatio();
+    this.columnViewsBySheetId.set(firstSheet.id, createColumnViewState(firstSheet));
     this.chartConfig = suggestChartConfig(firstSheet);
     this.visibleRowIndices = this.buildSequentialIndices(firstSheet.rows.length);
     this.selectedCell =
@@ -139,6 +161,22 @@ export class AppStore {
   public get activeSheet(): SheetData {
     const wb = this.workbook;
     return wb.sheets[wb.activeSheetIndex] ?? wb.sheets[0];
+  }
+
+  public get activeColumnView(): ColumnViewState {
+    const sheet = this.activeSheet;
+    let existing = this.columnViewsBySheetId.get(sheet.id);
+    if (!existing) {
+      existing = createColumnViewState(sheet);
+      this.columnViewsBySheetId.set(sheet.id, existing);
+      return existing;
+    }
+    if (existing.order.length !== sheet.columns.length) {
+      const normalized = normalizeColumnViewState(existing, sheet.columns.length);
+      this.columnViewsBySheetId.set(sheet.id, normalized);
+      return normalized;
+    }
+    return existing;
   }
 
   public subscribe(domains: AppDomain[], listener: StoreListener): () => void {
@@ -886,6 +924,11 @@ export class AppStore {
     this.filterSeq++;
     this.worker.invalidateCache();
     this.clearColumnStatsCache();
+    const nextView = reconcileColumnViewOnAdd(
+      this.activeColumnView,
+      nextSheet.columns.length - 1
+    );
+    this.columnViewsBySheetId.set(nextSheet.id, nextView);
     this.rebuildProfileFull(false);
     this.refreshActiveColumnStats(true);
     this.refreshDerivedSpatialData(true);
@@ -893,6 +936,7 @@ export class AppStore {
       'workbook',
       'sheetData',
       'visibleRows',
+      'columnView',
       'history',
       'stats',
       'profile',
@@ -923,6 +967,7 @@ export class AppStore {
         'workbook',
         'sheetData',
         'visibleRows',
+        'columnView',
         'chartConfig',
         'history',
         'stats',
@@ -943,6 +988,12 @@ export class AppStore {
     this.worker.invalidateCache();
     this.clearColumnStatsCache();
     this.selectedCell = null;
+    const nextView = reconcileColumnViewOnDelete(
+      this.activeColumnView,
+      colIndex,
+      nextSheet.columns.length
+    );
+    this.columnViewsBySheetId.set(nextSheet.id, nextView);
 
     let sortWasInvalidated = false;
     if (this.sort.colIndex !== null) {
@@ -970,6 +1021,7 @@ export class AppStore {
         'workbook',
         'sheetData',
         'visibleRows',
+        'columnView',
         'selection',
         'chartConfig',
         'history',
@@ -987,6 +1039,7 @@ export class AppStore {
         'workbook',
         'sheetData',
         'visibleRows',
+        'columnView',
         'selection',
         'chartConfig',
         'history',
@@ -1039,6 +1092,74 @@ export class AppStore {
     this.emit(['layout', 'vizMode']);
   }
 
+  public setSplitRatio(ratio: number, persist = true): void {
+    const clamped = clampSplitRatio(ratio);
+    const changed = Math.abs(this.splitRatio - clamped) > 0.0005;
+    this.splitRatio = clamped;
+    if (persist) {
+      saveWorkspaceSplitRatio(clamped);
+    }
+    if (changed) {
+      this.emit(['layout']);
+    }
+  }
+
+  public setColumnWidth(colIndex: number, width: number): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const next = setColumnWidthInView(this.activeColumnView, colIndex, width);
+    if (next === this.activeColumnView) return;
+    this.columnViewsBySheetId.set(sheet.id, next);
+    this.emit(['columnView']);
+  }
+
+  public autoFitColumn(colIndex: number): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const width = computeAutoFitColumnWidth(sheet, colIndex);
+    this.setColumnWidth(colIndex, width);
+  }
+
+  public toggleColumnPin(colIndex: number): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const next = toggleColumnPinInView(this.activeColumnView, colIndex);
+    this.columnViewsBySheetId.set(sheet.id, next);
+    this.emit(['columnView']);
+  }
+
+  public toggleColumnVisibility(colIndex: number): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const next = toggleColumnVisibilityInView(this.activeColumnView, colIndex);
+    if (next === this.activeColumnView) return;
+    this.columnViewsBySheetId.set(sheet.id, next);
+    this.emit(['columnView']);
+  }
+
+  public restoreAllColumns(): void {
+    const sheet = this.activeSheet;
+    const next = restoreAllColumnsInView(this.activeColumnView);
+    if (next === this.activeColumnView) return;
+    this.columnViewsBySheetId.set(sheet.id, next);
+    this.emit(['columnView']);
+  }
+
+  public resetColumnView(): void {
+    const sheet = this.activeSheet;
+    this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
+    this.emit(['columnView']);
+  }
+
+  public moveColumnVisual(colIndex: number, direction: -1 | 1): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const next = moveColumnVisualInView(this.activeColumnView, colIndex, direction);
+    if (next === this.activeColumnView) return;
+    this.columnViewsBySheetId.set(sheet.id, next);
+    this.emit(['columnView']);
+  }
+
   public setChartPanelMode(mode: '2d' | '3d'): void {
     if (this.chartPanelMode === mode) return;
     this.chartPanelMode = mode;
@@ -1066,6 +1187,9 @@ export class AppStore {
     this.clearColumnStatsCache();
 
     const sheet = this.activeSheet;
+    if (!this.columnViewsBySheetId.has(sheet.id)) {
+      this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
+    }
     this.selectedCell =
       sheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
     this.highlightedRowIndex = null;
@@ -1079,6 +1203,7 @@ export class AppStore {
       'workbook',
       'sheetData',
       'visibleRows',
+      'columnView',
       'selection',
       'chartConfig',
       'history',
@@ -1103,6 +1228,7 @@ export class AppStore {
     this.searchQuery = '';
     this.sort = {colIndex: null, direction: null};
     this.clearColumnStatsCache();
+    this.columnViewsBySheetId.set(blank.id, createColumnViewState(blank));
     this.chartConfig = suggestChartConfig(blank);
     this.selectedCell = {rowIndex: 0, colIndex: 0};
     this.highlightedRowIndex = null;
@@ -1115,6 +1241,7 @@ export class AppStore {
       'workbook',
       'sheetData',
       'visibleRows',
+      'columnView',
       'selection',
       'chartConfig',
       'history',
@@ -1138,8 +1265,10 @@ export class AppStore {
     this.searchQuery = '';
     this.sort = {colIndex: null, direction: null};
     this.clearColumnStatsCache();
+    this.columnViewsBySheetId.clear();
 
     const sheet = this.activeSheet;
+    this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
     this.selectedCell =
       sheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
     this.highlightedRowIndex = null;
@@ -1154,6 +1283,7 @@ export class AppStore {
       'workbook',
       'sheetData',
       'visibleRows',
+      'columnView',
       'selection',
       'chartConfig',
       'history',
@@ -1240,6 +1370,14 @@ export class AppStore {
     this.clearColumnStatsCache();
     this.selectedCell = null;
     this.highlightedRowIndex = null;
+    const active = this.activeSheet;
+    const prevView = this.columnViewsBySheetId.get(active.id);
+    if (prevView && prevView.order.length !== active.columns.length) {
+      this.columnViewsBySheetId.set(
+        active.id,
+        normalizeColumnViewState(prevView, active.columns.length)
+      );
+    }
     this.clampChartColumns();
     this.rebuildProfileFull(false);
 
@@ -1253,6 +1391,7 @@ export class AppStore {
         'workbook',
         'sheetData',
         'visibleRows',
+        'columnView',
         'selection',
         'chartConfig',
         'history',
@@ -1272,6 +1411,7 @@ export class AppStore {
         'workbook',
         'sheetData',
         'visibleRows',
+        'columnView',
         'selection',
         'chartConfig',
         'history',

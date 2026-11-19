@@ -1,5 +1,6 @@
 import type {
   ColumnVirtualRange,
+  PinnedColumnVirtualRange,
   VisibleRowsSource,
   VirtualRange,
 } from '../types';
@@ -127,6 +128,142 @@ export function computeColumnVirtualWindow(
     rightWidth,
     virtualized: true,
   };
+}
+
+export interface PinnedColumnWindowInput {
+  unpinnedCols: number[];
+  scrollLeft: number;
+  viewportWidth: number;
+  colWidths: number[];
+  fixedLeftWidth: number;
+  overscan: number;
+  virtualizeThreshold?: number;
+}
+
+export function computePinnedColumnVirtualWindow(
+  input: PinnedColumnWindowInput
+): PinnedColumnVirtualRange {
+  const {
+    unpinnedCols,
+    scrollLeft,
+    viewportWidth,
+    colWidths,
+    fixedLeftWidth,
+    overscan,
+    virtualizeThreshold = 14,
+  } = input;
+
+  const totalCols = unpinnedCols.length;
+  if (totalCols <= 0) {
+    return {
+      start: 0,
+      end: 0,
+      total: 0,
+      leftWidth: 0,
+      rightWidth: 0,
+      virtualized: false,
+      visibleUnpinnedCols: [],
+    };
+  }
+
+  if (totalCols <= virtualizeThreshold) {
+    return {
+      start: 0,
+      end: totalCols,
+      total: totalCols,
+      leftWidth: 0,
+      rightWidth: 0,
+      virtualized: false,
+      visibleUnpinnedCols: unpinnedCols.slice(),
+    };
+  }
+
+  const prefix = new Float64Array(totalCols + 1);
+  for (let i = 0; i < totalCols; i++) {
+    const sourceCol = unpinnedCols[i];
+    prefix[i + 1] = prefix[i] + (colWidths[sourceCol] ?? 156);
+  }
+
+  const totalWidth = prefix[totalCols];
+  const visibleLeft = Math.max(0, scrollLeft);
+  const visibleRight = visibleLeft + Math.max(200, viewportWidth - fixedLeftWidth);
+
+  let start = 0;
+  let lo = 0;
+  let hi = totalCols - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (prefix[mid + 1] <= visibleLeft) {
+      lo = mid + 1;
+    } else {
+      start = mid;
+      hi = mid - 1;
+    }
+  }
+
+  let end = totalCols;
+  lo = start;
+  hi = totalCols - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (prefix[mid] < visibleRight) {
+      lo = mid + 1;
+    } else {
+      end = mid;
+      hi = mid - 1;
+    }
+  }
+
+  start = Math.max(0, start - overscan);
+  end = Math.min(totalCols, Math.max(start + 1, end + overscan));
+
+  const leftWidth = prefix[start];
+  const rightWidth = Math.max(0, totalWidth - prefix[end]);
+
+  return {
+    start,
+    end,
+    total: totalCols,
+    leftWidth,
+    rightWidth,
+    virtualized: true,
+    visibleUnpinnedCols: unpinnedCols.slice(start, end),
+  };
+}
+
+export function computeScrollLeftForColumn(params: {
+  unpinnedColPos: number;
+  unpinnedCols: number[];
+  colWidths: number[];
+  currentScrollLeft: number;
+  viewportWidth: number;
+  fixedLeftWidth: number;
+}): number | null {
+  const {
+    unpinnedColPos,
+    unpinnedCols,
+    colWidths,
+    currentScrollLeft,
+    viewportWidth,
+    fixedLeftWidth,
+  } = params;
+  if (unpinnedColPos < 0 || unpinnedColPos >= unpinnedCols.length) return null;
+
+  let colLeft = 0;
+  for (let i = 0; i < unpinnedColPos; i++) {
+    colLeft += colWidths[unpinnedCols[i]] ?? 156;
+  }
+  const colW = colWidths[unpinnedCols[unpinnedColPos]] ?? 156;
+  const colRight = colLeft + colW;
+  const usableWidth = Math.max(120, viewportWidth - fixedLeftWidth);
+
+  if (colLeft < currentScrollLeft) {
+    return colLeft;
+  }
+  if (colRight > currentScrollLeft + usableWidth) {
+    return Math.max(0, colRight - usableWidth);
+  }
+  return null;
 }
 
 export function computeScrollTopForRow(params: {

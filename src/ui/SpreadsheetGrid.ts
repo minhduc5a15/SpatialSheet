@@ -1,23 +1,34 @@
 import type {
   CellCoord,
   ColumnStats,
-  ColumnVirtualRange,
+  ColumnViewState,
+  DatasetProfile,
+  PinnedColumnVirtualRange,
   SheetData,
   SortState,
+  VisibleColumnPlan,
   VirtualRange,
   VisibleRowsSource,
 } from '../types';
 import type {ActiveColumnStatsState} from '../core/store';
+import {
+  clampColumnWidth,
+  computeDefaultColumnWidths,
+  createColumnViewState,
+  getVisibleColumnsPlan,
+} from '../core/columnView';
 import {
   columnIndexToLetter,
   computeColumnStats,
   formatDisplayNumber,
 } from '../core/tabular';
 import {
-  computeColumnVirtualWindow,
+  computePinnedColumnVirtualWindow,
   computeRowVirtualWindow,
+  computeScrollLeftForColumn,
   computeScrollTopForRow,
 } from '../core/virtualWindow';
+import {ColumnManager} from './ColumnManager';
 import {svgIcon} from './icons';
 import {renderBrandLogoHtml} from './branding';
 
@@ -28,6 +39,7 @@ const DEFAULT_OVERSCAN_ROWS = 8;
 const DEFAULT_OVERSCAN_COLS = 2;
 const COLUMN_VIRTUALIZE_THRESHOLD = 14;
 const MAX_DISPLAY_CELL_CHARS = 200;
+const LONG_TEXT_THRESHOLD = 90;
 
 export interface SpreadsheetCallbacks {
   onCellCommit: (rowIndex: number, colIndex: number, value: string) => void;
@@ -39,6 +51,13 @@ export interface SpreadsheetCallbacks {
   onAddRow: () => void;
   onAddColumn: () => void;
   onClearSearch: () => void;
+  onResizeColumn?: (colIndex: number, width: number) => void;
+  onAutoFitColumn?: (colIndex: number) => void;
+  onTogglePinColumn?: (colIndex: number) => void;
+  onToggleHideColumn?: (colIndex: number) => void;
+  onRestoreAllColumns?: () => void;
+  onResetColumnView?: () => void;
+  onMoveColumnVisual?: (colIndex: number, direction: -1 | 1) => void;
 }
 
 function escapeHtml(str: string): string {
@@ -63,11 +82,18 @@ export class SpreadsheetGrid {
   private editingCell: CellCoord | null = null;
   private editingColumnIndex: number | null = null;
   private highlightedRowIndex: number | null = null;
+  private columnView: ColumnViewState | null = null;
+  private datasetProfile: DatasetProfile | null = null;
 
   private formulaInputEl: HTMLInputElement | null = null;
   private cellRefEl: HTMLElement | null = null;
+  private longTextTriggerBtn: HTMLButtonElement | null = null;
+  private colManagerHostEl: HTMLElement | null = null;
+  private columnManager: ColumnManager | null = null;
   private statsStripEl: HTMLElement | null = null;
   private tableContainerEl: HTMLElement | null = null;
+  private resizeBadgeEl: HTMLElement | null = null;
+  private longTextModalEl: HTMLElement | null = null;
 
   private tableEl: HTMLTableElement | null = null;
   private colGroupEl: HTMLElement | null = null;
@@ -77,10 +103,24 @@ export class SpreadsheetGrid {
   private colWidths: number[] = [];
   private totalColsWidth = 0;
   private lastRowRange: VirtualRange | null = null;
-  private lastColRange: ColumnVirtualRange | null = null;
+  private lastColRange: PinnedColumnVirtualRange | null = null;
+  private lastColPlan: VisibleColumnPlan | null = null;
   private lastStructureKey = '';
+  private lastColumnViewRef: ColumnViewState | null = null;
   private scrollRafId = 0;
   private resizeObserver: ResizeObserver | null = null;
+
+  // Live column drag-resize state
+  private resizeDrag: {
+    pointerId: number;
+    colIdx: number;
+    startX: number;
+    startWidth: number;
+    currentWidth: number;
+    rafId: number;
+    prevUserSelect: string;
+    prevCursor: string;
+  } | null = null;
 
   // Multi-column stats cache + optional store-provided async stats state
   private externalStatsState: ActiveColumnStatsState | null = null;
@@ -94,6 +134,11 @@ export class SpreadsheetGrid {
   private activeColRenameCommitted = false;
   private replaceInitChar: string | undefined = undefined;
 
+  private readonly onWindowPointerMoveResizeBound = (e: PointerEvent) =>
+    this.handleColumnResizeMove(e);
+  private readonly onWindowPointerUpResizeBound = (e: PointerEvent) =>
+    this.handleColumnResizeEnd(e);
+
   constructor(container: HTMLElement, callbacks: SpreadsheetCallbacks) {
     this.container = container;
     this.callbacks = callbacks;
@@ -102,7 +147,7 @@ export class SpreadsheetGrid {
 
   private renderShell(): void {
     this.container.innerHTML = `
-      <div class="flex flex-col h-full bg-white border border-slate-200 rounded-xl overflow-hidden">
+      <div class="flex flex-col h-full bg-white border border-slate-200 rounded-xl overflow-hidden relative">
         <!-- Formula & Cell Inspector Bar -->
         <div class="flex flex-wrap sm:flex-nowrap items-center gap-2 px-3 py-2 border-b border-slate-200 bg-slate-50/70">
           <div class="flex items-center gap-1.5 shrink-0">
@@ -113,38 +158,66 @@ export class SpreadsheetGrid {
             >--</span>
             <span class="font-mono-tabular text-xs font-semibold text-blue-600 select-none px-1" aria-hidden="true">fx</span>
           </div>
-          <input
-            type="text"
-            data-role="formula-input"
-            aria-label="Selected cell value"
-            placeholder="Select a cell to view or edit directly..."
-            class="order-last sm:order-none w-full sm:w-auto sm:flex-1 min-w-[140px] bg-white border border-slate-200 rounded-md px-2.5 py-1 text-sm text-slate-900 font-mono-tabular focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
-            disabled
-          />
+          <div class="order-last sm:order-none w-full sm:w-auto sm:flex-1 min-w-[140px] flex items-center gap-1.5">
+            <input
+              type="text"
+              data-role="formula-input"
+              aria-label="Selected cell value"
+              placeholder="Select a cell to view or edit directly..."
+              class="flex-1 min-w-0 bg-white border border-slate-200 rounded-md px-2.5 py-1 text-sm text-slate-900 font-mono-tabular focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
+              disabled
+            />
+            <button
+              type="button"
+              data-action="open-long-text"
+              class="hidden items-center gap-1 px-2 py-1 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-md hover:bg-blue-100 whitespace-nowrap shrink-0 cursor-pointer"
+              aria-label="Inspect and edit full cell text"
+              title="Open full text viewer & editor"
+            >
+              ${svgIcon('maximize', 'w-3 h-3')}
+              <span>Full text</span>
+            </button>
+          </div>
           <div class="flex items-center gap-1.5 shrink-0 ml-auto sm:ml-0">
+            <div data-role="col-manager-host"></div>
             <button
               type="button"
               data-action="add-row"
-              class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               aria-label="Add new row"
             >
               ${svgIcon('plus', 'w-3.5 h-3.5 text-blue-600')}
-              <span>Add Row</span>
+              <span>Row</span>
             </button>
             <button
               type="button"
               data-action="add-col"
-              class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               aria-label="Add new column"
             >
               ${svgIcon('plus', 'w-3.5 h-3.5 text-emerald-600')}
-              <span>Add Column</span>
+              <span>Column</span>
             </button>
           </div>
         </div>
 
         <!-- Scrollable Virtualized Spreadsheet Table -->
         <div data-role="table-container" class="flex-1 overflow-auto sheet-scroll relative bg-white"></div>
+
+        <!-- Floating Column Resize Indicator -->
+        <div
+          data-role="col-resize-badge"
+          class="hidden pointer-events-none fixed z-50 px-2 py-0.5 rounded bg-slate-900 text-white text-[11px] font-mono-tabular shadow-md whitespace-nowrap"
+        ></div>
+
+        <!-- Long-Text Cell Viewer & Editor Modal -->
+        <div
+          data-role="long-text-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Full cell text viewer and editor"
+          class="hidden fixed inset-0 z-50 bg-slate-900/45 items-center justify-center p-4"
+        ></div>
 
         <!-- Column Quick Stats Footer -->
         <div
@@ -158,17 +231,46 @@ export class SpreadsheetGrid {
       '[data-role="formula-input"]'
     );
     this.cellRefEl = this.container.querySelector('[data-role="cell-ref"]');
+    this.longTextTriggerBtn = this.container.querySelector(
+      '[data-action="open-long-text"]'
+    );
+    this.colManagerHostEl = this.container.querySelector(
+      '[data-role="col-manager-host"]'
+    );
     this.tableContainerEl = this.container.querySelector(
       '[data-role="table-container"]'
+    );
+    this.resizeBadgeEl = this.container.querySelector(
+      '[data-role="col-resize-badge"]'
+    );
+    this.longTextModalEl = this.container.querySelector(
+      '[data-role="long-text-modal"]'
     );
     this.statsStripEl = this.container.querySelector(
       '[data-role="stats-strip"]'
     );
 
+    if (this.colManagerHostEl) {
+      this.columnManager = new ColumnManager(this.colManagerHostEl, {
+        onToggleVisibility: (colIdx) => this.callbacks.onToggleHideColumn?.(colIdx),
+        onTogglePin: (colIdx) => this.callbacks.onTogglePinColumn?.(colIdx),
+        onMoveVisual: (colIdx, dir) =>
+          this.callbacks.onMoveColumnVisual?.(colIdx, dir),
+        onAutoFit: (colIdx) => this.callbacks.onAutoFitColumn?.(colIdx),
+        onDeleteColumn: (colIdx) => this.callbacks.onDeleteColumn(colIdx),
+        onShowAll: () => this.callbacks.onRestoreAllColumns?.(),
+        onResetLayout: () => this.callbacks.onResetColumnView?.(),
+        onFocusColumn: (colIdx) => this.focusColumnFromManager(colIdx),
+      });
+    }
+
     const addRowBtn = this.container.querySelector('[data-action="add-row"]');
     const addColBtn = this.container.querySelector('[data-action="add-col"]');
     addRowBtn?.addEventListener('click', () => this.callbacks.onAddRow());
     addColBtn?.addEventListener('click', () => this.callbacks.onAddColumn());
+    this.longTextTriggerBtn?.addEventListener('click', () =>
+      this.openLongTextModal()
+    );
 
     if (this.formulaInputEl) {
       this.formulaInputEl.addEventListener('keydown', (e) => {
@@ -212,9 +314,18 @@ export class SpreadsheetGrid {
       {passive: true}
     );
 
+    root.addEventListener('pointerdown', (e) => {
+      const target = e.target as HTMLElement | null;
+      const resizeHandle = target?.closest<HTMLElement>('[data-col-resize]');
+      if (resizeHandle) {
+        this.startColumnResize(e, Number(resizeHandle.dataset.colResize));
+      }
+    });
+
     root.addEventListener('click', (e) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
+      if (target.closest('[data-col-resize]')) return;
 
       const emptyAction = target.closest<HTMLElement>('[data-empty-action]');
       if (emptyAction) {
@@ -223,6 +334,18 @@ export class SpreadsheetGrid {
         } else if (emptyAction.dataset.emptyAction === 'clear-search') {
           this.callbacks.onClearSearch();
         }
+        return;
+      }
+
+      const pinBtn = target.closest<HTMLElement>('[data-pin-col]');
+      if (pinBtn) {
+        this.callbacks.onTogglePinColumn?.(Number(pinBtn.dataset.pinCol));
+        return;
+      }
+
+      const hideBtn = target.closest<HTMLElement>('[data-hide-col]');
+      if (hideBtn) {
+        this.callbacks.onToggleHideColumn?.(Number(hideBtn.dataset.hideCol));
         return;
       }
 
@@ -258,6 +381,14 @@ export class SpreadsheetGrid {
     root.addEventListener('dblclick', (e) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
+
+      const resizeHandle = target.closest<HTMLElement>('[data-col-resize]');
+      if (resizeHandle) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.callbacks.onAutoFitColumn?.(Number(resizeHandle.dataset.colResize));
+        return;
+      }
 
       const colTitleBtn = target.closest<HTMLElement>('[data-col-title]');
       if (colTitleBtn) {
@@ -406,6 +537,8 @@ export class SpreadsheetGrid {
     selectedCell: CellCoord | null;
     highlightedRowIndex: number | null;
     columnStats?: ActiveColumnStatsState;
+    columnView?: ColumnViewState;
+    profile?: DatasetProfile;
   }): void {
     const sheetChanged = this.sheet !== params.sheet;
     const visibleChanged = this.visibleRowIndices !== params.visibleRowIndices;
@@ -426,6 +559,15 @@ export class SpreadsheetGrid {
     if (params.columnStats !== undefined) {
       this.externalStatsState = params.columnStats;
     }
+    if (params.profile !== undefined) {
+      this.datasetProfile = params.profile;
+    }
+
+    const nextView =
+      params.columnView ?? this.columnView ?? createColumnViewState(params.sheet);
+    const columnViewChanged = nextView !== this.lastColumnViewRef;
+    this.columnView = nextView;
+    this.lastColumnViewRef = nextView;
 
     if (sheetChanged || sortChanged) {
       this.editingCell = null;
@@ -446,7 +588,7 @@ export class SpreadsheetGrid {
 
     const structKey = `${params.sheet.id}:${params.sheet.columns.length}:${params.sheet.columns.join('\x00')}`;
     const structChanged = structKey !== this.lastStructureKey;
-    if (structChanged) {
+    if (structChanged || columnViewChanged) {
       this.lastStructureKey = structKey;
       this.computeColumnWidths();
       if (this.tableContainerEl && sheetChanged) {
@@ -455,8 +597,19 @@ export class SpreadsheetGrid {
       }
     }
 
+    this.columnManager?.update({
+      sheet: params.sheet,
+      view: nextView,
+      profile: this.datasetProfile,
+    });
+
     const needsWindowRebuild =
-      sheetChanged || visibleChanged || sortChanged || structChanged || !this.tableEl;
+      sheetChanged ||
+      visibleChanged ||
+      sortChanged ||
+      structChanged ||
+      columnViewChanged ||
+      !this.tableEl;
 
     if (needsWindowRebuild) {
       this.renderTableStructureAndWindow(true);
@@ -468,6 +621,22 @@ export class SpreadsheetGrid {
     }
 
     this.syncFormulaBar();
+    this.renderStatsStrip();
+  }
+
+  public setColumnView(columnView: ColumnViewState, profile?: DatasetProfile): void {
+    if (!this.sheet) return;
+    if (profile) this.datasetProfile = profile;
+    if (columnView === this.lastColumnViewRef) return;
+    this.columnView = columnView;
+    this.lastColumnViewRef = columnView;
+    this.computeColumnWidths();
+    this.columnManager?.update({
+      sheet: this.sheet,
+      view: columnView,
+      profile: this.datasetProfile,
+    });
+    this.renderTableStructureAndWindow(true);
     this.renderStatsStrip();
   }
 
@@ -570,9 +739,29 @@ export class SpreadsheetGrid {
           const isSelected =
             this.selectedCell?.rowIndex === rowIndex &&
             this.selectedCell?.colIndex === colIndex;
-          td.className = `border-b border-r border-slate-200 p-0 ${
-            isSelected ? 'ring-2 ring-inset ring-blue-500 bg-blue-50/40' : ''
-          }`;
+          const isPinned = td.hasAttribute('data-sticky-col');
+          const isLastPinned = isPinned && td.classList.contains('border-r-2');
+          const stickyCls = isPinned
+            ? `sticky z-[6] ${
+                isLastPinned
+                  ? 'border-r-2 border-r-slate-300 shadow-[2px_0_4px_-2px_rgba(15,23,42,0.08)]'
+                  : ''
+              }`
+            : '';
+          const tr = td.closest('tr');
+          const dispIdx = Number(tr?.getAttribute('data-disp-idx') ?? 0);
+          const isRowHighlighted = tr?.hasAttribute('data-highlighted') ?? false;
+          const pinnedBg = isPinned
+            ? isSelected || isRowHighlighted
+              ? 'bg-blue-50'
+              : dispIdx % 2 === 1
+                ? 'bg-slate-50'
+                : 'bg-white'
+            : '';
+          const selectedRing = isSelected
+            ? `ring-2 ring-inset ring-blue-500 ${isPinned ? '' : 'bg-blue-50/40'}`
+            : '';
+          td.className = `${stickyCls} ${pinnedBg} border-b border-r border-slate-200 p-0 ${selectedRing}`.trim();
           if (isSelected) td.setAttribute('data-selected', '1');
           else td.removeAttribute('data-selected');
           td.innerHTML = `<button type="button" data-cell="${rowIndex}:${colIndex}" aria-label="Cell ${columnIndexToLetter(colIndex)}${rowIndex + 1}" class="w-full h-full px-2 text-sm text-slate-800 hover:bg-slate-100/70 focus:outline-none truncate block cursor-cell ${alignClass}">${escapeHtml(truncateDisplayText(val))}</button>`;
@@ -624,26 +813,27 @@ export class SpreadsheetGrid {
       this.totalColsWidth = 0;
       return;
     }
-    const cols = this.sheet.columns;
-    const rows = this.sheet.rows;
-    const sampleLimit = Math.min(rows.length, 24);
-    const widths = new Array<number>(cols.length);
-    let sum = 0;
-
-    for (let c = 0; c < cols.length; c++) {
-      let maxLen = cols[c].length;
-      for (let r = 0; r < sampleLimit; r++) {
-        const len = Math.min(28, (rows[r]?.[c] ?? '').length);
-        if (len > maxLen) maxLen = len;
-      }
-      const headerWidth = cols[c].length * 7.2 + 106;
-      const w = Math.max(164, headerWidth, Math.min(250, maxLen * 7.5 + 68));
-      widths[c] = Math.round(w);
-      sum += widths[c];
+    const widths = computeDefaultColumnWidths(
+      this.sheet,
+      this.columnView?.widths
+    );
+    const hiddenSet = new Set(this.columnView?.hidden ?? []);
+    let visibleSum = 0;
+    for (let c = 0; c < widths.length; c++) {
+      if (!hiddenSet.has(c)) visibleSum += widths[c];
     }
 
     this.colWidths = widths;
-    this.totalColsWidth = sum;
+    this.totalColsWidth = visibleSum;
+  }
+
+  private recomputeTotalVisibleWidth(): void {
+    const hiddenSet = new Set(this.columnView?.hidden ?? []);
+    let visibleSum = 0;
+    for (let c = 0; c < this.colWidths.length; c++) {
+      if (!hiddenSet.has(c)) visibleSum += this.colWidths[c] ?? 156;
+    }
+    this.totalColsWidth = visibleSum;
   }
 
   private scheduleVirtualSync(force: boolean): void {
@@ -663,6 +853,19 @@ export class SpreadsheetGrid {
       .forEach((td) => {
         td.removeAttribute('data-selected');
         td.classList.remove('ring-2', 'ring-inset', 'ring-blue-500', 'bg-blue-50/40');
+        if (td.hasAttribute('data-sticky-col')) {
+          const tr = td.closest('tr');
+          const dispIdx = Number(tr?.getAttribute('data-disp-idx') ?? 0);
+          const isRowHighlighted = tr?.hasAttribute('data-highlighted') ?? false;
+          td.classList.remove('bg-blue-50', 'bg-slate-50', 'bg-white');
+          td.classList.add(
+            isRowHighlighted
+              ? 'bg-blue-50'
+              : dispIdx % 2 === 1
+                ? 'bg-slate-50'
+                : 'bg-white'
+          );
+        }
       });
 
     // Clear previous row highlights
@@ -673,6 +876,11 @@ export class SpreadsheetGrid {
         tr.classList.remove('bg-blue-50/80');
         const disp = Number(tr.dataset.dispIdx ?? 0);
         tr.classList.add(disp % 2 === 1 ? 'bg-slate-50/40' : 'bg-white');
+        tr.querySelectorAll<HTMLElement>('td[data-sticky-col]').forEach((td) => {
+          if (td.hasAttribute('data-selected')) return;
+          td.classList.remove('bg-blue-50', 'bg-slate-50', 'bg-white');
+          td.classList.add(disp % 2 === 1 ? 'bg-slate-50' : 'bg-white');
+        });
       });
 
     if (this.highlightedRowIndex !== null) {
@@ -683,6 +891,10 @@ export class SpreadsheetGrid {
         tr.setAttribute('data-highlighted', '1');
         tr.classList.remove('bg-white', 'bg-slate-50/40');
         tr.classList.add('bg-blue-50/80');
+        tr.querySelectorAll<HTMLElement>('td[data-sticky-col]').forEach((td) => {
+          td.classList.remove('bg-white', 'bg-slate-50');
+          td.classList.add('bg-blue-50');
+        });
       }
     }
 
@@ -693,7 +905,13 @@ export class SpreadsheetGrid {
       const td = btn?.closest('td');
       if (td) {
         td.setAttribute('data-selected', '1');
-        td.classList.add('ring-2', 'ring-inset', 'ring-blue-500', 'bg-blue-50/40');
+        td.classList.add('ring-2', 'ring-inset', 'ring-blue-500');
+        if (td.hasAttribute('data-sticky-col')) {
+          td.classList.remove('bg-white', 'bg-slate-50');
+          td.classList.add('bg-blue-50');
+        } else {
+          td.classList.add('bg-blue-50/40');
+        }
       }
     }
   }
@@ -705,6 +923,7 @@ export class SpreadsheetGrid {
       this.cellRefEl.textContent = '--';
       this.formulaInputEl.value = '';
       this.formulaInputEl.disabled = true;
+      this.toggleLongTextButton(false);
       return;
     }
 
@@ -718,12 +937,120 @@ export class SpreadsheetGrid {
       this.cellRefEl.textContent = '--';
       this.formulaInputEl.value = '';
       this.formulaInputEl.disabled = true;
+      this.toggleLongTextButton(false);
       return;
     }
 
+    const val = this.sheet.rows[rowIndex][colIndex] ?? '';
     this.cellRefEl.textContent = `${columnIndexToLetter(colIndex)}${rowIndex + 1}`;
     this.formulaInputEl.disabled = false;
-    this.formulaInputEl.value = this.sheet.rows[rowIndex][colIndex] ?? '';
+    this.formulaInputEl.value = val;
+    this.toggleLongTextButton(val.length > LONG_TEXT_THRESHOLD || val.includes('\n'));
+  }
+
+  private toggleLongTextButton(visible: boolean): void {
+    if (!this.longTextTriggerBtn) return;
+    this.longTextTriggerBtn.classList.toggle('hidden', !visible);
+    this.longTextTriggerBtn.classList.toggle('inline-flex', visible);
+  }
+
+  private openLongTextModal(): void {
+    if (!this.longTextModalEl || !this.sheet || !this.selectedCell) return;
+    const {rowIndex, colIndex} = this.selectedCell;
+    const val = this.sheet.rows[rowIndex]?.[colIndex] ?? '';
+    const colName = this.sheet.columns[colIndex] ?? '';
+    const ref = `${columnIndexToLetter(colIndex)}${rowIndex + 1}`;
+
+    this.longTextModalEl.innerHTML = `
+      <div class="bg-white border border-slate-200 rounded-2xl shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden">
+        <div class="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <div class="text-sm font-semibold text-slate-900 truncate">Cell ${escapeHtml(ref)} · ${escapeHtml(colName)}</div>
+            <div class="text-xs text-slate-500 font-mono-tabular">${val.length.toLocaleString('en-US')} chars</div>
+          </div>
+          <button
+            type="button"
+            data-lt-close
+            aria-label="Close full text viewer"
+            class="p-1.5 rounded-lg text-slate-500 hover:bg-slate-200/70 hover:text-slate-900 cursor-pointer"
+          >${svgIcon('close', 'w-4 h-4')}</button>
+        </div>
+        <div class="p-4">
+          <textarea
+            data-role="long-text-area"
+            rows="10"
+            aria-label="Full cell text editor"
+            class="w-full p-3 text-sm font-mono-tabular text-slate-900 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500 resize-y"
+          >${escapeHtml(val)}</textarea>
+        </div>
+        <div class="px-4 py-3 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-2">
+          <button
+            type="button"
+            data-lt-copy
+            class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 cursor-pointer"
+          >${svgIcon('copy', 'w-3.5 h-3.5')}<span>Copy text</span></button>
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              data-lt-close
+              class="px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 rounded-lg cursor-pointer"
+            >Cancel</button>
+            <button
+              type="button"
+              data-lt-save
+              class="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg cursor-pointer"
+            >${svgIcon('check', 'w-3.5 h-3.5')}<span>Save cell</span></button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    this.longTextModalEl.classList.remove('hidden');
+    this.longTextModalEl.classList.add('flex');
+    const area = this.longTextModalEl.querySelector<HTMLTextAreaElement>(
+      '[data-role="long-text-area"]'
+    );
+    area?.focus();
+
+    const closeModal = () => {
+      if (!this.longTextModalEl) return;
+      this.longTextModalEl.classList.add('hidden');
+      this.longTextModalEl.classList.remove('flex');
+      this.longTextModalEl.innerHTML = '';
+      window.removeEventListener('keydown', onModalKey);
+    };
+
+    const onModalKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeModal();
+      } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' && area) {
+        ev.preventDefault();
+        this.callbacks.onCellCommit(rowIndex, colIndex, area.value);
+        closeModal();
+      }
+    };
+    window.addEventListener('keydown', onModalKey);
+
+    this.longTextModalEl.onclick = (ev) => {
+      const t = ev.target as HTMLElement | null;
+      if (!t) return;
+      if (t === this.longTextModalEl || t.closest('[data-lt-close]')) {
+        closeModal();
+        return;
+      }
+      if (t.closest('[data-lt-copy]') && area) {
+        void navigator.clipboard?.writeText(area.value).catch(() => {});
+        const copyBtn = t.closest<HTMLElement>('[data-lt-copy]');
+        const span = copyBtn?.querySelector('span');
+        if (span) span.textContent = 'Copied';
+        return;
+      }
+      if (t.closest('[data-lt-save]') && area) {
+        this.callbacks.onCellCommit(rowIndex, colIndex, area.value);
+        closeModal();
+      }
+    };
   }
 
   private renderStatsStrip(): void {
@@ -765,16 +1092,31 @@ export class SpreadsheetGrid {
       }
     }
 
-    const sig = `${totalRows}:${visibleCount}:${this.sheet.columns.length}:${activeCol}:${isLoading ? 'loading' : stats ? `${stats.numericCount}:${stats.sum}:${stats.nonEmptyCount}:${stats.uniqueCount}` : 'none'}`;
+    const plan = this.getActiveColumnPlan();
+    const hiddenCount = Math.max(
+      0,
+      this.sheet.columns.length - plan.visibleCols.length
+    );
+    const sig = `${totalRows}:${visibleCount}:${this.sheet.columns.length}:${hiddenCount}:${plan.pinnedCols.length}:${plan.downgradedPinCount}:${activeCol}:${isLoading ? 'loading' : stats ? `${stats.numericCount}:${stats.sum}:${stats.nonEmptyCount}:${stats.uniqueCount}` : 'none'}`;
     if (sig === this.lastStatsSignature) {
       return;
     }
     this.lastStatsSignature = sig;
 
+    const visColNote =
+      hiddenCount > 0
+        ? `${plan.visibleCols.length}/${this.sheet.columns.length} cols`
+        : `${this.sheet.columns.length} cols`;
+    const pinNote =
+      plan.downgradedPinCount > 0
+        ? ` · ${plan.pinnedCols.length} pinned (${plan.downgradedPinCount} unpinned on narrow view)`
+        : plan.pinnedCols.length > 0
+          ? ` · ${plan.pinnedCols.length} pinned`
+          : '';
     const leftText =
       visibleCount === totalRows
-        ? `${totalRows.toLocaleString('en-US')} rows · ${this.sheet.columns.length} cols`
-        : `Showing ${visibleCount.toLocaleString('en-US')} of ${totalRows.toLocaleString('en-US')} rows · ${this.sheet.columns.length} cols`;
+        ? `${totalRows.toLocaleString('en-US')} rows · ${visColNote}${pinNote}`
+        : `Showing ${visibleCount.toLocaleString('en-US')} of ${totalRows.toLocaleString('en-US')} rows · ${visColNote}${pinNote}`;
 
     let rightHtml = '';
     if (isLoading) {
@@ -886,7 +1228,7 @@ export class SpreadsheetGrid {
     }
 
     this.tableContainerEl.innerHTML = `
-      <table class="border-collapse text-sm" style="table-layout:fixed;min-width:100%" role="grid" aria-label="Editable spreadsheet grid">
+      <table class="border-separate border-spacing-0 text-sm" style="table-layout:fixed;min-width:100%" role="grid" aria-label="Editable spreadsheet grid">
         <colgroup></colgroup>
         <thead></thead>
         <tbody></tbody>
@@ -900,13 +1242,28 @@ export class SpreadsheetGrid {
     this.lastColRange = null;
   }
 
+  private getActiveColumnPlan(): VisibleColumnPlan {
+    const view =
+      this.columnView ??
+      (this.sheet
+        ? createColumnViewState(this.sheet)
+        : {order: [], hidden: [], pinned: [], widths: {}});
+    const viewportWidth = this.tableContainerEl?.clientWidth || 720;
+    return getVisibleColumnsPlan({
+      view,
+      colWidths: this.colWidths,
+      viewportWidth,
+      rowNumWidth: ROW_NUM_COL_WIDTH,
+    });
+  }
+
   private computeCurrentRanges(): {
     rowRange: VirtualRange;
-    colRange: ColumnVirtualRange;
+    colPlan: VisibleColumnPlan;
+    colRange: PinnedColumnVirtualRange;
   } {
     const root = this.tableContainerEl;
     const totalRows = this.visibleRowIndices.length;
-    const totalCols = this.sheet?.columns.length ?? 0;
     const scrollTop = root?.scrollTop ?? 0;
     const scrollLeft = root?.scrollLeft ?? 0;
     const viewportHeight = root?.clientHeight || 480;
@@ -920,23 +1277,24 @@ export class SpreadsheetGrid {
       overscan: DEFAULT_OVERSCAN_ROWS,
     });
 
-    const colRange = computeColumnVirtualWindow({
-      totalCols,
+    const colPlan = this.getActiveColumnPlan();
+    const colRange = computePinnedColumnVirtualWindow({
+      unpinnedCols: colPlan.unpinnedCols,
       scrollLeft,
       viewportWidth,
       colWidths: this.colWidths,
-      fixedLeftWidth: ROW_NUM_COL_WIDTH,
+      fixedLeftWidth: ROW_NUM_COL_WIDTH + colPlan.pinnedTotalWidth,
       overscan: DEFAULT_OVERSCAN_COLS,
       virtualizeThreshold: COLUMN_VIRTUALIZE_THRESHOLD,
     });
 
-    return {rowRange, colRange};
+    return {rowRange, colPlan, colRange};
   }
 
   private renderVirtualWindow(force: boolean): void {
     if (!this.sheet || !this.tableEl || !this.tbodyEl) return;
 
-    const {rowRange, colRange} = this.computeCurrentRanges();
+    const {rowRange, colPlan, colRange} = this.computeCurrentRanges();
 
     const rowRangeSame =
       !force &&
@@ -945,8 +1303,15 @@ export class SpreadsheetGrid {
       this.lastRowRange.end === rowRange.end &&
       this.lastRowRange.total === rowRange.total;
 
-    const colRangeSame =
+    const colPlanSame =
       !force &&
+      this.lastColPlan !== null &&
+      this.lastColPlan.pinnedCols.length === colPlan.pinnedCols.length &&
+      this.lastColPlan.visibleCols.length === colPlan.visibleCols.length &&
+      this.lastColPlan.pinnedTotalWidth === colPlan.pinnedTotalWidth;
+
+    const colRangeSame =
+      colPlanSame &&
       this.lastColRange !== null &&
       this.lastColRange.start === colRange.start &&
       this.lastColRange.end === colRange.end &&
@@ -957,27 +1322,38 @@ export class SpreadsheetGrid {
     }
 
     if (!colRangeSame || force) {
+      this.lastColPlan = colPlan;
       this.lastColRange = colRange;
-      this.renderColGroup(colRange);
-      this.renderHeader(false, colRange);
+      this.renderColGroup(colPlan, colRange);
+      this.renderHeader(false, colPlan, colRange);
     }
 
     this.lastRowRange = rowRange;
-    this.renderBodySlice(rowRange, colRange);
+    this.renderBodySlice(rowRange, colPlan, colRange);
   }
 
-  private renderColGroup(colRange: ColumnVirtualRange): void {
+  private renderColGroup(
+    colPlan: VisibleColumnPlan,
+    colRange: PinnedColumnVirtualRange
+  ): void {
     if (!this.colGroupEl || !this.tableEl) return;
 
     const totalW = ROW_NUM_COL_WIDTH + this.totalColsWidth;
     this.tableEl.style.width = `${totalW}px`;
 
     const parts: string[] = [`<col style="width:${ROW_NUM_COL_WIDTH}px" />`];
+    for (const colIdx of colPlan.pinnedCols) {
+      parts.push(
+        `<col data-col-idx="${colIdx}" style="width:${this.colWidths[colIdx] ?? 156}px" />`
+      );
+    }
     if (colRange.leftWidth > 0) {
       parts.push(`<col style="width:${colRange.leftWidth}px" />`);
     }
-    for (let c = colRange.start; c < colRange.end; c++) {
-      parts.push(`<col style="width:${this.colWidths[c] ?? 150}px" />`);
+    for (const colIdx of colRange.visibleUnpinnedCols) {
+      parts.push(
+        `<col data-col-idx="${colIdx}" style="width:${this.colWidths[colIdx] ?? 156}px" />`
+      );
     }
     if (colRange.rightWidth > 0) {
       parts.push(`<col style="width:${colRange.rightWidth}px" />`);
@@ -985,95 +1361,169 @@ export class SpreadsheetGrid {
     this.colGroupEl.innerHTML = parts.join('');
   }
 
-  private renderHeader(forceFocus: boolean, colRange?: ColumnVirtualRange): void {
+  private renderHeaderCellHtml(
+    colIdx: number,
+    colPlan: VisibleColumnPlan,
+    isPinned: boolean,
+    isLastPinned: boolean
+  ): string {
+    const sheet = this.sheet!;
+    const colName = sheet.columns[colIdx];
+    const letter = columnIndexToLetter(colIdx);
+    const type = sheet.types[colIdx] ?? 'text';
+    const typeLabel =
+      type === 'number' ? 'Num' : type === 'percent' ? '%' : 'Text';
+    const isSorted = this.sort.colIndex === colIdx;
+    const sortIconName =
+      isSorted && this.sort.direction === 'asc'
+        ? 'sortAsc'
+        : isSorted && this.sort.direction === 'desc'
+          ? 'sortDesc'
+          : 'sortNone';
+    const sortIconColor = isSorted ? 'text-blue-600' : 'text-slate-400';
+
+    const isRenaming = this.editingColumnIndex === colIdx;
+    const headerTitleHtml = isRenaming
+      ? `<input
+          type="text"
+          data-col-rename="${colIdx}"
+          value="${escapeHtml(colName)}"
+          aria-label="Rename column ${escapeHtml(colName)}"
+          class="w-full min-w-[60px] bg-white border border-blue-500 rounded px-1.5 py-0.5 text-xs font-semibold text-slate-900 focus:outline-none"
+        />`
+      : `<button
+          type="button"
+          data-col-title="${colIdx}"
+          title="${escapeHtml(colName)} · Double-click to rename"
+          class="text-left text-xs font-semibold text-slate-800 truncate hover:text-blue-700 cursor-text"
+        >${escapeHtml(colName)}</button>`;
+
+    const stickyCls = isPinned
+      ? `z-20 bg-slate-100 ${
+          isLastPinned
+            ? 'border-r-2 border-r-slate-300 shadow-[2px_0_4px_-2px_rgba(15,23,42,0.12)]'
+            : 'border-r border-slate-200'
+        }`
+      : 'z-10 bg-slate-100 border-r border-slate-200';
+    const stickyStyle = isPinned
+      ? `left:${colPlan.pinnedLeftOffsets[colIdx]}px;`
+      : '';
+    const canHide = colPlan.visibleCols.length > 1;
+
+    return `
+      <th
+        scope="col"
+        ${isPinned ? `data-sticky-col="${colIdx}"` : ''}
+        class="group/th sticky top-0 ${stickyCls} border-b border-slate-200 px-1.5 py-2 text-left align-middle select-none relative"
+        style="${stickyStyle}height:${GRID_HEADER_HEIGHT}px"
+      >
+        <div class="flex items-center justify-between gap-0.5 pr-1">
+          <div class="flex items-center gap-1 min-w-0">
+            <span class="font-mono-tabular text-[10px] font-medium text-slate-400 shrink-0">${letter}</span>
+            ${headerTitleHtml}
+          </div>
+          <div class="flex items-center gap-0.5 shrink-0">
+            <span class="text-[10px] text-slate-400 font-mono-tabular px-0.5" title="Type: ${typeLabel}">${typeLabel}</span>
+            <button
+              type="button"
+              data-pin-col="${colIdx}"
+              aria-pressed="${isPinned}"
+              aria-label="${isPinned ? `Unpin column ${escapeHtml(colName)}` : `Pin column ${escapeHtml(colName)}`}"
+              title="${isPinned ? 'Unpin column' : 'Pin column left'}"
+              class="${
+                isPinned
+                  ? 'inline-flex text-blue-600 bg-blue-100/80'
+                  : 'hidden group-hover/th:inline-flex group-focus-within/th:inline-flex text-slate-400 hover:text-blue-600 hover:bg-slate-200/70'
+              } p-0.5 rounded transition-colors cursor-pointer"
+            >${svgIcon('pin', 'w-3 h-3')}</button>
+            <button
+              type="button"
+              data-sort-col="${colIdx}"
+              aria-label="Sort by column ${escapeHtml(colName)}"
+              class="p-0.5 rounded hover:bg-slate-200/80 ${sortIconColor} transition-colors cursor-pointer"
+            >${svgIcon(sortIconName, 'w-3.5 h-3.5')}</button>
+            ${
+              canHide
+                ? `<button
+                    type="button"
+                    data-hide-col="${colIdx}"
+                    aria-label="Hide column ${escapeHtml(colName)}"
+                    title="Hide column"
+                    class="hidden group-hover/th:inline-flex group-focus-within/th:inline-flex p-0.5 rounded text-slate-400 hover:text-amber-700 hover:bg-amber-50 transition-colors cursor-pointer"
+                  >${svgIcon('eyeOff', 'w-3 h-3')}</button>`
+                : ''
+            }
+            ${
+              sheet.columns.length > 1
+                ? `<button
+                    type="button"
+                    data-delete-col="${colIdx}"
+                    aria-label="Delete column ${escapeHtml(colName)}"
+                    title="Delete column"
+                    class="hidden group-hover/th:inline-flex group-focus-within/th:inline-flex p-0.5 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                  >${svgIcon('close', 'w-3 h-3')}</button>`
+                : ''
+            }
+          </div>
+        </div>
+        <div
+          data-col-resize="${colIdx}"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize column ${escapeHtml(colName)}"
+          title="Drag to resize · Double-click to auto-fit"
+          style="touch-action:none"
+          class="absolute top-0 right-0 bottom-0 w-2 cursor-col-resize hover:bg-blue-500/40 transition-colors z-30"
+        ></div>
+      </th>
+    `;
+  }
+
+  private renderHeader(
+    forceFocus: boolean,
+    colPlan?: VisibleColumnPlan,
+    colRange?: PinnedColumnVirtualRange
+  ): void {
     if (!this.theadEl || !this.sheet) return;
-    const sheet = this.sheet;
-    const range = colRange ?? this.lastColRange ?? this.computeCurrentRanges().colRange;
+    const activePlan =
+      colPlan ?? this.lastColPlan ?? this.getActiveColumnPlan();
+    const range =
+      colRange ?? this.lastColRange ?? this.computeCurrentRanges().colRange;
 
     const headerCells: string[] = [];
+
+    activePlan.pinnedCols.forEach((colIdx, pIdx) => {
+      headerCells.push(
+        this.renderHeaderCellHtml(
+          colIdx,
+          activePlan,
+          true,
+          pIdx === activePlan.pinnedCols.length - 1
+        )
+      );
+    });
+
     if (range.leftWidth > 0) {
       headerCells.push(
-        `<th scope="col" aria-hidden="true" class="sticky top-0 z-10 bg-slate-100/95 border-b border-slate-200 p-0"></th>`
+        `<th scope="col" aria-hidden="true" class="sticky top-0 z-10 bg-slate-100 border-b border-slate-200 p-0"></th>`
       );
     }
 
-    for (let colIdx = range.start; colIdx < range.end; colIdx++) {
-      const colName = sheet.columns[colIdx];
-      const letter = columnIndexToLetter(colIdx);
-      const type = sheet.types[colIdx] ?? 'text';
-      const typeLabel =
-        type === 'number' ? 'Num' : type === 'percent' ? '%' : 'Text';
-      const isSorted = this.sort.colIndex === colIdx;
-      const sortIconName =
-        isSorted && this.sort.direction === 'asc'
-          ? 'sortAsc'
-          : isSorted && this.sort.direction === 'desc'
-            ? 'sortDesc'
-            : 'sortNone';
-      const sortIconColor = isSorted ? 'text-blue-600' : 'text-slate-400';
-
-      const isRenaming = this.editingColumnIndex === colIdx;
-      const headerTitleHtml = isRenaming
-        ? `<input
-            type="text"
-            data-col-rename="${colIdx}"
-            value="${escapeHtml(colName)}"
-            aria-label="Rename column ${escapeHtml(colName)}"
-            class="w-full min-w-[70px] bg-white border border-blue-500 rounded px-1.5 py-0.5 text-xs font-semibold text-slate-900 focus:outline-none"
-          />`
-        : `<button
-            type="button"
-            data-col-title="${colIdx}"
-            title="Double-click to rename column"
-            class="text-left text-xs font-semibold text-slate-800 truncate hover:text-blue-700 cursor-text"
-          >${escapeHtml(colName)}</button>`;
-
-      headerCells.push(`
-        <th
-          scope="col"
-          class="group/th sticky top-0 z-10 bg-slate-100/95 border-b border-r border-slate-200 px-1.5 py-2 text-left align-middle select-none"
-          style="height:${GRID_HEADER_HEIGHT}px"
-        >
-          <div class="flex items-center justify-between gap-0.5">
-            <div class="flex items-center gap-1 min-w-0">
-              <span class="font-mono-tabular text-[10px] font-medium text-slate-400 shrink-0">${letter}</span>
-              ${headerTitleHtml}
-            </div>
-            <div class="flex items-center gap-0.5 shrink-0">
-              <span class="text-[10px] text-slate-400 font-mono-tabular px-0.5" title="Data type: ${typeLabel}">${typeLabel}</span>
-              <button
-                type="button"
-                data-sort-col="${colIdx}"
-                aria-label="Sort by column ${escapeHtml(colName)}"
-                class="p-0.5 rounded hover:bg-slate-200/80 ${sortIconColor} transition-colors cursor-pointer"
-              >
-                ${svgIcon(sortIconName, 'w-3.5 h-3.5')}
-              </button>
-              ${
-                sheet.columns.length > 1
-                  ? `<button
-                      type="button"
-                      data-delete-col="${colIdx}"
-                      aria-label="Delete column ${escapeHtml(colName)}"
-                      class="p-0.5 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
-                    >${svgIcon('close', 'w-3 h-3')}</button>`
-                  : ''
-              }
-            </div>
-          </div>
-        </th>
-      `);
+    for (const colIdx of range.visibleUnpinnedCols) {
+      headerCells.push(
+        this.renderHeaderCellHtml(colIdx, activePlan, false, false)
+      );
     }
 
     if (range.rightWidth > 0) {
       headerCells.push(
-        `<th scope="col" aria-hidden="true" class="sticky top-0 z-10 bg-slate-100/95 border-b border-slate-200 p-0"></th>`
+        `<th scope="col" aria-hidden="true" class="sticky top-0 z-10 bg-slate-100 border-b border-slate-200 p-0"></th>`
       );
     }
 
     this.theadEl.innerHTML = `
       <tr>
-        <th scope="col" class="sticky top-0 left-0 z-20 bg-slate-100 border-b border-r border-slate-200 px-1.5 py-2 text-center text-[11px] font-mono-tabular font-medium text-slate-400" style="width:${ROW_NUM_COL_WIDTH}px">
+        <th scope="col" class="sticky top-0 left-0 z-30 bg-slate-100 border-b border-r border-slate-200 px-1.5 py-2 text-center text-[11px] font-mono-tabular font-medium text-slate-400 overflow-hidden" style="left:0;width:${ROW_NUM_COL_WIDTH}px">
           #
         </th>
         ${headerCells.join('')}
@@ -1089,9 +1539,94 @@ export class SpreadsheetGrid {
     }
   }
 
+  private renderCellHtml(params: {
+    rowIdx: number;
+    colIdx: number;
+    dispIdx: number;
+    val: string;
+    isRowHighlighted: boolean;
+    colPlan: VisibleColumnPlan;
+    isPinned: boolean;
+    isLastPinned: boolean;
+  }): string {
+    const {
+      rowIdx,
+      colIdx,
+      dispIdx,
+      val,
+      isRowHighlighted,
+      colPlan,
+      isPinned,
+      isLastPinned,
+    } = params;
+    const sheet = this.sheet!;
+    const colType = sheet.types[colIdx] ?? 'text';
+    const isSelected =
+      this.selectedCell?.rowIndex === rowIdx &&
+      this.selectedCell?.colIndex === colIdx;
+    const isEditing =
+      this.editingCell?.rowIndex === rowIdx &&
+      this.editingCell?.colIndex === colIdx;
+
+    const alignClass =
+      colType === 'number' || colType === 'percent'
+        ? 'text-right font-mono-tabular'
+        : 'text-left';
+
+    const stickyCls = isPinned
+      ? `sticky z-[6] ${
+          isLastPinned
+            ? 'border-r-2 border-r-slate-300 shadow-[2px_0_4px_-2px_rgba(15,23,42,0.08)]'
+            : ''
+        }`
+      : '';
+    const stickyStyle = isPinned
+      ? `left:${colPlan.pinnedLeftOffsets[colIdx]}px;`
+      : '';
+    const opaqueStickyBg = isPinned
+      ? isSelected
+        ? 'bg-blue-50'
+        : isRowHighlighted
+          ? 'bg-blue-50'
+          : dispIdx % 2 === 1
+            ? 'bg-slate-50'
+            : 'bg-white'
+      : '';
+
+    if (isEditing) {
+      return `
+        <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} border-b border-r border-slate-200 p-0 bg-white ring-2 ring-inset ring-blue-600" style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
+          <input
+            type="text"
+            data-cell-input="${rowIdx}:${colIdx}"
+            value="${escapeHtml(val)}"
+            aria-label="Edit cell ${columnIndexToLetter(colIdx)}${rowIdx + 1}"
+            class="w-full h-full px-2 text-sm text-slate-900 bg-white focus:outline-none ${alignClass}"
+          />
+        </td>
+      `;
+    }
+
+    const selectedRing = isSelected
+      ? `ring-2 ring-inset ring-blue-500 ${isPinned ? '' : 'bg-blue-50/40'}`
+      : '';
+    const displayVal = truncateDisplayText(val);
+    return `
+      <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} ${opaqueStickyBg} border-b border-r border-slate-200 p-0 ${selectedRing}" ${isSelected ? 'data-selected="1"' : ''} style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
+        <button
+          type="button"
+          data-cell="${rowIdx}:${colIdx}"
+          aria-label="Cell ${columnIndexToLetter(colIdx)}${rowIdx + 1}"
+          class="w-full h-full px-2 text-sm text-slate-800 hover:bg-slate-100/70 focus:outline-none truncate block cursor-cell ${alignClass}"
+        >${escapeHtml(displayVal)}</button>
+      </td>
+    `;
+  }
+
   private renderBodySlice(
     rowRange: VirtualRange,
-    colRange: ColumnVirtualRange
+    colPlan: VisibleColumnPlan,
+    colRange: PinnedColumnVirtualRange
   ): void {
     if (!this.tbodyEl || !this.sheet) return;
     const sheet = this.sheet;
@@ -1099,8 +1634,9 @@ export class SpreadsheetGrid {
 
     const colSpanTotal =
       1 +
+      colPlan.pinnedCols.length +
       (colRange.leftWidth > 0 ? 1 : 0) +
-      (colRange.end - colRange.start) +
+      colRange.visibleUnpinnedCols.length +
       (colRange.rightWidth > 0 ? 1 : 0);
 
     const rowsHtml: string[] = [];
@@ -1122,54 +1658,39 @@ export class SpreadsheetGrid {
           : 'bg-white';
 
       const cells: string[] = [];
+
+      colPlan.pinnedCols.forEach((colIdx, pIdx) => {
+        cells.push(
+          this.renderCellHtml({
+            rowIdx,
+            colIdx,
+            dispIdx,
+            val: row[colIdx] ?? '',
+            isRowHighlighted,
+            colPlan,
+            isPinned: true,
+            isLastPinned: pIdx === colPlan.pinnedCols.length - 1,
+          })
+        );
+      });
+
       if (colRange.leftWidth > 0) {
         cells.push(`<td class="border-b border-slate-200 p-0"></td>`);
       }
 
-      for (let colIdx = colRange.start; colIdx < colRange.end; colIdx++) {
-        const val = row[colIdx] ?? '';
-        const colType = sheet.types[colIdx] ?? 'text';
-        const isSelected =
-          this.selectedCell?.rowIndex === rowIdx &&
-          this.selectedCell?.colIndex === colIdx;
-        const isEditing =
-          this.editingCell?.rowIndex === rowIdx &&
-          this.editingCell?.colIndex === colIdx;
-
-        const alignClass =
-          colType === 'number' || colType === 'percent'
-            ? 'text-right font-mono-tabular'
-            : 'text-left';
-
-        if (isEditing) {
-          cells.push(`
-            <td class="border-b border-r border-slate-200 p-0 bg-white ring-2 ring-inset ring-blue-600" style="height:${GRID_ROW_HEIGHT}px">
-              <input
-                type="text"
-                data-cell-input="${rowIdx}:${colIdx}"
-                value="${escapeHtml(val)}"
-                aria-label="Edit cell ${columnIndexToLetter(colIdx)}${rowIdx + 1}"
-                class="w-full h-full px-2 text-sm text-slate-900 bg-white focus:outline-none ${alignClass}"
-              />
-            </td>
-          `);
-        } else {
-          const selectedRing = isSelected
-            ? 'ring-2 ring-inset ring-blue-500 bg-blue-50/40'
-            : '';
-          const displayVal = truncateDisplayText(val);
-          // Avoid duplicating long strings into aria-label attributes
-          cells.push(`
-            <td class="border-b border-r border-slate-200 p-0 ${selectedRing}" ${isSelected ? 'data-selected="1"' : ''} style="height:${GRID_ROW_HEIGHT}px">
-              <button
-                type="button"
-                data-cell="${rowIdx}:${colIdx}"
-                aria-label="Cell ${columnIndexToLetter(colIdx)}${rowIdx + 1}"
-                class="w-full h-full px-2 text-sm text-slate-800 hover:bg-slate-100/70 focus:outline-none truncate block cursor-cell ${alignClass}"
-              >${escapeHtml(displayVal)}</button>
-            </td>
-          `);
-        }
+      for (const colIdx of colRange.visibleUnpinnedCols) {
+        cells.push(
+          this.renderCellHtml({
+            rowIdx,
+            colIdx,
+            dispIdx,
+            val: row[colIdx] ?? '',
+            isRowHighlighted,
+            colPlan,
+            isPinned: false,
+            isLastPinned: false,
+          })
+        );
       }
 
       if (colRange.rightWidth > 0) {
@@ -1178,7 +1699,7 @@ export class SpreadsheetGrid {
 
       rowsHtml.push(`
         <tr data-row-index="${rowIdx}" data-disp-idx="${dispIdx}" ${isRowHighlighted ? 'data-highlighted="1"' : ''} class="group ${rowBg} hover:bg-blue-50/40" style="height:${GRID_ROW_HEIGHT}px">
-          <td class="sticky left-0 z-[5] bg-slate-50 border-b border-r border-slate-200 px-1.5 py-0 text-center select-none" style="height:${GRID_ROW_HEIGHT}px">
+          <td class="sticky left-0 z-[15] bg-slate-50 border-b border-r border-slate-200 px-1.5 py-0 text-center select-none overflow-hidden" style="left:0;height:${GRID_ROW_HEIGHT}px">
             <div class="flex items-center justify-between gap-1">
               <span class="font-mono-tabular text-[11px] text-slate-400 truncate text-right flex-1">${rowIdx + 1}</span>
               <button
@@ -1204,7 +1725,6 @@ export class SpreadsheetGrid {
 
     this.tbodyEl.innerHTML = rowsHtml.join('');
 
-    // Focus active inline cell editor if open in this visible window
     if (this.editingCell) {
       const cellInput = this.tbodyEl.querySelector<HTMLInputElement>(
         `[data-cell-input="${this.editingCell.rowIndex}:${this.editingCell.colIndex}"]`
@@ -1223,6 +1743,107 @@ export class SpreadsheetGrid {
     }
   }
 
+  private startColumnResize(e: PointerEvent, colIdx: number): void {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startWidth = this.colWidths[colIdx] ?? 156;
+    const prevUserSelect = document.body.style.userSelect;
+    const prevCursor = document.body.style.cursor;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'col-resize';
+
+    this.resizeDrag = {
+      pointerId: e.pointerId,
+      colIdx,
+      startX: e.clientX,
+      startWidth,
+      currentWidth: startWidth,
+      rafId: 0,
+      prevUserSelect,
+      prevCursor,
+    };
+
+    this.showResizeBadge(e.clientX, e.clientY, startWidth);
+    window.addEventListener('pointermove', this.onWindowPointerMoveResizeBound);
+    window.addEventListener('pointerup', this.onWindowPointerUpResizeBound);
+    window.addEventListener('pointercancel', this.onWindowPointerUpResizeBound);
+  }
+
+  private handleColumnResizeMove(e: PointerEvent): void {
+    if (!this.resizeDrag || this.resizeDrag.pointerId !== e.pointerId) return;
+    const deltaX = e.clientX - this.resizeDrag.startX;
+    const nextW = clampColumnWidth(this.resizeDrag.startWidth + deltaX);
+    this.resizeDrag.currentWidth = nextW;
+    this.showResizeBadge(e.clientX, e.clientY, nextW);
+
+    if (!this.resizeDrag.rafId) {
+      this.resizeDrag.rafId = requestAnimationFrame(() => {
+        if (!this.resizeDrag) return;
+        this.resizeDrag.rafId = 0;
+        this.applyLiveColumnWidth(
+          this.resizeDrag.colIdx,
+          this.resizeDrag.currentWidth
+        );
+      });
+    }
+  }
+
+  private handleColumnResizeEnd(e: PointerEvent): void {
+    if (!this.resizeDrag || this.resizeDrag.pointerId !== e.pointerId) return;
+    const {colIdx, currentWidth, rafId, prevUserSelect, prevCursor} =
+      this.resizeDrag;
+    if (rafId) cancelAnimationFrame(rafId);
+    this.resizeDrag = null;
+
+    window.removeEventListener('pointermove', this.onWindowPointerMoveResizeBound);
+    window.removeEventListener('pointerup', this.onWindowPointerUpResizeBound);
+    window.removeEventListener('pointercancel', this.onWindowPointerUpResizeBound);
+
+    document.body.style.userSelect = prevUserSelect;
+    document.body.style.cursor = prevCursor;
+    this.resizeBadgeEl?.classList.add('hidden');
+
+    this.applyLiveColumnWidth(colIdx, currentWidth);
+    this.callbacks.onResizeColumn?.(colIdx, currentWidth);
+  }
+
+  private applyLiveColumnWidth(colIdx: number, nextWidth: number): void {
+    this.colWidths[colIdx] = nextWidth;
+    this.recomputeTotalVisibleWidth();
+
+    if (this.tableEl) {
+      this.tableEl.style.width = `${ROW_NUM_COL_WIDTH + this.totalColsWidth}px`;
+    }
+    const colEl = this.colGroupEl?.querySelector<HTMLElement>(
+      `col[data-col-idx="${colIdx}"]`
+    );
+    if (colEl) {
+      colEl.style.width = `${nextWidth}px`;
+    }
+
+    // Recompute sticky left offsets cleanly if a pinned column changed width
+    const plan = this.getActiveColumnPlan();
+    this.lastColPlan = plan;
+    for (const pinnedCol of plan.pinnedCols) {
+      const leftPx = `${plan.pinnedLeftOffsets[pinnedCol]}px`;
+      this.tableEl
+        ?.querySelectorAll<HTMLElement>(`[data-sticky-col="${pinnedCol}"]`)
+        .forEach((cell) => {
+          cell.style.left = leftPx;
+        });
+    }
+  }
+
+  private showResizeBadge(clientX: number, clientY: number, width: number): void {
+    if (!this.resizeBadgeEl) return;
+    this.resizeBadgeEl.textContent = `${width}px`;
+    this.resizeBadgeEl.style.left = `${Math.round(clientX + 12)}px`;
+    this.resizeBadgeEl.style.top = `${Math.round(Math.max(8, clientY - 28))}px`;
+    this.resizeBadgeEl.classList.remove('hidden');
+  }
+
   private startEditing(
     rowIndex: number,
     colIndex: number,
@@ -1235,26 +1856,72 @@ export class SpreadsheetGrid {
     this.renderVirtualWindow(true);
   }
 
+  public scrollToColumn(sourceColIndex: number): void {
+    if (!this.tableContainerEl || !this.sheet) return;
+    const plan = this.getActiveColumnPlan();
+    if (plan.pinnedCols.includes(sourceColIndex)) {
+      this.renderVirtualWindow(true);
+      return;
+    }
+    const unpinnedPos = plan.unpinnedCols.indexOf(sourceColIndex);
+    if (unpinnedPos < 0) return;
+
+    const nextLeft = computeScrollLeftForColumn({
+      unpinnedColPos: unpinnedPos,
+      unpinnedCols: plan.unpinnedCols,
+      colWidths: this.colWidths,
+      currentScrollLeft: this.tableContainerEl.scrollLeft,
+      viewportWidth: this.tableContainerEl.clientWidth || 720,
+      fixedLeftWidth: ROW_NUM_COL_WIDTH + plan.pinnedTotalWidth,
+    });
+    if (nextLeft !== null) {
+      this.tableContainerEl.scrollLeft = nextLeft;
+    }
+    this.renderVirtualWindow(true);
+  }
+
+  private focusColumnFromManager(colIdx: number): void {
+    if (!this.sheet) return;
+    if (this.columnView?.hidden.includes(colIdx)) {
+      this.callbacks.onToggleHideColumn?.(colIdx);
+    }
+    const row = this.selectedCell?.rowIndex ?? this.visibleRowIndices[0] ?? 0;
+    this.callbacks.onSelectCell({rowIndex: row, colIndex: colIdx});
+    this.scrollToColumn(colIdx);
+    this.focusCellButton(row, colIdx);
+  }
+
   private moveSelection(deltaVisibleRow: number, deltaCol: number): void {
     if (!this.sheet || this.visibleRowIndices.length === 0) return;
 
-    const curRow = this.selectedCell?.rowIndex ?? this.visibleRowIndices[0];
-    const curCol = this.selectedCell?.colIndex ?? 0;
+    const plan = this.getActiveColumnPlan();
+    const visibleCols = plan.visibleCols;
+    if (visibleCols.length === 0) return;
 
-    const visIdx = this.findDisplayIndex(curRow);
-    const baseVisIdx = visIdx >= 0 ? visIdx : 0;
-    const nextVisIdx = Math.max(
+    const curRow = this.selectedCell?.rowIndex ?? this.visibleRowIndices[0];
+    const curCol = this.selectedCell?.colIndex ?? visibleCols[0];
+
+    const visRowIdx = this.findDisplayIndex(curRow);
+    const baseVisRowIdx = visRowIdx >= 0 ? visRowIdx : 0;
+    const nextVisRowIdx = Math.max(
       0,
-      Math.min(this.visibleRowIndices.length - 1, baseVisIdx + deltaVisibleRow)
+      Math.min(this.visibleRowIndices.length - 1, baseVisRowIdx + deltaVisibleRow)
     );
-    const nextRow = this.visibleRowIndices[nextVisIdx];
-    const nextCol = Math.max(
+    const nextRow = this.visibleRowIndices[nextVisRowIdx];
+
+    const curColPos = visibleCols.indexOf(curCol);
+    const baseColPos = curColPos >= 0 ? curColPos : 0;
+    const nextColPos = Math.max(
       0,
-      Math.min(this.sheet.columns.length - 1, curCol + deltaCol)
+      Math.min(visibleCols.length - 1, baseColPos + deltaCol)
     );
+    const nextCol = visibleCols[nextColPos];
 
     this.callbacks.onSelectCell({rowIndex: nextRow, colIndex: nextCol});
     this.scrollToRow(nextRow);
+    if (deltaCol !== 0) {
+      this.scrollToColumn(nextCol);
+    }
     this.focusCellButton(nextRow, nextCol);
   }
 
@@ -1263,7 +1930,7 @@ export class SpreadsheetGrid {
       const btn = this.tableContainerEl?.querySelector<HTMLButtonElement>(
         `[data-cell="${rowIndex}:${colIndex}"]`
       );
-      btn?.focus({preventScroll: false});
+      btn?.focus({preventScroll: true});
     });
   }
 
@@ -1272,6 +1939,23 @@ export class SpreadsheetGrid {
       cancelAnimationFrame(this.scrollRafId);
       this.scrollRafId = 0;
     }
+    if (this.resizeDrag) {
+      if (this.resizeDrag.rafId) cancelAnimationFrame(this.resizeDrag.rafId);
+      document.body.style.userSelect = this.resizeDrag.prevUserSelect;
+      document.body.style.cursor = this.resizeDrag.prevCursor;
+      window.removeEventListener(
+        'pointermove',
+        this.onWindowPointerMoveResizeBound
+      );
+      window.removeEventListener('pointerup', this.onWindowPointerUpResizeBound);
+      window.removeEventListener(
+        'pointercancel',
+        this.onWindowPointerUpResizeBound
+      );
+      this.resizeDrag = null;
+    }
+    this.columnManager?.dispose();
+    this.columnManager = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
   }

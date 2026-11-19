@@ -1,4 +1,10 @@
-import type {ColumnType, SheetData, WorkbookState} from '../types';
+import type {
+  ColumnType,
+  ColumnViewState,
+  SemanticType,
+  SheetData,
+  WorkbookState,
+} from '../types';
 import {inferSingleColumnType} from './tabular';
 
 export interface CellPatchEntry {
@@ -12,6 +18,14 @@ export interface CellPatchEntry {
   nextType: ColumnType;
 }
 
+export interface ColumnStructuralTransition {
+  kind: 'add' | 'delete';
+  colIndex: number;
+  prevView: ColumnViewState;
+  nextView: ColumnViewState;
+  deletedRoleOverride?: SemanticType;
+}
+
 export interface SheetSnapshotEntry {
   kind: 'sheet-snapshot';
   sheetIndex: number;
@@ -19,6 +33,7 @@ export interface SheetSnapshotEntry {
   nextSheet: SheetData;
   prevActiveSheetIndex: number;
   nextActiveSheetIndex: number;
+  columnTransition?: ColumnStructuralTransition;
 }
 
 export interface WorkbookSwitchEntry {
@@ -126,7 +141,10 @@ export class WorkbookHistoryManager {
   }
 
   /** Commits a structural mutation of the active sheet (row/col add/delete/rename) using CoW references. */
-  commitSheetSnapshot(nextSheet: SheetData): void {
+  commitSheetSnapshot(
+    nextSheet: SheetData,
+    options?: {columnTransition?: ColumnStructuralTransition}
+  ): void {
     const sheetIdx = this.present.activeSheetIndex;
     const prevSheet = this.present.sheets[sheetIdx];
     if (!prevSheet || prevSheet === nextSheet) return;
@@ -147,6 +165,7 @@ export class WorkbookHistoryManager {
       nextSheet,
       prevActiveSheetIndex: prevIdx,
       nextActiveSheetIndex: prevIdx,
+      columnTransition: options?.columnTransition,
     });
   }
 

@@ -54,6 +54,13 @@ class SpatialSheetApp {
 
   private lastTabsKey = '';
   private previewSplitRatio: number | null = null;
+  private readonly abortController = new AbortController();
+  private resizeObservers: ResizeObserver[] = [];
+  private storeUnsubscribes: Array<() => void> = [];
+  private spatialSizeRafId = 0;
+  private windowResizeRafId = 0;
+  private simExitRafId = 0;
+  private disposed = false;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -235,7 +242,7 @@ class SpatialSheetApp {
           <section data-role="grid-host" class="w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col"></section>
 
           <!-- Resizable Split Divider (Desktop >= 1024px in Split mode) -->
-          <div data-role="workspace-splitter" class="hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20"></div>
+          <div data-role="workspace-splitter" class="group hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20"></div>
 
           <!-- Visualization Pane (2D Interactive Charts + 3D XR Blocks Stage) -->
           <section data-role="viz-host" class="w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col gap-2">
@@ -449,161 +456,190 @@ class SpatialSheetApp {
     );
     xb.add(this.spatialStage);
     void xb.init(options).then(() => {
-      this.syncSpatialSize();
+      if (!this.disposed) this.syncSpatialSize();
     });
 
     const ro = new ResizeObserver(() => {
-      this.syncSpatialSize();
+      if (!this.disposed) this.syncSpatialSize();
     });
     ro.observe(this.xrCanvasMountEl);
+    this.resizeObservers.push(ro);
 
     const mainRo = new ResizeObserver(() => {
-      this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
+      if (!this.disposed) {
+        this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
+      }
     });
     mainRo.observe(this.mainEl);
+    this.resizeObservers.push(mainRo);
 
-    window.addEventListener('resize', () => {
-      requestAnimationFrame(() => {
-        this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
-        this.syncSpatialSize();
-      });
-    });
+    window.addEventListener(
+      'resize',
+      () => {
+        if (this.windowResizeRafId) {
+          cancelAnimationFrame(this.windowResizeRafId);
+        }
+        this.windowResizeRafId = requestAnimationFrame(() => {
+          this.windowResizeRafId = 0;
+          if (this.disposed) return;
+          this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
+          this.syncSpatialSize();
+        });
+      },
+      {signal: this.abortController.signal}
+    );
   }
 
   private bindStoreSubscriptions(): void {
     // 1. Top metadata + Sheet tabs + Search input sync
-    this.store.subscribe(['workbook', 'sheetData'], (changed) => {
-      this.syncMetadataAndTabs();
-      if (changed.has('workbook') && this.searchInput.value !== this.store.searchQuery) {
-        this.searchInput.value = this.store.searchQuery;
-      }
-    });
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['workbook', 'sheetData'], (changed) => {
+        this.syncMetadataAndTabs();
+        if (changed.has('workbook') && this.searchInput.value !== this.store.searchQuery) {
+          this.searchInput.value = this.store.searchQuery;
+        }
+      })
+    );
 
     // 2. Undo / Redo buttons
-    this.store.subscribe(['history'], () => {
-      this.undoBtn.disabled = !this.store.history.canUndo;
-      this.redoBtn.disabled = !this.store.history.canRedo;
-    });
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['history'], () => {
+        this.undoBtn.disabled = !this.store.history.canUndo;
+        this.redoBtn.disabled = !this.store.history.canRedo;
+      })
+    );
 
     // 3. Loading & error states
-    this.store.subscribe(['loading'], () => this.syncLoadingBanner());
-    this.store.subscribe(['error'], () => this.syncErrorBanner());
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['loading'], () => this.syncLoadingBanner())
+    );
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['error'], () => this.syncErrorBanner())
+    );
 
     // 4. Layout & 2D/3D visibility
-    this.store.subscribe(['layout', 'vizMode'], () => {
-      this.syncLayoutAndVizVisibility();
-    });
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['layout', 'vizMode'], () => {
+        this.syncLayoutAndVizVisibility();
+      })
+    );
 
     // 5. Spreadsheet Grid (fine-grained: cell patch vs columnView vs full window vs selection only vs stats)
-    this.store.subscribe(
-      ['sheetData', 'visibleRows', 'columnView', 'profile', 'selection', 'stats'],
-      (changed) => {
-        if (changed.has('visibleRows')) {
-          this.spreadsheet.setData({
-            sheet: this.store.activeSheet,
-            visibleRowIndices: this.store.visibleRowIndices,
-            sort: this.store.sort,
-            selectedCell: this.store.selectedCell,
-            highlightedRowIndex: this.store.highlightedRowIndex,
-            columnStats: this.store.activeColumnStats,
-            columnView: this.store.activeColumnView,
-            profile: this.store.datasetProfile,
-          });
-          return;
-        }
+    this.storeUnsubscribes.push(
+      this.store.subscribe(
+        ['sheetData', 'visibleRows', 'columnView', 'profile', 'selection', 'stats'],
+        (changed) => {
+          if (changed.has('visibleRows')) {
+            this.spreadsheet.setData({
+              sheet: this.store.activeSheet,
+              visibleRowIndices: this.store.visibleRowIndices,
+              sort: this.store.sort,
+              selectedCell: this.store.selectedCell,
+              highlightedRowIndex: this.store.highlightedRowIndex,
+              columnStats: this.store.activeColumnStats,
+              columnView: this.store.activeColumnView,
+              profile: this.store.datasetProfile,
+            });
+            return;
+          }
 
-        if (changed.has('sheetData') && this.store.lastCellPatch) {
-          const patch = this.store.lastCellPatch;
-          this.store.lastCellPatch = null;
-          this.spreadsheet.updateSingleCellInPlace(
-            this.store.activeSheet,
-            patch.rowIndex,
-            patch.colIndex,
-            this.store.activeColumnStats
-          );
+          if (changed.has('sheetData') && this.store.lastCellPatch) {
+            const patch = this.store.lastCellPatch;
+            this.store.lastCellPatch = null;
+            this.spreadsheet.updateSingleCellInPlace(
+              this.store.activeSheet,
+              patch.rowIndex,
+              patch.colIndex,
+              this.store.activeColumnStats
+            );
+            if (changed.has('selection')) {
+              this.spreadsheet.setSelection(
+                this.store.selectedCell,
+                this.store.highlightedRowIndex,
+                this.store.activeColumnStats
+              );
+            }
+            return;
+          }
+
+          if (changed.has('sheetData')) {
+            this.spreadsheet.setData({
+              sheet: this.store.activeSheet,
+              visibleRowIndices: this.store.visibleRowIndices,
+              sort: this.store.sort,
+              selectedCell: this.store.selectedCell,
+              highlightedRowIndex: this.store.highlightedRowIndex,
+              columnStats: this.store.activeColumnStats,
+              columnView: this.store.activeColumnView,
+              profile: this.store.datasetProfile,
+            });
+            return;
+          }
+
+          if (changed.has('columnView') || changed.has('profile')) {
+            this.spreadsheet.setColumnView(
+              this.store.activeColumnView,
+              this.store.datasetProfile
+            );
+            return;
+          }
+
           if (changed.has('selection')) {
             this.spreadsheet.setSelection(
               this.store.selectedCell,
               this.store.highlightedRowIndex,
               this.store.activeColumnStats
             );
+            return;
           }
-          return;
-        }
 
-        if (changed.has('sheetData')) {
-          this.spreadsheet.setData({
-            sheet: this.store.activeSheet,
-            visibleRowIndices: this.store.visibleRowIndices,
-            sort: this.store.sort,
-            selectedCell: this.store.selectedCell,
-            highlightedRowIndex: this.store.highlightedRowIndex,
-            columnStats: this.store.activeColumnStats,
-            columnView: this.store.activeColumnView,
-            profile: this.store.datasetProfile,
-          });
-          return;
+          if (changed.has('stats')) {
+            this.spreadsheet.setColumnStats(this.store.activeColumnStats);
+          }
         }
-
-        if (changed.has('columnView') || changed.has('profile')) {
-          this.spreadsheet.setColumnView(
-            this.store.activeColumnView,
-            this.store.datasetProfile
-          );
-          return;
-        }
-
-        if (changed.has('selection')) {
-          this.spreadsheet.setSelection(
-            this.store.selectedCell,
-            this.store.highlightedRowIndex,
-            this.store.activeColumnStats
-          );
-          return;
-        }
-
-        if (changed.has('stats')) {
-          this.spreadsheet.setColumnStats(this.store.activeColumnStats);
-        }
-      }
+      )
     );
 
     // 6. 2D Chart updates (skip full rebuild on highlight-only changes)
-    this.store.subscribe(
-      ['sheetData', 'visibleRows', 'chartConfig', 'profile', 'chartHighlight'],
-      (changed) => {
-        const dataOrConfigChanged =
-          changed.has('sheetData') ||
-          changed.has('visibleRows') ||
-          changed.has('chartConfig') ||
-          changed.has('profile');
+    this.storeUnsubscribes.push(
+      this.store.subscribe(
+        ['sheetData', 'visibleRows', 'chartConfig', 'profile', 'chartHighlight'],
+        (changed) => {
+          const dataOrConfigChanged =
+            changed.has('sheetData') ||
+            changed.has('visibleRows') ||
+            changed.has('chartConfig') ||
+            changed.has('profile');
 
-        if (dataOrConfigChanged) {
-          this.chart2d.setData({
-            sheet: this.store.activeSheet,
-            visibleRowIndices: this.store.visibleRowIndices,
-            config: this.store.chartConfig,
-            highlightedRowIndex: this.store.highlightedRowIndex,
-            recommendations: this.store.chartRecommendations,
-            profile: this.store.datasetProfile,
-          });
-        } else if (changed.has('chartHighlight')) {
-          this.chart2d.setHighlight(this.store.highlightedRowIndex);
+          if (dataOrConfigChanged) {
+            this.chart2d.setData({
+              sheet: this.store.activeSheet,
+              visibleRowIndices: this.store.visibleRowIndices,
+              config: this.store.chartConfig,
+              highlightedRowIndex: this.store.highlightedRowIndex,
+              recommendations: this.store.chartRecommendations,
+              profile: this.store.datasetProfile,
+            });
+          } else if (changed.has('chartHighlight')) {
+            this.chart2d.setHighlight(this.store.highlightedRowIndex);
+          }
         }
-      }
+      )
     );
 
     // 7. 3D Analytical Stage & Inspector Overlay updates
-    this.store.subscribe(['spatialData', 'profile', 'chartHighlight'], (changed) => {
-      if (changed.has('spatialData') || changed.has('profile')) {
-        this.syncSpatialViews();
-      } else if (changed.has('chartHighlight')) {
-        this.spatialStage.setHighlight(
-          this.store.selectedSpatialItem,
-          this.store.highlightedRowIndex
-        );
-      }
-    });
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['spatialData', 'profile', 'chartHighlight'], (changed) => {
+        if (changed.has('spatialData') || changed.has('profile')) {
+          this.syncSpatialViews();
+        } else if (changed.has('chartHighlight')) {
+          this.spatialStage.setHighlight(
+            this.store.selectedSpatialItem,
+            this.store.highlightedRowIndex
+          );
+        }
+      })
+    );
   }
 
   private syncSpatialViews(): void {
@@ -761,7 +797,7 @@ class SpatialSheetApp {
       this.gridHostEl.className =
         'w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col';
       this.splitterEl.className =
-        'hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20';
+        'group hidden lg:flex shrink-0 h-full cursor-col-resize relative z-20';
       this.vizHostEl.className =
         'w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col gap-2';
     }
@@ -780,7 +816,11 @@ class SpatialSheetApp {
 
     this.spatialStage.setEmbeddedVisible(show3D || isSimulatorFullscreen);
     if (show3D) {
-      requestAnimationFrame(() => this.syncSpatialSize());
+      if (this.spatialSizeRafId) cancelAnimationFrame(this.spatialSizeRafId);
+      this.spatialSizeRafId = requestAnimationFrame(() => {
+        this.spatialSizeRafId = 0;
+        if (!this.disposed) this.syncSpatialSize();
+      });
     }
   }
 
@@ -850,142 +890,208 @@ class SpatialSheetApp {
   }
 
   private bindGlobalEvents(): void {
+    const {signal} = this.abortController;
+
     // Delegated sheet tabs
-    this.sheetTabsEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      const tabBtn = target.closest<HTMLElement>('[data-sheet-tab]');
-      if (tabBtn) {
-        this.store.switchSheet(Number(tabBtn.dataset.sheetTab));
-        return;
-      }
-      if (target.closest('[data-action="add-sheet"]')) {
-        this.store.addNewSheet();
-      }
-    });
+    this.sheetTabsEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        const tabBtn = target.closest<HTMLElement>('[data-sheet-tab]');
+        if (tabBtn) {
+          this.store.switchSheet(Number(tabBtn.dataset.sheetTab));
+          return;
+        }
+        if (target.closest('[data-action="add-sheet"]')) {
+          this.store.addNewSheet();
+        }
+      },
+      {signal}
+    );
 
     // Delegated error dismiss
-    this.errorBannerEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (target?.closest('[data-close-err]')) {
-        this.store.dismissError();
-      }
-    });
+    this.errorBannerEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-close-err]')) {
+          this.store.dismissError();
+        }
+      },
+      {signal}
+    );
 
     // File input
     const fileInput = this.root.querySelector<HTMLInputElement>(
       '[data-role="file-input"]'
     );
-    fileInput?.addEventListener('change', async () => {
-      const file = fileInput.files?.[0];
-      if (!file) return;
-      await this.store.loadFile(file);
-      fileInput.value = '';
-    });
+    fileInput?.addEventListener(
+      'change',
+      async () => {
+        const file = fileInput.files?.[0];
+        if (!file) return;
+        await this.store.loadFile(file);
+        fileInput.value = '';
+      },
+      {signal}
+    );
 
     // New blank sheet button
     this.root
       .querySelector('[data-action="new-blank"]')
-      ?.addEventListener('click', () => {
-        this.store.resetWithWorkbook(createBlankWorkbook());
-      });
+      ?.addEventListener(
+        'click',
+        () => {
+          this.store.resetWithWorkbook(createBlankWorkbook());
+        },
+        {signal}
+      );
 
     // Exports
     this.root
       .querySelector('[data-action="export-csv"]')
-      ?.addEventListener('click', () => {
-        exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName);
-      });
+      ?.addEventListener(
+        'click',
+        () => {
+          exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName);
+        },
+        {signal}
+      );
     this.root
       .querySelector('[data-action="export-xlsx"]')
-      ?.addEventListener('click', () => {
-        exportWorkbookAsExcel(this.store.workbook);
-      });
+      ?.addEventListener(
+        'click',
+        () => {
+          exportWorkbookAsExcel(this.store.workbook);
+        },
+        {signal}
+      );
 
     // Undo / Redo
-    this.undoBtn.addEventListener('click', () => this.store.undo());
-    this.redoBtn.addEventListener('click', () => this.store.redo());
+    this.undoBtn.addEventListener('click', () => this.store.undo(), {signal});
+    this.redoBtn.addEventListener('click', () => this.store.redo(), {signal});
 
     // Debounced Search
-    this.searchInput.addEventListener('input', () => {
-      this.store.setSearchQueryDebounced(this.searchInput.value);
-    });
+    this.searchInput.addEventListener(
+      'input',
+      () => {
+        this.store.setSearchQueryDebounced(this.searchInput.value);
+      },
+      {signal}
+    );
 
     // Layout mode switches
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-layout]')
       .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.store.setLayout(btn.dataset.layout as WorkspaceLayout);
-        });
+        btn.addEventListener(
+          'click',
+          () => {
+            this.store.setLayout(btn.dataset.layout as WorkspaceLayout);
+          },
+          {signal}
+        );
       });
 
     // Viz sub-tabs
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-viz-tab]')
       .forEach((btn) => {
-        btn.addEventListener('click', () => {
-          this.store.setChartPanelMode(btn.dataset.vizTab as '2d' | '3d');
-        });
+        btn.addEventListener(
+          'click',
+          () => {
+            this.store.setChartPanelMode(btn.dataset.vizTab as '2d' | '3d');
+          },
+          {signal}
+        );
       });
 
     // XR / Simulator launcher
     this.root
       .querySelector('[data-action="toggle-xr"]')
-      ?.addEventListener('click', () => {
-        void this.launchXRorSimulator();
-      });
+      ?.addEventListener(
+        'click',
+        () => {
+          void this.launchXRorSimulator();
+        },
+        {signal}
+      );
 
-    this.exitSimBtn.addEventListener('click', () => {
-      this.exitSimulatorMode();
-    });
+    this.exitSimBtn.addEventListener(
+      'click',
+      () => {
+        this.exitSimulatorMode();
+      },
+      {signal}
+    );
 
     // Global keyboard shortcuts (Undo/Redo)
-    window.addEventListener('keydown', (e) => {
-      const target = e.target as HTMLElement | null;
-      const isTextInput =
-        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA';
-      if (isTextInput) return;
+    window.addEventListener(
+      'keydown',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        const isTextInput =
+          target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA';
+        if (isTextInput) return;
 
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        if (e.shiftKey) this.store.redo();
-        else this.store.undo();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-        e.preventDefault();
-        this.store.redo();
-      }
-    });
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) this.store.redo();
+          else this.store.undo();
+        } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+          e.preventDefault();
+          this.store.redo();
+        }
+      },
+      {signal}
+    );
 
     // Drag and Drop file upload
     let dragDepth = 0;
-    window.addEventListener('dragenter', (e) => {
-      if (e.dataTransfer?.types.includes('Files')) {
-        dragDepth++;
-        this.dropOverlayEl.classList.remove('hidden');
-        this.dropOverlayEl.classList.add('flex');
-      }
-    });
-    window.addEventListener('dragleave', () => {
-      dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) {
+    window.addEventListener(
+      'dragenter',
+      (e) => {
+        if (e.dataTransfer?.types.includes('Files')) {
+          dragDepth++;
+          this.dropOverlayEl.classList.remove('hidden');
+          this.dropOverlayEl.classList.add('flex');
+        }
+      },
+      {signal}
+    );
+    window.addEventListener(
+      'dragleave',
+      () => {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) {
+          this.dropOverlayEl.classList.add('hidden');
+          this.dropOverlayEl.classList.remove('flex');
+        }
+      },
+      {signal}
+    );
+    window.addEventListener(
+      'dragover',
+      (e) => {
+        e.preventDefault();
+      },
+      {signal}
+    );
+    window.addEventListener(
+      'drop',
+      async (e) => {
+        e.preventDefault();
+        dragDepth = 0;
         this.dropOverlayEl.classList.add('hidden');
         this.dropOverlayEl.classList.remove('flex');
-      }
-    });
-    window.addEventListener('dragover', (e) => {
-      e.preventDefault();
-    });
-    window.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      dragDepth = 0;
-      this.dropOverlayEl.classList.add('hidden');
-      this.dropOverlayEl.classList.remove('flex');
-      const file = e.dataTransfer?.files?.[0];
-      if (file) {
-        await this.store.loadFile(file);
-      }
-    });
+        const file = e.dataTransfer?.files?.[0];
+        if (file) {
+          await this.store.loadFile(file);
+        }
+      },
+      {signal}
+    );
   }
 
   private async launchXRorSimulator(): Promise<void> {
@@ -1027,13 +1133,42 @@ class SpatialSheetApp {
     this.exitSimBtn.classList.remove('inline-flex');
     this.spatialStage.onXRSessionEnded();
     this.store.setSimulatorFullscreen(false);
-    requestAnimationFrame(() => this.syncSpatialSize());
+    if (this.simExitRafId) cancelAnimationFrame(this.simExitRafId);
+    this.simExitRafId = requestAnimationFrame(() => {
+      this.simExitRafId = 0;
+      if (!this.disposed) this.syncSpatialSize();
+    });
+  }
+
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.spatialSizeRafId) cancelAnimationFrame(this.spatialSizeRafId);
+    if (this.windowResizeRafId) cancelAnimationFrame(this.windowResizeRafId);
+    if (this.simExitRafId) cancelAnimationFrame(this.simExitRafId);
+    this.spatialSizeRafId = 0;
+    this.windowResizeRafId = 0;
+    this.simExitRafId = 0;
+
+    for (const ro of this.resizeObservers) ro.disconnect();
+    this.resizeObservers = [];
+
+    this.abortController.abort();
+    for (const unsub of this.storeUnsubscribes) unsub();
+    this.storeUnsubscribes = [];
+
+    this.splitter.dispose();
+    this.spreadsheet.dispose();
+    this.chart2d.dispose();
+    this.spatialOverlay.dispose();
+    this.store.dispose();
   }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   const root = document.getElementById('root');
   if (root) {
-    new SpatialSheetApp(root);
+    const app = new SpatialSheetApp(root);
+    window.addEventListener('beforeunload', () => app.dispose(), {once: true});
   }
 });

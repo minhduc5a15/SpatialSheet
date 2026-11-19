@@ -38,6 +38,7 @@ export class ColumnManager {
   private view: ColumnViewState | null = null;
   private profile: DatasetProfile | null = null;
 
+  private readonly abortController = new AbortController();
   private readonly onDocPointerDownBound = (e: MouseEvent) => this.handleDocClick(e);
   private readonly onDocKeyDownBound = (e: KeyboardEvent) => this.handleDocKey(e);
 
@@ -72,14 +73,19 @@ export class ColumnManager {
       '[data-role="col-manager-popover"]'
     )!;
 
-    this.triggerBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.toggle();
-    });
+    const {signal} = this.abortController;
+    this.triggerBtn.addEventListener(
+      'click',
+      (e) => {
+        e.stopPropagation();
+        this.toggle();
+      },
+      {signal}
+    );
 
     this.bindPopoverEvents();
-    document.addEventListener('mousedown', this.onDocPointerDownBound);
-    document.addEventListener('keydown', this.onDocKeyDownBound);
+    document.addEventListener('mousedown', this.onDocPointerDownBound, {signal});
+    document.addEventListener('keydown', this.onDocKeyDownBound, {signal});
   }
 
   public update(params: {
@@ -348,18 +354,25 @@ export class ColumnManager {
   }
 
   private bindPopoverEvents(): void {
-    this.popoverEl.addEventListener('input', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (
-        target instanceof HTMLInputElement &&
-        target.dataset.role === 'col-manager-search'
-      ) {
-        this.searchQuery = target.value;
-        this.renderPopoverBody();
-      }
-    });
+    const {signal} = this.abortController;
+    this.popoverEl.addEventListener(
+      'input',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (
+          target instanceof HTMLInputElement &&
+          target.dataset.role === 'col-manager-search'
+        ) {
+          this.searchQuery = target.value;
+          this.renderPopoverBody();
+        }
+      },
+      {signal}
+    );
 
-    this.popoverEl.addEventListener('click', (e) => {
+    this.popoverEl.addEventListener(
+      'click',
+      (e) => {
       e.stopPropagation();
       const target = e.target as HTMLElement | null;
       if (!target) return;
@@ -414,7 +427,9 @@ export class ColumnManager {
       if (focusBtn) {
         this.callbacks.onFocusColumn?.(Number(focusBtn.dataset.cmFocus));
       }
-    });
+      },
+      {signal}
+    );
   }
 
   private handleDocClick(e: MouseEvent): void {
@@ -434,7 +449,7 @@ export class ColumnManager {
   }
 
   public dispose(): void {
-    document.removeEventListener('mousedown', this.onDocPointerDownBound);
-    document.removeEventListener('keydown', this.onDocKeyDownBound);
+    this.toggle(false);
+    this.abortController.abort();
   }
 }

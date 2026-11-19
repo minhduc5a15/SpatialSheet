@@ -25,13 +25,8 @@ export class WorkspaceSplitter {
   private prevBodyUserSelect = '';
   private prevBodyCursor = '';
   private percentageBadgeEl: HTMLElement | null = null;
-
-  private readonly onPointerDownBound = (e: PointerEvent) => this.handlePointerDown(e);
-  private readonly onPointerMoveBound = (e: PointerEvent) => this.handlePointerMove(e);
-  private readonly onPointerUpBound = (e: PointerEvent) => this.handlePointerUp(e);
-  private readonly onDblClickBound = (e: MouseEvent) => this.handleDblClick(e);
-  private readonly onKeyDownBound = (e: KeyboardEvent) => this.handleKeyDown(e);
-  private readonly onPresetClickBound = (e: MouseEvent) => this.handlePresetClick(e);
+  private readonly abortController = new AbortController();
+  private disposed = false;
 
   constructor(el: HTMLElement, callbacks: WorkspaceSplitterCallbacks) {
     this.el = el;
@@ -49,6 +44,7 @@ export class WorkspaceSplitter {
     this.el.setAttribute('aria-valuemax', String(Math.round(MAX_SPLIT_RATIO * 100)));
     this.el.setAttribute('aria-valuenow', String(pct));
     this.el.tabIndex = 0;
+    this.el.classList.add('group');
     this.el.style.width = `${SPLITTER_WIDTH_PX}px`;
     this.el.style.touchAction = 'none';
 
@@ -65,7 +61,7 @@ export class WorkspaceSplitter {
     }).join('');
 
     this.el.innerHTML = `
-      <div class="relative w-full h-full flex items-center justify-center group select-none">
+      <div class="relative w-full h-full flex items-center justify-center select-none">
         <div
           aria-hidden="true"
           class="w-[3px] h-full rounded-full bg-slate-200 group-hover:bg-blue-400 group-focus-visible:bg-blue-500 transition-colors"
@@ -95,13 +91,31 @@ export class WorkspaceSplitter {
   }
 
   private bindEvents(): void {
-    this.el.addEventListener('pointerdown', this.onPointerDownBound);
-    this.el.addEventListener('pointermove', this.onPointerMoveBound);
-    this.el.addEventListener('pointerup', this.onPointerUpBound);
-    this.el.addEventListener('pointercancel', this.onPointerUpBound);
-    this.el.addEventListener('dblclick', this.onDblClickBound);
-    this.el.addEventListener('keydown', this.onKeyDownBound);
-    this.el.addEventListener('click', this.onPresetClickBound);
+    const {signal} = this.abortController;
+    this.el.addEventListener(
+      'pointerdown',
+      (e) => this.handlePointerDown(e),
+      {signal}
+    );
+    this.el.addEventListener(
+      'pointermove',
+      (e) => this.handlePointerMove(e),
+      {signal}
+    );
+    this.el.addEventListener(
+      'pointerup',
+      (e) => this.handlePointerUp(e),
+      {signal}
+    );
+    this.el.addEventListener(
+      'pointercancel',
+      (e) => this.handlePointerUp(e),
+      {signal}
+    );
+    this.el.addEventListener('dblclick', (e) => this.handleDblClick(e), {signal});
+    this.el.addEventListener('keydown', (e) => this.handleKeyDown(e), {signal});
+    this.el.addEventListener('click', (e) => this.handlePresetClick(e), {signal});
+    window.addEventListener('blur', () => this.cancelActiveDrag(), {signal});
   }
 
   public syncRatio(ratio: number): void {
@@ -160,6 +174,7 @@ export class WorkspaceSplitter {
   }
 
   private handlePointerDown(e: PointerEvent): void {
+    if (this.disposed || this.activePointerId !== null) return;
     const target = e.target as HTMLElement | null;
     if (target?.closest('[data-split-preset]')) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;
@@ -179,7 +194,7 @@ export class WorkspaceSplitter {
   }
 
   private handlePointerMove(e: PointerEvent): void {
-    if (this.activePointerId !== e.pointerId) return;
+    if (this.disposed || this.activePointerId !== e.pointerId) return;
     if (Math.abs(e.clientX - this.dragStartX) >= 2) {
       this.dragMoved = true;
     }
@@ -195,7 +210,7 @@ export class WorkspaceSplitter {
     if (!this.rafId) {
       this.rafId = requestAnimationFrame(() => {
         this.rafId = 0;
-        if (this.pendingRatio !== null) {
+        if (!this.disposed && this.pendingRatio !== null) {
           this.syncRatio(this.pendingRatio);
           this.callbacks.onRatioPreview(this.pendingRatio);
         }
@@ -203,42 +218,41 @@ export class WorkspaceSplitter {
     }
   }
 
-  private handlePointerUp(e: PointerEvent): void {
-    if (this.activePointerId !== e.pointerId) return;
-    this.activePointerId = null;
-    this.el.releasePointerCapture?.(e.pointerId);
-    document.body.style.userSelect = this.prevBodyUserSelect;
-    document.body.style.cursor = this.prevBodyCursor;
-    this.percentageBadgeEl?.classList.add('hidden');
-
+  private cancelActiveDrag(): void {
     if (this.rafId) {
       cancelAnimationFrame(this.rafId);
       this.rafId = 0;
     }
-
-    if (this.dragMoved && this.pendingRatio !== null) {
-      this.callbacks.onRatioCommit(this.pendingRatio);
-      this.syncRatio(this.callbacks.getRatio());
+    if (this.activePointerId !== null) {
+      const pid = this.activePointerId;
+      this.activePointerId = null;
+      try {
+        this.el.releasePointerCapture?.(pid);
+      } catch {
+        // Ignore if pointer capture is already released
+      }
+      document.body.style.userSelect = this.prevBodyUserSelect;
+      document.body.style.cursor = this.prevBodyCursor;
     }
+    this.percentageBadgeEl?.classList.add('hidden');
     this.pendingRatio = null;
   }
 
+  private handlePointerUp(e: PointerEvent): void {
+    if (this.activePointerId !== e.pointerId) return;
+    const commitRatio =
+      this.dragMoved && this.pendingRatio !== null ? this.pendingRatio : null;
+    this.cancelActiveDrag();
+
+    if (commitRatio !== null && !this.disposed) {
+      this.callbacks.onRatioCommit(commitRatio);
+      this.syncRatio(this.callbacks.getRatio());
+    }
+  }
+
   public dispose(): void {
-    if (this.rafId) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = 0;
-    }
-    this.el.removeEventListener('pointerdown', this.onPointerDownBound);
-    this.el.removeEventListener('pointermove', this.onPointerMoveBound);
-    this.el.removeEventListener('pointerup', this.onPointerUpBound);
-    this.el.removeEventListener('pointercancel', this.onPointerUpBound);
-    this.el.removeEventListener('dblclick', this.onDblClickBound);
-    this.el.removeEventListener('keydown', this.onKeyDownBound);
-    this.el.removeEventListener('click', this.onPresetClickBound);
-    if (this.activePointerId !== null) {
-      document.body.style.userSelect = this.prevBodyUserSelect;
-      document.body.style.cursor = this.prevBodyCursor;
-      this.activePointerId = null;
-    }
+    this.disposed = true;
+    this.cancelActiveDrag();
+    this.abortController.abort();
   }
 }

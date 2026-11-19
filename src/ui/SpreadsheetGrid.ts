@@ -108,11 +108,16 @@ export class SpreadsheetGrid {
   private lastStructureKey = '';
   private lastColumnViewRef: ColumnViewState | null = null;
   private scrollRafId = 0;
+  private focusRafId = 0;
   private resizeObserver: ResizeObserver | null = null;
+  private readonly abortController = new AbortController();
+  private modalAbortController: AbortController | null = null;
+  private disposed = false;
 
   // Live column drag-resize state
   private resizeDrag: {
     pointerId: number;
+    captureEl: Element | null;
     colIdx: number;
     startX: number;
     startWidth: number;
@@ -138,6 +143,8 @@ export class SpreadsheetGrid {
     this.handleColumnResizeMove(e);
   private readonly onWindowPointerUpResizeBound = (e: PointerEvent) =>
     this.handleColumnResizeEnd(e);
+  private readonly onWindowBlurResizeBound = () =>
+    this.cancelColumnResizeDrag();
 
   constructor(container: HTMLElement, callbacks: SpreadsheetCallbacks) {
     this.container = container;
@@ -264,39 +271,50 @@ export class SpreadsheetGrid {
       });
     }
 
+    const {signal} = this.abortController;
     const addRowBtn = this.container.querySelector('[data-action="add-row"]');
     const addColBtn = this.container.querySelector('[data-action="add-col"]');
-    addRowBtn?.addEventListener('click', () => this.callbacks.onAddRow());
-    addColBtn?.addEventListener('click', () => this.callbacks.onAddColumn());
-    this.longTextTriggerBtn?.addEventListener('click', () =>
-      this.openLongTextModal()
+    addRowBtn?.addEventListener('click', () => this.callbacks.onAddRow(), {signal});
+    addColBtn?.addEventListener('click', () => this.callbacks.onAddColumn(), {signal});
+    this.longTextTriggerBtn?.addEventListener(
+      'click',
+      () => this.openLongTextModal(),
+      {signal}
     );
 
     if (this.formulaInputEl) {
-      this.formulaInputEl.addEventListener('keydown', (e) => {
-        if (!this.selectedCell) return;
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          this.commitFormulaBar();
-          this.moveSelection(1, 0);
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          this.syncFormulaBar();
-          this.formulaInputEl?.blur();
-        }
-      });
-      this.formulaInputEl.addEventListener('blur', () => {
-        if (this.selectedCell) {
-          this.commitFormulaBar();
-        }
-      });
+      this.formulaInputEl.addEventListener(
+        'keydown',
+        (e) => {
+          if (!this.selectedCell) return;
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            this.commitFormulaBar();
+            this.moveSelection(1, 0);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            this.syncFormulaBar();
+            this.formulaInputEl?.blur();
+          }
+        },
+        {signal}
+      );
+      this.formulaInputEl.addEventListener(
+        'blur',
+        () => {
+          if (this.selectedCell) {
+            this.commitFormulaBar();
+          }
+        },
+        {signal}
+      );
     }
 
     this.bindDelegatedTableEvents();
 
     if (this.tableContainerEl && typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => {
-        this.scheduleVirtualSync(false);
+        if (!this.disposed) this.scheduleVirtualSync(false);
       });
       this.resizeObserver.observe(this.tableContainerEl);
     }
@@ -305,195 +323,220 @@ export class SpreadsheetGrid {
   private bindDelegatedTableEvents(): void {
     const root = this.tableContainerEl;
     if (!root) return;
+    const {signal} = this.abortController;
 
     root.addEventListener(
       'scroll',
       () => {
         this.scheduleVirtualSync(false);
       },
-      {passive: true}
+      {passive: true, signal}
     );
 
-    root.addEventListener('pointerdown', (e) => {
-      const target = e.target as HTMLElement | null;
-      const resizeHandle = target?.closest<HTMLElement>('[data-col-resize]');
-      if (resizeHandle) {
-        this.startColumnResize(e, Number(resizeHandle.dataset.colResize));
-      }
-    });
-
-    root.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      if (target.closest('[data-col-resize]')) return;
-
-      const emptyAction = target.closest<HTMLElement>('[data-empty-action]');
-      if (emptyAction) {
-        if (emptyAction.dataset.emptyAction === 'add-row') {
-          this.callbacks.onAddRow();
-        } else if (emptyAction.dataset.emptyAction === 'clear-search') {
-          this.callbacks.onClearSearch();
+    root.addEventListener(
+      'pointerdown',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        const resizeHandle = target?.closest<HTMLElement>('[data-col-resize]');
+        if (resizeHandle) {
+          this.startColumnResize(
+            e,
+            Number(resizeHandle.dataset.colResize),
+            resizeHandle
+          );
         }
-        return;
-      }
+      },
+      {signal}
+    );
 
-      const pinBtn = target.closest<HTMLElement>('[data-pin-col]');
-      if (pinBtn) {
-        this.callbacks.onTogglePinColumn?.(Number(pinBtn.dataset.pinCol));
-        return;
-      }
+    root.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        if (target.closest('[data-col-resize]')) return;
 
-      const hideBtn = target.closest<HTMLElement>('[data-hide-col]');
-      if (hideBtn) {
-        this.callbacks.onToggleHideColumn?.(Number(hideBtn.dataset.hideCol));
-        return;
-      }
+        const emptyAction = target.closest<HTMLElement>('[data-empty-action]');
+        if (emptyAction) {
+          if (emptyAction.dataset.emptyAction === 'add-row') {
+            this.callbacks.onAddRow();
+          } else if (emptyAction.dataset.emptyAction === 'clear-search') {
+            this.callbacks.onClearSearch();
+          }
+          return;
+        }
 
-      const sortBtn = target.closest<HTMLElement>('[data-sort-col]');
-      if (sortBtn) {
-        this.callbacks.onSortColumn(Number(sortBtn.dataset.sortCol));
-        return;
-      }
+        const pinBtn = target.closest<HTMLElement>('[data-pin-col]');
+        if (pinBtn) {
+          this.callbacks.onTogglePinColumn?.(Number(pinBtn.dataset.pinCol));
+          return;
+        }
 
-      const delColBtn = target.closest<HTMLElement>('[data-delete-col]');
-      if (delColBtn) {
-        this.callbacks.onDeleteColumn(Number(delColBtn.dataset.deleteCol));
-        return;
-      }
+        const hideBtn = target.closest<HTMLElement>('[data-hide-col]');
+        if (hideBtn) {
+          this.callbacks.onToggleHideColumn?.(Number(hideBtn.dataset.hideCol));
+          return;
+        }
 
-      const delRowBtn = target.closest<HTMLElement>('[data-delete-row]');
-      if (delRowBtn) {
-        this.callbacks.onDeleteRow(Number(delRowBtn.dataset.deleteRow));
-        return;
-      }
+        const sortBtn = target.closest<HTMLElement>('[data-sort-col]');
+        if (sortBtn) {
+          this.callbacks.onSortColumn(Number(sortBtn.dataset.sortCol));
+          return;
+        }
 
-      const cellBtn = target.closest<HTMLElement>('[data-cell]');
-      if (cellBtn) {
-        const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
-        this.editingCell = null;
-        this.callbacks.onSelectCell({
-          rowIndex: Number(rStr),
-          colIndex: Number(cStr),
-        });
-      }
-    });
+        const delColBtn = target.closest<HTMLElement>('[data-delete-col]');
+        if (delColBtn) {
+          this.callbacks.onDeleteColumn(Number(delColBtn.dataset.deleteCol));
+          return;
+        }
 
-    root.addEventListener('dblclick', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
+        const delRowBtn = target.closest<HTMLElement>('[data-delete-row]');
+        if (delRowBtn) {
+          this.callbacks.onDeleteRow(Number(delRowBtn.dataset.deleteRow));
+          return;
+        }
 
-      const resizeHandle = target.closest<HTMLElement>('[data-col-resize]');
-      if (resizeHandle) {
-        e.preventDefault();
-        e.stopPropagation();
-        this.callbacks.onAutoFitColumn?.(Number(resizeHandle.dataset.colResize));
-        return;
-      }
-
-      const colTitleBtn = target.closest<HTMLElement>('[data-col-title]');
-      if (colTitleBtn) {
-        this.editingColumnIndex = Number(colTitleBtn.dataset.colTitle);
-        this.activeColRenameCommitted = false;
-        this.renderHeader(true);
-        const input = root.querySelector<HTMLInputElement>(
-          `[data-col-rename="${this.editingColumnIndex}"]`
-        );
-        input?.focus();
-        input?.select();
-        return;
-      }
-
-      const cellBtn = target.closest<HTMLElement>('[data-cell]');
-      if (cellBtn) {
-        const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
-        this.startEditing(Number(rStr), Number(cStr));
-      }
-    });
-
-    root.addEventListener('keydown', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-
-      if (target instanceof HTMLInputElement && target.dataset.cellInput) {
-        const [rStr, cStr] = target.dataset.cellInput.split(':');
-        const rowIndex = Number(rStr);
-        const colIndex = Number(cStr);
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          this.commitInlineCellInput(target, rowIndex, colIndex);
-          this.moveSelection(1, 0);
-        } else if (e.key === 'Tab') {
-          e.preventDefault();
-          this.commitInlineCellInput(target, rowIndex, colIndex);
-          this.moveSelection(0, e.shiftKey ? -1 : 1);
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          this.activeCellInputCommitted = true;
+        const cellBtn = target.closest<HTMLElement>('[data-cell]');
+        if (cellBtn) {
+          const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
           this.editingCell = null;
-          this.renderVirtualWindow(true);
-          this.focusCellButton(rowIndex, colIndex);
+          this.callbacks.onSelectCell({
+            rowIndex: Number(rStr),
+            colIndex: Number(cStr),
+          });
         }
-        return;
-      }
+      },
+      {signal}
+    );
 
-      if (target instanceof HTMLInputElement && target.dataset.colRename) {
-        const colIdx = Number(target.dataset.colRename);
-        if (e.key === 'Enter') {
+    root.addEventListener(
+      'dblclick',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+
+        const resizeHandle = target.closest<HTMLElement>('[data-col-resize]');
+        if (resizeHandle) {
           e.preventDefault();
-          this.commitColRenameInput(target, colIdx);
-        } else if (e.key === 'Escape') {
-          e.preventDefault();
-          this.activeColRenameCommitted = true;
-          this.editingColumnIndex = null;
+          e.stopPropagation();
+          this.callbacks.onAutoFitColumn?.(Number(resizeHandle.dataset.colResize));
+          return;
+        }
+
+        const colTitleBtn = target.closest<HTMLElement>('[data-col-title]');
+        if (colTitleBtn) {
+          this.editingColumnIndex = Number(colTitleBtn.dataset.colTitle);
+          this.activeColRenameCommitted = false;
           this.renderHeader(true);
+          const input = root.querySelector<HTMLInputElement>(
+            `[data-col-rename="${this.editingColumnIndex}"]`
+          );
+          input?.focus();
+          input?.select();
+          return;
         }
-        return;
-      }
 
-      const cellBtn = target.closest<HTMLElement>('[data-cell]');
-      if (cellBtn) {
-        const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
-        const rowIndex = Number(rStr);
-        const colIndex = Number(cStr);
-
-        if (e.key === 'Enter' || e.key === 'F2') {
-          e.preventDefault();
-          this.startEditing(rowIndex, colIndex);
-        } else if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          this.moveSelection(1, 0);
-        } else if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          this.moveSelection(-1, 0);
-        } else if (e.key === 'ArrowRight') {
-          e.preventDefault();
-          this.moveSelection(0, 1);
-        } else if (e.key === 'ArrowLeft') {
-          e.preventDefault();
-          this.moveSelection(0, -1);
-        } else if (
-          e.key.length === 1 &&
-          !e.ctrlKey &&
-          !e.metaKey &&
-          !e.altKey
-        ) {
-          e.preventDefault();
-          this.startEditing(rowIndex, colIndex, e.key);
+        const cellBtn = target.closest<HTMLElement>('[data-cell]');
+        if (cellBtn) {
+          const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
+          this.startEditing(Number(rStr), Number(cStr));
         }
-      }
-    });
+      },
+      {signal}
+    );
 
-    root.addEventListener('focusout', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!(target instanceof HTMLInputElement)) return;
+    root.addEventListener(
+      'keydown',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
 
-      if (target.dataset.cellInput && !this.activeCellInputCommitted) {
-        const [rStr, cStr] = target.dataset.cellInput.split(':');
-        this.commitInlineCellInput(target, Number(rStr), Number(cStr));
-      } else if (target.dataset.colRename && !this.activeColRenameCommitted) {
-        this.commitColRenameInput(target, Number(target.dataset.colRename));
-      }
-    });
+        if (target instanceof HTMLInputElement && target.dataset.cellInput) {
+          const [rStr, cStr] = target.dataset.cellInput.split(':');
+          const rowIndex = Number(rStr);
+          const colIndex = Number(cStr);
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            this.commitInlineCellInput(target, rowIndex, colIndex);
+            this.moveSelection(1, 0);
+          } else if (e.key === 'Tab') {
+            e.preventDefault();
+            this.commitInlineCellInput(target, rowIndex, colIndex);
+            this.moveSelection(0, e.shiftKey ? -1 : 1);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            this.activeCellInputCommitted = true;
+            this.editingCell = null;
+            this.renderVirtualWindow(true);
+            this.focusCellButton(rowIndex, colIndex);
+          }
+          return;
+        }
+
+        if (target instanceof HTMLInputElement && target.dataset.colRename) {
+          const colIdx = Number(target.dataset.colRename);
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            this.commitColRenameInput(target, colIdx);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            this.activeColRenameCommitted = true;
+            this.editingColumnIndex = null;
+            this.renderHeader(true);
+          }
+          return;
+        }
+
+        const cellBtn = target.closest<HTMLElement>('[data-cell]');
+        if (cellBtn) {
+          const [rStr, cStr] = (cellBtn.dataset.cell ?? '').split(':');
+          const rowIndex = Number(rStr);
+          const colIndex = Number(cStr);
+
+          if (e.key === 'Enter' || e.key === 'F2') {
+            e.preventDefault();
+            this.startEditing(rowIndex, colIndex);
+          } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            this.moveSelection(1, 0);
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            this.moveSelection(-1, 0);
+          } else if (e.key === 'ArrowRight') {
+            e.preventDefault();
+            this.moveSelection(0, 1);
+          } else if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            this.moveSelection(0, -1);
+          } else if (
+            e.key.length === 1 &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            !e.altKey
+          ) {
+            e.preventDefault();
+            this.startEditing(rowIndex, colIndex, e.key);
+          }
+        }
+      },
+      {signal}
+    );
+
+    root.addEventListener(
+      'focusout',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!(target instanceof HTMLInputElement)) return;
+
+        if (target.dataset.cellInput && !this.activeCellInputCommitted) {
+          const [rStr, cStr] = target.dataset.cellInput.split(':');
+          this.commitInlineCellInput(target, Number(rStr), Number(cStr));
+        } else if (target.dataset.colRename && !this.activeColRenameCommitted) {
+          this.commitColRenameInput(target, Number(target.dataset.colRename));
+        }
+      },
+      {signal}
+    );
   }
 
   private commitInlineCellInput(
@@ -571,12 +614,23 @@ export class SpreadsheetGrid {
 
     if (sheetChanged || sortChanged) {
       this.editingCell = null;
-    } else if (
-      this.editingCell &&
-      (this.editingCell.rowIndex >= params.sheet.rows.length ||
-        this.editingCell.colIndex >= params.sheet.columns.length)
-    ) {
-      this.editingCell = null;
+      this.editingColumnIndex = null;
+    } else {
+      if (
+        this.editingCell &&
+        (this.editingCell.rowIndex >= params.sheet.rows.length ||
+          this.editingCell.colIndex >= params.sheet.columns.length ||
+          nextView.hidden.includes(this.editingCell.colIndex))
+      ) {
+        this.editingCell = null;
+      }
+      if (
+        this.editingColumnIndex !== null &&
+        (this.editingColumnIndex >= params.sheet.columns.length ||
+          nextView.hidden.includes(this.editingColumnIndex))
+      ) {
+        this.editingColumnIndex = null;
+      }
     }
 
     if (sheetChanged || visibleChanged) {
@@ -630,6 +684,20 @@ export class SpreadsheetGrid {
     if (columnView === this.lastColumnViewRef) return;
     this.columnView = columnView;
     this.lastColumnViewRef = columnView;
+    if (
+      this.editingCell &&
+      (this.editingCell.colIndex >= this.sheet.columns.length ||
+        columnView.hidden.includes(this.editingCell.colIndex))
+    ) {
+      this.editingCell = null;
+    }
+    if (
+      this.editingColumnIndex !== null &&
+      (this.editingColumnIndex >= this.sheet.columns.length ||
+        columnView.hidden.includes(this.editingColumnIndex))
+    ) {
+      this.editingColumnIndex = null;
+    }
     this.computeColumnWidths();
     this.columnManager?.update({
       sheet: this.sheet,
@@ -761,7 +829,10 @@ export class SpreadsheetGrid {
           const selectedRing = isSelected
             ? `ring-2 ring-inset ring-blue-500 ${isPinned ? '' : 'bg-blue-50/40'}`
             : '';
-          td.className = `${stickyCls} ${pinnedBg} border-b border-r border-slate-200 p-0 ${selectedRing}`.trim();
+          const rightBorderCls = isLastPinned
+            ? ''
+            : 'border-r border-slate-200';
+          td.className = `${stickyCls} ${pinnedBg} border-b ${rightBorderCls} p-0 ${selectedRing}`.trim();
           if (isSelected) td.setAttribute('data-selected', '1');
           else td.removeAttribute('data-selected');
           td.innerHTML = `<button type="button" data-cell="${rowIndex}:${colIndex}" aria-label="Cell ${columnIndexToLetter(colIndex)}${rowIndex + 1}" class="w-full h-full px-2 text-sm text-slate-800 hover:bg-slate-100/70 focus:outline-none truncate block cursor-cell ${alignClass}">${escapeHtml(truncateDisplayText(val))}</button>`;
@@ -837,10 +908,12 @@ export class SpreadsheetGrid {
   }
 
   private scheduleVirtualSync(force: boolean): void {
-    if (this.scrollRafId) return;
+    if (this.disposed || this.scrollRafId) return;
     this.scrollRafId = requestAnimationFrame(() => {
       this.scrollRafId = 0;
-      this.renderVirtualWindow(force);
+      if (!this.disposed) {
+        this.renderVirtualWindow(force);
+      }
     });
   }
 
@@ -954,8 +1027,19 @@ export class SpreadsheetGrid {
     this.longTextTriggerBtn.classList.toggle('inline-flex', visible);
   }
 
+  private closeLongTextModal(): void {
+    this.modalAbortController?.abort();
+    this.modalAbortController = null;
+    if (!this.longTextModalEl) return;
+    this.longTextModalEl.classList.add('hidden');
+    this.longTextModalEl.classList.remove('flex');
+    this.longTextModalEl.innerHTML = '';
+  }
+
   private openLongTextModal(): void {
     if (!this.longTextModalEl || !this.sheet || !this.selectedCell) return;
+    this.closeLongTextModal();
+
     const {rowIndex, colIndex} = this.selectedCell;
     const val = this.sheet.rows[rowIndex]?.[colIndex] ?? '';
     const colName = this.sheet.columns[colIndex] ?? '';
@@ -1012,45 +1096,49 @@ export class SpreadsheetGrid {
     );
     area?.focus();
 
-    const closeModal = () => {
-      if (!this.longTextModalEl) return;
-      this.longTextModalEl.classList.add('hidden');
-      this.longTextModalEl.classList.remove('flex');
-      this.longTextModalEl.innerHTML = '';
-      window.removeEventListener('keydown', onModalKey);
-    };
+    const modalController = new AbortController();
+    this.modalAbortController = modalController;
 
-    const onModalKey = (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') {
-        ev.preventDefault();
-        closeModal();
-      } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' && area) {
-        ev.preventDefault();
-        this.callbacks.onCellCommit(rowIndex, colIndex, area.value);
-        closeModal();
-      }
-    };
-    window.addEventListener('keydown', onModalKey);
+    window.addEventListener(
+      'keydown',
+      (ev: KeyboardEvent) => {
+        if (ev.key === 'Escape') {
+          ev.preventDefault();
+          this.closeLongTextModal();
+        } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter' && area) {
+          ev.preventDefault();
+          const savedVal = area.value;
+          this.closeLongTextModal();
+          this.callbacks.onCellCommit(rowIndex, colIndex, savedVal);
+        }
+      },
+      {signal: modalController.signal}
+    );
 
-    this.longTextModalEl.onclick = (ev) => {
-      const t = ev.target as HTMLElement | null;
-      if (!t) return;
-      if (t === this.longTextModalEl || t.closest('[data-lt-close]')) {
-        closeModal();
-        return;
-      }
-      if (t.closest('[data-lt-copy]') && area) {
-        void navigator.clipboard?.writeText(area.value).catch(() => {});
-        const copyBtn = t.closest<HTMLElement>('[data-lt-copy]');
-        const span = copyBtn?.querySelector('span');
-        if (span) span.textContent = 'Copied';
-        return;
-      }
-      if (t.closest('[data-lt-save]') && area) {
-        this.callbacks.onCellCommit(rowIndex, colIndex, area.value);
-        closeModal();
-      }
-    };
+    this.longTextModalEl.addEventListener(
+      'click',
+      (ev: MouseEvent) => {
+        const t = ev.target as HTMLElement | null;
+        if (!t) return;
+        if (t === this.longTextModalEl || t.closest('[data-lt-close]')) {
+          this.closeLongTextModal();
+          return;
+        }
+        if (t.closest('[data-lt-copy]') && area) {
+          void navigator.clipboard?.writeText(area.value).catch(() => {});
+          const copyBtn = t.closest<HTMLElement>('[data-lt-copy]');
+          const span = copyBtn?.querySelector('span');
+          if (span) span.textContent = 'Copied';
+          return;
+        }
+        if (t.closest('[data-lt-save]') && area) {
+          const savedVal = area.value;
+          this.closeLongTextModal();
+          this.callbacks.onCellCommit(rowIndex, colIndex, savedVal);
+        }
+      },
+      {signal: modalController.signal}
+    );
   }
 
   private renderStatsStrip(): void {
@@ -1292,7 +1380,15 @@ export class SpreadsheetGrid {
   }
 
   private renderVirtualWindow(force: boolean): void {
-    if (!this.sheet || !this.tableEl || !this.tbodyEl) return;
+    if (!this.sheet || !this.tableEl || !this.tbodyEl || this.disposed) return;
+
+    if (this.tableContainerEl) {
+      const vpW = this.tableContainerEl.clientWidth || 720;
+      const maxLeft = Math.max(0, ROW_NUM_COL_WIDTH + this.totalColsWidth - vpW);
+      if (this.tableContainerEl.scrollLeft > maxLeft) {
+        this.tableContainerEl.scrollLeft = maxLeft;
+      }
+    }
 
     const {rowRange, colPlan, colRange} = this.computeCurrentRanges();
 
@@ -1593,9 +1689,10 @@ export class SpreadsheetGrid {
             : 'bg-white'
       : '';
 
+    const rightBorderCls = isLastPinned ? '' : 'border-r border-slate-200';
     if (isEditing) {
       return `
-        <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} border-b border-r border-slate-200 p-0 bg-white ring-2 ring-inset ring-blue-600" style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
+        <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} border-b ${rightBorderCls} p-0 bg-white ring-2 ring-inset ring-blue-600" style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
           <input
             type="text"
             data-cell-input="${rowIdx}:${colIdx}"
@@ -1612,7 +1709,7 @@ export class SpreadsheetGrid {
       : '';
     const displayVal = truncateDisplayText(val);
     return `
-      <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} ${opaqueStickyBg} border-b border-r border-slate-200 p-0 ${selectedRing}" ${isSelected ? 'data-selected="1"' : ''} style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
+      <td ${isPinned ? `data-sticky-col="${colIdx}"` : ''} class="${stickyCls} ${opaqueStickyBg} border-b ${rightBorderCls} p-0 ${selectedRing}" ${isSelected ? 'data-selected="1"' : ''} style="${stickyStyle}height:${GRID_ROW_HEIGHT}px">
         <button
           type="button"
           data-cell="${rowIdx}:${colIdx}"
@@ -1743,8 +1840,15 @@ export class SpreadsheetGrid {
     }
   }
 
-  private startColumnResize(e: PointerEvent, colIdx: number): void {
+  private startColumnResize(
+    e: PointerEvent,
+    colIdx: number,
+    captureEl?: Element | null
+  ): void {
     if (e.button !== 0 && e.pointerType === 'mouse') return;
+    if (this.resizeDrag) {
+      this.cancelColumnResizeDrag();
+    }
     e.preventDefault();
     e.stopPropagation();
 
@@ -1753,9 +1857,11 @@ export class SpreadsheetGrid {
     const prevCursor = document.body.style.cursor;
     document.body.style.userSelect = 'none';
     document.body.style.cursor = 'col-resize';
+    captureEl?.setPointerCapture?.(e.pointerId);
 
     this.resizeDrag = {
       pointerId: e.pointerId,
+      captureEl: captureEl ?? null,
       colIdx,
       startX: e.clientX,
       startWidth,
@@ -1769,6 +1875,7 @@ export class SpreadsheetGrid {
     window.addEventListener('pointermove', this.onWindowPointerMoveResizeBound);
     window.addEventListener('pointerup', this.onWindowPointerUpResizeBound);
     window.addEventListener('pointercancel', this.onWindowPointerUpResizeBound);
+    window.addEventListener('blur', this.onWindowBlurResizeBound);
   }
 
   private handleColumnResizeMove(e: PointerEvent): void {
@@ -1780,7 +1887,7 @@ export class SpreadsheetGrid {
 
     if (!this.resizeDrag.rafId) {
       this.resizeDrag.rafId = requestAnimationFrame(() => {
-        if (!this.resizeDrag) return;
+        if (!this.resizeDrag || this.disposed) return;
         this.resizeDrag.rafId = 0;
         this.applyLiveColumnWidth(
           this.resizeDrag.colIdx,
@@ -1790,20 +1897,33 @@ export class SpreadsheetGrid {
     }
   }
 
-  private handleColumnResizeEnd(e: PointerEvent): void {
-    if (!this.resizeDrag || this.resizeDrag.pointerId !== e.pointerId) return;
-    const {colIdx, currentWidth, rafId, prevUserSelect, prevCursor} =
+  private cancelColumnResizeDrag(): void {
+    if (!this.resizeDrag) return;
+    const {pointerId, captureEl, rafId, prevUserSelect, prevCursor} =
       this.resizeDrag;
     if (rafId) cancelAnimationFrame(rafId);
     this.resizeDrag = null;
 
+    try {
+      captureEl?.releasePointerCapture?.(pointerId);
+    } catch {
+      // Ignore if pointer capture is already released
+    }
+
     window.removeEventListener('pointermove', this.onWindowPointerMoveResizeBound);
     window.removeEventListener('pointerup', this.onWindowPointerUpResizeBound);
     window.removeEventListener('pointercancel', this.onWindowPointerUpResizeBound);
+    window.removeEventListener('blur', this.onWindowBlurResizeBound);
 
     document.body.style.userSelect = prevUserSelect;
     document.body.style.cursor = prevCursor;
     this.resizeBadgeEl?.classList.add('hidden');
+  }
+
+  private handleColumnResizeEnd(e: PointerEvent): void {
+    if (!this.resizeDrag || this.resizeDrag.pointerId !== e.pointerId) return;
+    const {colIdx, currentWidth} = this.resizeDrag;
+    this.cancelColumnResizeDrag();
 
     this.applyLiveColumnWidth(colIdx, currentWidth);
     this.callbacks.onResizeColumn?.(colIdx, currentWidth);
@@ -1812,6 +1932,19 @@ export class SpreadsheetGrid {
   private applyLiveColumnWidth(colIdx: number, nextWidth: number): void {
     this.colWidths[colIdx] = nextWidth;
     this.recomputeTotalVisibleWidth();
+
+    const prevPinnedLen = this.lastColPlan?.pinnedCols.length ?? 0;
+    const prevDowngraded = this.lastColPlan?.downgradedPinCount ?? 0;
+    const plan = this.getActiveColumnPlan();
+
+    if (
+      plan.pinnedCols.length !== prevPinnedLen ||
+      plan.downgradedPinCount !== prevDowngraded
+    ) {
+      this.renderTableStructureAndWindow(true);
+      this.renderStatsStrip();
+      return;
+    }
 
     if (this.tableEl) {
       this.tableEl.style.width = `${ROW_NUM_COL_WIDTH + this.totalColsWidth}px`;
@@ -1824,7 +1957,6 @@ export class SpreadsheetGrid {
     }
 
     // Recompute sticky left offsets cleanly if a pinned column changed width
-    const plan = this.getActiveColumnPlan();
     this.lastColPlan = plan;
     for (const pinnedCol of plan.pinnedCols) {
       const leftPx = `${plan.pinnedLeftOffsets[pinnedCol]}px`;
@@ -1926,7 +2058,13 @@ export class SpreadsheetGrid {
   }
 
   private focusCellButton(rowIndex: number, colIndex: number): void {
-    requestAnimationFrame(() => {
+    if (this.disposed) return;
+    if (this.focusRafId) {
+      cancelAnimationFrame(this.focusRafId);
+    }
+    this.focusRafId = requestAnimationFrame(() => {
+      this.focusRafId = 0;
+      if (this.disposed) return;
       const btn = this.tableContainerEl?.querySelector<HTMLButtonElement>(
         `[data-cell="${rowIndex}:${colIndex}"]`
       );
@@ -1935,25 +2073,18 @@ export class SpreadsheetGrid {
   }
 
   public dispose(): void {
+    this.disposed = true;
+    this.abortController.abort();
+    this.closeLongTextModal();
     if (this.scrollRafId) {
       cancelAnimationFrame(this.scrollRafId);
       this.scrollRafId = 0;
     }
-    if (this.resizeDrag) {
-      if (this.resizeDrag.rafId) cancelAnimationFrame(this.resizeDrag.rafId);
-      document.body.style.userSelect = this.resizeDrag.prevUserSelect;
-      document.body.style.cursor = this.resizeDrag.prevCursor;
-      window.removeEventListener(
-        'pointermove',
-        this.onWindowPointerMoveResizeBound
-      );
-      window.removeEventListener('pointerup', this.onWindowPointerUpResizeBound);
-      window.removeEventListener(
-        'pointercancel',
-        this.onWindowPointerUpResizeBound
-      );
-      this.resizeDrag = null;
+    if (this.focusRafId) {
+      cancelAnimationFrame(this.focusRafId);
+      this.focusRafId = 0;
     }
+    this.cancelColumnResizeDrag();
     this.columnManager?.dispose();
     this.columnManager = null;
     this.resizeObserver?.disconnect();

@@ -263,6 +263,7 @@ export class ChartSeriesManager {
   private yColIndices: number[] = [];
   private chartType: ChartType = 'bar';
 
+  private readonly abortController = new AbortController();
   private readonly onDocMouseDownBound = (e: MouseEvent) => this.handleDocClick(e);
   private readonly onDocKeyDownBound = (e: KeyboardEvent) => this.handleDocKey(e);
 
@@ -298,14 +299,19 @@ export class ChartSeriesManager {
       '[data-role="series-manager-popover"]'
     )!;
 
-    this.triggerBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.toggle();
-    });
+    const {signal} = this.abortController;
+    this.triggerBtn.addEventListener(
+      'click',
+      (e) => {
+        e.stopPropagation();
+        this.toggle();
+      },
+      {signal}
+    );
 
     this.bindPopoverEvents();
-    document.addEventListener('mousedown', this.onDocMouseDownBound);
-    document.addEventListener('keydown', this.onDocKeyDownBound);
+    document.addEventListener('mousedown', this.onDocMouseDownBound, {signal});
+    document.addEventListener('keydown', this.onDocKeyDownBound, {signal});
   }
 
   public update(params: {
@@ -543,63 +549,76 @@ export class ChartSeriesManager {
   }
 
   private bindPopoverEvents(): void {
-    this.popoverEl.addEventListener('input', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (
-        target instanceof HTMLInputElement &&
-        target.dataset.role === 'series-search'
-      ) {
-        this.searchQuery = target.value;
-        this.renderPopoverBody();
-      }
-    });
+    const {signal} = this.abortController;
+    this.popoverEl.addEventListener(
+      'input',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (
+          target instanceof HTMLInputElement &&
+          target.dataset.role === 'series-search'
+        ) {
+          this.searchQuery = target.value;
+          this.renderPopoverBody();
+        }
+      },
+      {signal}
+    );
 
-    this.popoverEl.addEventListener('change', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!(target instanceof HTMLInputElement)) return;
+    this.popoverEl.addEventListener(
+      'change',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!(target instanceof HTMLInputElement)) return;
 
-      if (target.dataset.role === 'series-selected-only') {
-        this.selectedOnly = target.checked;
-        this.renderPopoverBody();
-        return;
-      }
-
-      if (target.dataset.seriesCol !== undefined) {
-        const colIdx = Number(target.dataset.seriesCol);
-        const exists = this.yColIndices.includes(colIdx);
-        let nextY: number[];
-        if (target.checked && !exists) {
-          nextY = [...this.yColIndices, colIdx];
-        } else if (!target.checked && exists) {
-          nextY = this.yColIndices.filter((c) => c !== colIdx);
-        } else {
+        if (target.dataset.role === 'series-selected-only') {
+          this.selectedOnly = target.checked;
+          this.renderPopoverBody();
           return;
         }
-        this.yColIndices = nextY;
-        this.callbacks.onChangeSeries(nextY);
-        this.syncTriggerLabel();
-        this.renderPopoverBody();
-      }
-    });
 
-    this.popoverEl.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const target = e.target as HTMLElement | null;
-      const presetBtn = target?.closest<HTMLButtonElement>('[data-series-preset]');
-      if (presetBtn && this.sheet) {
-        const preset = presetBtn.dataset.seriesPreset as SeriesPreset;
-        const nextY = applySeriesPreset(
-          preset,
-          this.sheet,
-          this.profile,
-          this.xColIndex
-        );
-        this.yColIndices = nextY;
-        this.callbacks.onChangeSeries(nextY);
-        this.syncTriggerLabel();
-        this.renderPopoverBody();
-      }
-    });
+        if (target.dataset.seriesCol !== undefined) {
+          const colIdx = Number(target.dataset.seriesCol);
+          const exists = this.yColIndices.includes(colIdx);
+          let nextY: number[];
+          if (target.checked && !exists) {
+            nextY = [...this.yColIndices, colIdx];
+          } else if (!target.checked && exists) {
+            nextY = this.yColIndices.filter((c) => c !== colIdx);
+          } else {
+            return;
+          }
+          this.yColIndices = nextY;
+          this.callbacks.onChangeSeries(nextY);
+          this.syncTriggerLabel();
+          this.renderPopoverBody();
+        }
+      },
+      {signal}
+    );
+
+    this.popoverEl.addEventListener(
+      'click',
+      (e) => {
+        e.stopPropagation();
+        const target = e.target as HTMLElement | null;
+        const presetBtn = target?.closest<HTMLButtonElement>('[data-series-preset]');
+        if (presetBtn && this.sheet) {
+          const preset = presetBtn.dataset.seriesPreset as SeriesPreset;
+          const nextY = applySeriesPreset(
+            preset,
+            this.sheet,
+            this.profile,
+            this.xColIndex
+          );
+          this.yColIndices = nextY;
+          this.callbacks.onChangeSeries(nextY);
+          this.syncTriggerLabel();
+          this.renderPopoverBody();
+        }
+      },
+      {signal}
+    );
   }
 
   private handleDocClick(e: MouseEvent): void {
@@ -619,7 +638,7 @@ export class ChartSeriesManager {
   }
 
   public dispose(): void {
-    document.removeEventListener('mousedown', this.onDocMouseDownBound);
-    document.removeEventListener('keydown', this.onDocKeyDownBound);
+    this.toggle(false);
+    this.abortController.abort();
   }
 }

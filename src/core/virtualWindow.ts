@@ -85,10 +85,12 @@ export function computeColumnVirtualWindow(
     prefix[i + 1] = prefix[i] + (colWidths[i] ?? 150);
   }
   const totalWidth = prefix[totalCols];
-  const visibleLeft = Math.max(0, scrollLeft);
-  const visibleRight = visibleLeft + Math.max(200, viewportWidth - fixedLeftWidth);
+  const usableViewportWidth = Math.max(200, viewportWidth - fixedLeftWidth);
+  const maxScrollLeft = Math.max(0, totalWidth - usableViewportWidth);
+  const visibleLeft = Math.min(Math.max(0, scrollLeft), maxScrollLeft);
+  const visibleRight = visibleLeft + usableViewportWidth;
 
-  let start = 0;
+  let start = totalCols - 1;
   let lo = 0;
   let hi = totalCols - 1;
   while (lo <= hi) {
@@ -185,10 +187,12 @@ export function computePinnedColumnVirtualWindow(
   }
 
   const totalWidth = prefix[totalCols];
-  const visibleLeft = Math.max(0, scrollLeft);
-  const visibleRight = visibleLeft + Math.max(200, viewportWidth - fixedLeftWidth);
+  const usableViewportWidth = Math.max(200, viewportWidth - fixedLeftWidth);
+  const maxScrollLeft = Math.max(0, totalWidth - usableViewportWidth);
+  const visibleLeft = Math.min(Math.max(0, scrollLeft), maxScrollLeft);
+  const visibleRight = visibleLeft + usableViewportWidth;
 
-  let start = 0;
+  let start = totalCols - 1;
   let lo = 0;
   let hi = totalCols - 1;
   while (lo <= hi) {

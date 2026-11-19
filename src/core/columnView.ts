@@ -384,3 +384,93 @@ export function reconcileColumnViewOnDelete(
     nextTotalCols
   );
 }
+
+function insertRelativeToOriginal(
+  shiftedList: number[],
+  restoredColIndex: number,
+  prevList: number[],
+  deletedColIndex: number
+): number[] {
+  const result = shiftedList.filter((idx) => idx !== restoredColIndex);
+  const prevPos = prevList.indexOf(deletedColIndex);
+  if (prevPos >= 0) {
+    // Try nearest surviving right neighbor from previous list
+    for (let i = prevPos + 1; i < prevList.length; i++) {
+      const candidate = prevList[i];
+      if (candidate === deletedColIndex) continue;
+      const targetPos = result.indexOf(candidate);
+      if (targetPos >= 0) {
+        result.splice(targetPos, 0, restoredColIndex);
+        return result;
+      }
+    }
+    // Otherwise place immediately after nearest surviving left neighbor
+    for (let i = prevPos - 1; i >= 0; i--) {
+      const candidate = prevList[i];
+      if (candidate === deletedColIndex) continue;
+      const targetPos = result.indexOf(candidate);
+      if (targetPos >= 0) {
+        result.splice(targetPos + 1, 0, restoredColIndex);
+        return result;
+      }
+    }
+  }
+  result.push(restoredColIndex);
+  return result;
+}
+
+export function reconcileColumnViewOnUndoDelete(
+  currentView: ColumnViewState,
+  deletedSourceColIndex: number,
+  prevViewBeforeDelete: ColumnViewState,
+  restoredTotalCols: number
+): ColumnViewState {
+  const shiftUp = (idx: number): number =>
+    idx >= deletedSourceColIndex ? idx + 1 : idx;
+
+  const shiftedOrder = currentView.order.map(shiftUp);
+  const shiftedHidden = currentView.hidden.map(shiftUp);
+  const shiftedPinned = currentView.pinned.map(shiftUp);
+
+  const shiftedWidths: Record<number, number> = {};
+  for (const [k, w] of Object.entries(currentView.widths)) {
+    const colIdx = Number(k);
+    if (!Number.isInteger(colIdx) || colIdx < 0) continue;
+    shiftedWidths[shiftUp(colIdx)] = w;
+  }
+
+  const nextOrder = insertRelativeToOriginal(
+    shiftedOrder,
+    deletedSourceColIndex,
+    prevViewBeforeDelete.order,
+    deletedSourceColIndex
+  );
+
+  const nextHidden = prevViewBeforeDelete.hidden.includes(deletedSourceColIndex)
+    ? [...shiftedHidden, deletedSourceColIndex]
+    : shiftedHidden;
+
+  const nextPinned = prevViewBeforeDelete.pinned.includes(deletedSourceColIndex)
+    ? insertRelativeToOriginal(
+        shiftedPinned,
+        deletedSourceColIndex,
+        prevViewBeforeDelete.pinned,
+        deletedSourceColIndex
+      )
+    : shiftedPinned;
+
+  const restoredWidth = prevViewBeforeDelete.widths[deletedSourceColIndex];
+  if (typeof restoredWidth === 'number' && Number.isFinite(restoredWidth)) {
+    shiftedWidths[deletedSourceColIndex] = restoredWidth;
+  }
+
+  return normalizeColumnViewState(
+    {
+      order: nextOrder,
+      hidden: nextHidden,
+      pinned: nextPinned,
+      widths: shiftedWidths,
+    },
+    restoredTotalCols
+  );
+}

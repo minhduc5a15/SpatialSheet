@@ -76,6 +76,7 @@ export class SpatialInspectorOverlay {
   private derived: DerivedSpatialDataset | null = null;
   private recommendations: ChartRecommendation[] = [];
   private selectedItem: SpatialDataItem | null = null;
+  private readonly abortController = new AbortController();
 
   constructor(
     hostEl: HTMLElement,
@@ -130,167 +131,192 @@ export class SpatialInspectorOverlay {
   }
 
   private bindEvents(): void {
-    this.topBarEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
+    const {signal} = this.abortController;
+    this.topBarEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
 
-      const modeBtn = target.closest<HTMLButtonElement>('[data-spatial-mode]');
-      if (modeBtn) {
-        this.callbacks.onModeChange(
-          modeBtn.dataset.spatialMode as SpatialChartMode
-        );
-        return;
-      }
+        const modeBtn = target.closest<HTMLButtonElement>('[data-spatial-mode]');
+        if (modeBtn) {
+          this.callbacks.onModeChange(
+            modeBtn.dataset.spatialMode as SpatialChartMode
+          );
+          return;
+        }
 
-      if (target.closest('[data-action="toggle-spatial-config"]')) {
-        this.isConfigOpen = !this.isConfigOpen;
-        if (this.isConfigOpen) this.isRecsOpen = false;
-        this.renderTopBar();
-        this.renderDrawers();
-        return;
-      }
+        if (target.closest('[data-action="toggle-spatial-config"]')) {
+          this.isConfigOpen = !this.isConfigOpen;
+          if (this.isConfigOpen) this.isRecsOpen = false;
+          this.renderTopBar();
+          this.renderDrawers();
+          return;
+        }
 
-      if (target.closest('[data-action="toggle-spatial-recs"]')) {
-        this.isRecsOpen = !this.isRecsOpen;
-        if (this.isRecsOpen) this.isConfigOpen = false;
-        this.renderTopBar();
-        this.renderDrawers();
-        return;
-      }
+        if (target.closest('[data-action="toggle-spatial-recs"]')) {
+          this.isRecsOpen = !this.isRecsOpen;
+          if (this.isRecsOpen) this.isConfigOpen = false;
+          this.renderTopBar();
+          this.renderDrawers();
+          return;
+        }
 
-      if (target.closest('[data-action="reset-spatial-camera"]')) {
-        this.callbacks.onResetCamera();
-        return;
-      }
+        if (target.closest('[data-action="reset-spatial-camera"]')) {
+          this.callbacks.onResetCamera();
+          return;
+        }
 
-      if (target.closest('[data-action="toggle-spatial-env"]')) {
-        const nextEnv: SpatialEnvironmentMode =
-          this.config?.environmentMode === 'studio' ? 'clean' : 'studio';
-        this.callbacks.onConfigChange({environmentMode: nextEnv});
-      }
-    });
+        if (target.closest('[data-action="toggle-spatial-env"]')) {
+          const nextEnv: SpatialEnvironmentMode =
+            this.config?.environmentMode === 'studio' ? 'clean' : 'studio';
+          this.callbacks.onConfigChange({environmentMode: nextEnv});
+        }
+      },
+      {signal}
+    );
 
-    this.recsPopoverEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      if (target.closest('[data-action="close-recs"]')) {
-        this.isRecsOpen = false;
-        this.renderTopBar();
-        this.renderDrawers();
-        return;
-      }
-      const applyBtn = target.closest<HTMLButtonElement>('[data-apply-rec-id]');
-      if (applyBtn) {
-        const rec = this.recommendations.find(
-          (r) => r.id === applyBtn.dataset.applyRecId
-        );
-        if (rec) {
+    this.recsPopoverEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        if (target.closest('[data-action="close-recs"]')) {
           this.isRecsOpen = false;
           this.renderTopBar();
-          this.callbacks.onApplyRecommendation(rec);
+          this.renderDrawers();
+          return;
         }
-      }
-    });
-
-    this.validationOverlayEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (target?.closest('[data-action="switch-to-bar3d"]')) {
-        this.callbacks.onModeChange('bar3d');
-      } else if (target?.closest('[data-action="open-config-from-err"]')) {
-        this.isConfigOpen = true;
-        this.isRecsOpen = false;
-        this.renderTopBar();
-        this.renderDrawers();
-      }
-    });
-
-    this.configDrawerEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (target?.closest('[data-action="close-config"]')) {
-        this.isConfigOpen = false;
-        this.renderTopBar();
-        this.renderDrawers();
-      }
-    });
-
-    this.configDrawerEl.addEventListener('change', (e) => {
-      const el = e.target as HTMLSelectElement | null;
-      if (!el || !this.config) return;
-      const role = el.dataset.cfgField;
-      if (!role) return;
-
-      switch (role) {
-        case 'xColIndex':
-          this.callbacks.onConfigChange({xColIndex: Number(el.value)});
-          break;
-        case 'yColIndex':
-          this.callbacks.onConfigChange({yColIndex: Number(el.value)});
-          break;
-        case 'zColIndex':
-          this.callbacks.onConfigChange({
-            zColIndex: el.value === '' ? null : Number(el.value),
-          });
-          break;
-        case 'groupByColIndex':
-          this.callbacks.onConfigChange({
-            groupByColIndex: el.value === '' ? null : Number(el.value),
-          });
-          break;
-        case 'colorColIndex':
-          this.callbacks.onConfigChange({
-            colorColIndex: el.value === '' ? null : Number(el.value),
-          });
-          break;
-        case 'aggregation':
-          this.callbacks.onConfigChange({
-            aggregation: el.value as AggregationFn,
-          });
-          break;
-        case 'sortOrder':
-          this.callbacks.onConfigChange({
-            sortOrder: el.value as SpatialSortOrder,
-          });
-          break;
-        case 'topK':
-          this.callbacks.onConfigChange({topK: Number(el.value)});
-          break;
-        case 'scaleType':
-          this.callbacks.onConfigChange({scaleType: el.value as ScaleType});
-          break;
-        case 'samplingStrategy':
-          this.callbacks.onConfigChange({
-            samplingStrategy: el.value as SamplingStrategy,
-          });
-          break;
-        case 'sampleLimit':
-          this.callbacks.onConfigChange({sampleLimit: Number(el.value)});
-          break;
-        case 'roleTargetCol':
-          this.roleTargetColIndex = Number(el.value);
-          this.renderConfigDrawer();
-          break;
-        case 'roleOverride': {
-          const targetCol = this.roleTargetColIndex ?? this.config.yColIndex;
-          const nextRole =
-            el.value === 'auto' ? null : (el.value as SemanticType);
-          this.callbacks.onOverrideColumnRole(targetCol, nextRole);
-          break;
+        const applyBtn = target.closest<HTMLButtonElement>('[data-apply-rec-id]');
+        if (applyBtn) {
+          const rec = this.recommendations.find(
+            (r) => r.id === applyBtn.dataset.applyRecId
+          );
+          if (rec) {
+            this.isRecsOpen = false;
+            this.renderTopBar();
+            this.callbacks.onApplyRecommendation(rec);
+          }
         }
-      }
-    });
+      },
+      {signal}
+    );
 
-    this.inspectorDrawerEl.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      if (target.closest('[data-action="close-inspector"]')) {
-        this.callbacks.onSelectItem(null);
-        return;
-      }
-      const jumpBtn = target.closest<HTMLButtonElement>('[data-jump-row]');
-      if (jumpBtn) {
-        this.callbacks.onJumpToRow(Number(jumpBtn.dataset.jumpRow));
-      }
-    });
+    this.validationOverlayEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-action="switch-to-bar3d"]')) {
+          this.callbacks.onModeChange('bar3d');
+        } else if (target?.closest('[data-action="open-config-from-err"]')) {
+          this.isConfigOpen = true;
+          this.isRecsOpen = false;
+          this.renderTopBar();
+          this.renderDrawers();
+        }
+      },
+      {signal}
+    );
+
+    this.configDrawerEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-action="close-config"]')) {
+          this.isConfigOpen = false;
+          this.renderTopBar();
+          this.renderDrawers();
+        }
+      },
+      {signal}
+    );
+
+    this.configDrawerEl.addEventListener(
+      'change',
+      (e) => {
+        const el = e.target as HTMLSelectElement | null;
+        if (!el || !this.config) return;
+        const role = el.dataset.cfgField;
+        if (!role) return;
+
+        switch (role) {
+          case 'xColIndex':
+            this.callbacks.onConfigChange({xColIndex: Number(el.value)});
+            break;
+          case 'yColIndex':
+            this.callbacks.onConfigChange({yColIndex: Number(el.value)});
+            break;
+          case 'zColIndex':
+            this.callbacks.onConfigChange({
+              zColIndex: el.value === '' ? null : Number(el.value),
+            });
+            break;
+          case 'groupByColIndex':
+            this.callbacks.onConfigChange({
+              groupByColIndex: el.value === '' ? null : Number(el.value),
+            });
+            break;
+          case 'colorColIndex':
+            this.callbacks.onConfigChange({
+              colorColIndex: el.value === '' ? null : Number(el.value),
+            });
+            break;
+          case 'aggregation':
+            this.callbacks.onConfigChange({
+              aggregation: el.value as AggregationFn,
+            });
+            break;
+          case 'sortOrder':
+            this.callbacks.onConfigChange({
+              sortOrder: el.value as SpatialSortOrder,
+            });
+            break;
+          case 'topK':
+            this.callbacks.onConfigChange({topK: Number(el.value)});
+            break;
+          case 'scaleType':
+            this.callbacks.onConfigChange({scaleType: el.value as ScaleType});
+            break;
+          case 'samplingStrategy':
+            this.callbacks.onConfigChange({
+              samplingStrategy: el.value as SamplingStrategy,
+            });
+            break;
+          case 'sampleLimit':
+            this.callbacks.onConfigChange({sampleLimit: Number(el.value)});
+            break;
+          case 'roleTargetCol':
+            this.roleTargetColIndex = Number(el.value);
+            this.renderConfigDrawer();
+            break;
+          case 'roleOverride': {
+            const targetCol = this.roleTargetColIndex ?? this.config.yColIndex;
+            const nextRole =
+              el.value === 'auto' ? null : (el.value as SemanticType);
+            this.callbacks.onOverrideColumnRole(targetCol, nextRole);
+            break;
+          }
+        }
+      },
+      {signal}
+    );
+
+    this.inspectorDrawerEl.addEventListener(
+      'click',
+      (e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        if (target.closest('[data-action="close-inspector"]')) {
+          this.callbacks.onSelectItem(null);
+          return;
+        }
+        const jumpBtn = target.closest<HTMLButtonElement>('[data-jump-row]');
+        if (jumpBtn) {
+          this.callbacks.onJumpToRow(Number(jumpBtn.dataset.jumpRow));
+        }
+      },
+      {signal}
+    );
   }
 
   public update(params: {
@@ -883,5 +909,9 @@ export class SpatialInspectorOverlay {
         </div>
       </div>
     `;
+  }
+
+  public dispose(): void {
+    this.abortController.abort();
   }
 }

@@ -25,11 +25,18 @@ import {
   normalizeColumnViewState,
   reconcileColumnViewOnAdd,
   reconcileColumnViewOnDelete,
+  reconcileColumnViewOnUndoDelete,
   restoreAllColumnsInView,
   setColumnWidthInView,
   toggleColumnPinInView,
   toggleColumnVisibilityInView,
 } from './columnView';
+import {
+  clearPersistedColumnView,
+  computeSheetLayoutIdentity,
+  loadPersistedColumnView,
+  savePersistedColumnView,
+} from './columnViewPersistence';
 import {
   clampSplitRatio,
   loadWorkspaceSplitRatio,
@@ -121,15 +128,21 @@ export class AppStore {
   private derivedSpatialCacheKey = '';
   private spatialStale = false;
   private nextSheetIdSeq = 1;
+  private readonly columnViewStorage?: Storage | null;
 
-  constructor(initialWorkbook?: WorkbookState, worker?: DataWorkerClient) {
+  constructor(
+    initialWorkbook?: WorkbookState,
+    worker?: DataWorkerClient,
+    columnViewStorage?: Storage | null
+  ) {
     const initial = initialWorkbook ?? createBlankWorkbook();
     this.history = new WorkbookHistoryManager(initial, 50);
     this.worker = worker ?? new DataWorkerClient();
+    this.columnViewStorage = columnViewStorage;
 
     const firstSheet = this.activeSheet;
     this.splitRatio = loadWorkspaceSplitRatio();
-    this.columnViewsBySheetId.set(firstSheet.id, createColumnViewState(firstSheet));
+    this.resolveAndCacheInitialColumnView(firstSheet);
     this.chartConfig = suggestChartConfig(firstSheet);
     this.visibleRowIndices = this.buildSequentialIndices(firstSheet.rows.length);
     this.selectedCell =
@@ -164,19 +177,63 @@ export class AppStore {
   }
 
   public get activeColumnView(): ColumnViewState {
-    const sheet = this.activeSheet;
-    let existing = this.columnViewsBySheetId.get(sheet.id);
+    return this.getPureColumnView(this.activeSheet);
+  }
+
+  private getPureColumnView(sheet: SheetData): ColumnViewState {
+    const existing = this.columnViewsBySheetId.get(sheet.id);
     if (!existing) {
-      existing = createColumnViewState(sheet);
-      this.columnViewsBySheetId.set(sheet.id, existing);
-      return existing;
+      return createColumnViewState(sheet);
     }
     if (existing.order.length !== sheet.columns.length) {
-      const normalized = normalizeColumnViewState(existing, sheet.columns.length);
+      return normalizeColumnViewState(existing, sheet.columns.length);
+    }
+    return existing;
+  }
+
+  private resolveAndCacheInitialColumnView(sheet: SheetData): ColumnViewState {
+    const existing = this.columnViewsBySheetId.get(sheet.id);
+    if (existing) {
+      const normalized =
+        existing.order.length === sheet.columns.length
+          ? existing
+          : normalizeColumnViewState(existing, sheet.columns.length);
       this.columnViewsBySheetId.set(sheet.id, normalized);
       return normalized;
     }
-    return existing;
+
+    const identity = computeSheetLayoutIdentity({
+      fileName: this.workbook.fileName,
+      fileFormat: this.workbook.fileFormat,
+      sheetName: sheet.name,
+      columns: sheet.columns,
+    });
+    const persisted = loadPersistedColumnView(
+      identity,
+      sheet.columns.length,
+      this.columnViewStorage
+    );
+    const resolved = persisted ?? createColumnViewState(sheet);
+    this.columnViewsBySheetId.set(sheet.id, resolved);
+    return resolved;
+  }
+
+  private persistColumnViewForSheet(
+    sheet: SheetData,
+    view: ColumnViewState
+  ): void {
+    const identity = computeSheetLayoutIdentity({
+      fileName: this.workbook.fileName,
+      fileFormat: this.workbook.fileFormat,
+      sheetName: sheet.name,
+      columns: sheet.columns,
+    });
+    savePersistedColumnView(
+      identity,
+      view,
+      sheet.columns.length,
+      this.columnViewStorage
+    );
   }
 
   public subscribe(domains: AppDomain[], listener: StoreListener): () => void {
@@ -918,17 +975,26 @@ export class AppStore {
 
   public addColumn(): void {
     this.cancelPendingSearchTimer();
-    const nextSheet = addSheetColumn(this.activeSheet);
-    this.history.commitSheetSnapshot(nextSheet);
+    const oldSheet = this.activeSheet;
+    const oldView = this.getPureColumnView(oldSheet);
+    const nextSheet = addSheetColumn(oldSheet);
+    const newColIndex = nextSheet.columns.length - 1;
+    const nextView = reconcileColumnViewOnAdd(oldView, newColIndex);
+
+    this.columnViewsBySheetId.set(nextSheet.id, nextView);
+    this.persistColumnViewForSheet(nextSheet, nextView);
+    this.history.commitSheetSnapshot(nextSheet, {
+      columnTransition: {
+        kind: 'add',
+        colIndex: newColIndex,
+        prevView: oldView,
+        nextView,
+      },
+    });
     this.nextSheetVersion();
     this.filterSeq++;
     this.worker.invalidateCache();
     this.clearColumnStatsCache();
-    const nextView = reconcileColumnViewOnAdd(
-      this.activeColumnView,
-      nextSheet.columns.length - 1
-    );
-    this.columnViewsBySheetId.set(nextSheet.id, nextView);
     this.rebuildProfileFull(false);
     this.refreshActiveColumnStats(true);
     this.refreshDerivedSpatialData(true);
@@ -980,20 +1046,52 @@ export class AppStore {
   }
 
   public deleteColumn(colIndex: number): void {
+    const oldSheet = this.activeSheet;
+    if (
+      !Number.isInteger(colIndex) ||
+      colIndex < 0 ||
+      colIndex >= oldSheet.columns.length ||
+      oldSheet.columns.length <= 1
+    ) {
+      return;
+    }
+
     this.cancelPendingSearchTimer();
-    const nextSheet = deleteSheetColumn(this.activeSheet, colIndex);
-    this.history.commitSheetSnapshot(nextSheet);
+    const oldView = this.getPureColumnView(oldSheet);
+    const nextSheet = deleteSheetColumn(oldSheet, colIndex);
+    const nextView = reconcileColumnViewOnDelete(
+      oldView,
+      colIndex,
+      nextSheet.columns.length
+    );
+
+    const deletedRoleOverride =
+      this.datasetProfile.columns[colIndex]?.roleOverride;
+    const shiftedOverrides = new Map<number, SemanticType>();
+    for (const c of this.datasetProfile.columns) {
+      if (c.roleOverride === undefined || c.colIndex === colIndex) continue;
+      shiftedOverrides.set(
+        c.colIndex > colIndex ? c.colIndex - 1 : c.colIndex,
+        c.roleOverride
+      );
+    }
+
+    this.columnViewsBySheetId.set(nextSheet.id, nextView);
+    this.persistColumnViewForSheet(nextSheet, nextView);
+    this.history.commitSheetSnapshot(nextSheet, {
+      columnTransition: {
+        kind: 'delete',
+        colIndex,
+        prevView: oldView,
+        nextView,
+        deletedRoleOverride,
+      },
+    });
     this.nextSheetVersion();
     this.filterSeq++;
     this.worker.invalidateCache();
     this.clearColumnStatsCache();
     this.selectedCell = null;
-    const nextView = reconcileColumnViewOnDelete(
-      this.activeColumnView,
-      colIndex,
-      nextSheet.columns.length
-    );
-    this.columnViewsBySheetId.set(nextSheet.id, nextView);
 
     let sortWasInvalidated = false;
     if (this.sort.colIndex !== null) {
@@ -1009,7 +1107,17 @@ export class AppStore {
     }
 
     this.chartConfig = suggestChartConfig(nextSheet);
-    this.rebuildProfileFull(true);
+    this.datasetProfile = profileDataset(
+      nextSheet,
+      this.sheetVersion,
+      shiftedOverrides
+    );
+    this.chartRecommendations = recommendCharts(this.datasetProfile);
+    this.spatialConfig = createDefaultSpatialConfig(
+      this.datasetProfile,
+      this.chartConfig
+    );
+    this.selectedSpatialItem = null;
 
     if (this.hasActiveFilterOrSort() || sortWasInvalidated) {
       if (!this.hasActiveFilterOrSort()) {
@@ -1107,9 +1215,11 @@ export class AppStore {
   public setColumnWidth(colIndex: number, width: number): void {
     const sheet = this.activeSheet;
     if (colIndex < 0 || colIndex >= sheet.columns.length) return;
-    const next = setColumnWidthInView(this.activeColumnView, colIndex, width);
-    if (next === this.activeColumnView) return;
+    const cur = this.getPureColumnView(sheet);
+    const next = setColumnWidthInView(cur, colIndex, width);
+    if (next === cur) return;
     this.columnViewsBySheetId.set(sheet.id, next);
+    this.persistColumnViewForSheet(sheet, next);
     this.emit(['columnView']);
   }
 
@@ -1123,40 +1233,56 @@ export class AppStore {
   public toggleColumnPin(colIndex: number): void {
     const sheet = this.activeSheet;
     if (colIndex < 0 || colIndex >= sheet.columns.length) return;
-    const next = toggleColumnPinInView(this.activeColumnView, colIndex);
+    const cur = this.getPureColumnView(sheet);
+    const next = toggleColumnPinInView(cur, colIndex);
     this.columnViewsBySheetId.set(sheet.id, next);
+    this.persistColumnViewForSheet(sheet, next);
     this.emit(['columnView']);
   }
 
   public toggleColumnVisibility(colIndex: number): void {
     const sheet = this.activeSheet;
     if (colIndex < 0 || colIndex >= sheet.columns.length) return;
-    const next = toggleColumnVisibilityInView(this.activeColumnView, colIndex);
-    if (next === this.activeColumnView) return;
+    const cur = this.getPureColumnView(sheet);
+    const next = toggleColumnVisibilityInView(cur, colIndex);
+    if (next === cur) return;
     this.columnViewsBySheetId.set(sheet.id, next);
+    this.persistColumnViewForSheet(sheet, next);
     this.emit(['columnView']);
   }
 
   public restoreAllColumns(): void {
     const sheet = this.activeSheet;
-    const next = restoreAllColumnsInView(this.activeColumnView);
-    if (next === this.activeColumnView) return;
+    const cur = this.getPureColumnView(sheet);
+    const next = restoreAllColumnsInView(cur);
+    if (next === cur) return;
     this.columnViewsBySheetId.set(sheet.id, next);
+    this.persistColumnViewForSheet(sheet, next);
     this.emit(['columnView']);
   }
 
   public resetColumnView(): void {
     const sheet = this.activeSheet;
-    this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
+    const fresh = createColumnViewState(sheet);
+    this.columnViewsBySheetId.set(sheet.id, fresh);
+    const identity = computeSheetLayoutIdentity({
+      fileName: this.workbook.fileName,
+      fileFormat: this.workbook.fileFormat,
+      sheetName: sheet.name,
+      columns: sheet.columns,
+    });
+    clearPersistedColumnView(identity, this.columnViewStorage);
     this.emit(['columnView']);
   }
 
   public moveColumnVisual(colIndex: number, direction: -1 | 1): void {
     const sheet = this.activeSheet;
     if (colIndex < 0 || colIndex >= sheet.columns.length) return;
-    const next = moveColumnVisualInView(this.activeColumnView, colIndex, direction);
-    if (next === this.activeColumnView) return;
+    const cur = this.getPureColumnView(sheet);
+    const next = moveColumnVisualInView(cur, colIndex, direction);
+    if (next === cur) return;
     this.columnViewsBySheetId.set(sheet.id, next);
+    this.persistColumnViewForSheet(sheet, next);
     this.emit(['columnView']);
   }
 
@@ -1187,9 +1313,7 @@ export class AppStore {
     this.clearColumnStatsCache();
 
     const sheet = this.activeSheet;
-    if (!this.columnViewsBySheetId.has(sheet.id)) {
-      this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
-    }
+    this.resolveAndCacheInitialColumnView(sheet);
     this.selectedCell =
       sheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
     this.highlightedRowIndex = null;
@@ -1268,7 +1392,7 @@ export class AppStore {
     this.columnViewsBySheetId.clear();
 
     const sheet = this.activeSheet;
-    this.columnViewsBySheetId.set(sheet.id, createColumnViewState(sheet));
+    this.resolveAndCacheInitialColumnView(sheet);
     this.selectedCell =
       sheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
     this.highlightedRowIndex = null;
@@ -1371,15 +1495,111 @@ export class AppStore {
     this.selectedCell = null;
     this.highlightedRowIndex = null;
     const active = this.activeSheet;
-    const prevView = this.columnViewsBySheetId.get(active.id);
-    if (prevView && prevView.order.length !== active.columns.length) {
-      this.columnViewsBySheetId.set(
-        active.id,
-        normalizeColumnViewState(prevView, active.columns.length)
-      );
+    let overrideMapForProfile: Map<number, SemanticType> | undefined;
+
+    if (entry.kind === 'sheet-snapshot' && entry.columnTransition) {
+      const ct = entry.columnTransition;
+      const preTransitionView =
+        this.columnViewsBySheetId.get(active.id) ??
+        createColumnViewState(dir === 'undo' ? entry.nextSheet : entry.prevSheet);
+      let reconciled: ColumnViewState;
+      if (ct.kind === 'delete' && dir === 'undo') {
+        reconciled = reconcileColumnViewOnUndoDelete(
+          preTransitionView,
+          ct.colIndex,
+          ct.prevView,
+          active.columns.length
+        );
+        if (this.sort.colIndex !== null && this.sort.colIndex >= ct.colIndex) {
+          this.sort = {
+            colIndex: this.sort.colIndex + 1,
+            direction: this.sort.direction,
+          };
+        }
+        overrideMapForProfile = new Map<number, SemanticType>();
+        for (const c of this.datasetProfile.columns) {
+          if (c.roleOverride === undefined) continue;
+          overrideMapForProfile.set(
+            c.colIndex >= ct.colIndex ? c.colIndex + 1 : c.colIndex,
+            c.roleOverride
+          );
+        }
+        if (ct.deletedRoleOverride !== undefined) {
+          overrideMapForProfile.set(ct.colIndex, ct.deletedRoleOverride);
+        }
+      } else if (ct.kind === 'delete' && dir === 'redo') {
+        reconciled = reconcileColumnViewOnDelete(
+          preTransitionView,
+          ct.colIndex,
+          active.columns.length
+        );
+        if (this.sort.colIndex === ct.colIndex) {
+          this.sort = {colIndex: null, direction: null};
+        } else if (
+          this.sort.colIndex !== null &&
+          this.sort.colIndex > ct.colIndex
+        ) {
+          this.sort = {
+            colIndex: this.sort.colIndex - 1,
+            direction: this.sort.direction,
+          };
+        }
+        overrideMapForProfile = new Map<number, SemanticType>();
+        for (const c of this.datasetProfile.columns) {
+          if (c.roleOverride === undefined || c.colIndex === ct.colIndex) continue;
+          overrideMapForProfile.set(
+            c.colIndex > ct.colIndex ? c.colIndex - 1 : c.colIndex,
+            c.roleOverride
+          );
+        }
+      } else if (ct.kind === 'add' && dir === 'undo') {
+        reconciled = reconcileColumnViewOnDelete(
+          preTransitionView,
+          ct.colIndex,
+          active.columns.length
+        );
+        if (this.sort.colIndex === ct.colIndex) {
+          this.sort = {colIndex: null, direction: null};
+        } else if (
+          this.sort.colIndex !== null &&
+          this.sort.colIndex > ct.colIndex
+        ) {
+          this.sort = {
+            colIndex: this.sort.colIndex - 1,
+            direction: this.sort.direction,
+          };
+        }
+      } else {
+        // add redo
+        reconciled = reconcileColumnViewOnAdd(preTransitionView, ct.colIndex);
+      }
+      this.columnViewsBySheetId.set(active.id, reconciled);
+      this.persistColumnViewForSheet(active, reconciled);
+    } else if (entry.kind === 'workbook-switch') {
+      this.resolveAndCacheInitialColumnView(active);
+    } else {
+      const currentView = this.getPureColumnView(active);
+      if (currentView.order.length !== active.columns.length) {
+        this.columnViewsBySheetId.set(
+          active.id,
+          normalizeColumnViewState(currentView, active.columns.length)
+        );
+      } else if (!this.columnViewsBySheetId.has(active.id)) {
+        this.columnViewsBySheetId.set(active.id, currentView);
+      }
     }
     this.clampChartColumns();
-    this.rebuildProfileFull(false);
+    if (overrideMapForProfile) {
+      this.datasetProfile = profileDataset(
+        active,
+        this.sheetVersion,
+        overrideMapForProfile
+      );
+      this.chartRecommendations = recommendCharts(this.datasetProfile);
+      this.clampSpatialColumns();
+    } else {
+      this.rebuildProfileFull(false);
+    }
 
     if (!this.hasActiveFilterOrSort()) {
       this.visibleRowIndices = this.buildSequentialIndices(

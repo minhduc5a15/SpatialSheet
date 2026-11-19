@@ -323,6 +323,7 @@ export class InteractiveChart2D {
   private activeTooltipTarget: Element | null = null;
   private recommendations: ChartRecommendation[] = [];
   private legendExpanded = false;
+  private readonly abortController = new AbortController();
 
   constructor(container: HTMLElement, callbacks: Chart2DCallbacks) {
     this.container = container;
@@ -476,134 +477,175 @@ export class InteractiveChart2D {
   }
 
   private bindDelegatedEvents(): void {
+    const {signal} = this.abortController;
     if (this.typeGroupEl) {
-      this.typeGroupEl.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement | null;
-        const typeBtn = target?.closest<HTMLButtonElement>('[data-chart-type]');
-        if (!typeBtn) return;
-        const nextType = typeBtn.dataset.chartType as ChartType;
-        if (nextType !== this.config.type) {
-          this.callbacks.onConfigChange({
-            ...this.config,
-            type: nextType,
-          });
-        }
-      });
-    }
-
-    this.xAxisSelectEl?.addEventListener('change', () => {
-      if (!this.xAxisSelectEl) return;
-      this.callbacks.onConfigChange({
-        ...this.config,
-        xColIndex: Number(this.xAxisSelectEl.value),
-      });
-    });
-
-    this.aggSelectEl?.addEventListener('change', () => {
-      if (!this.aggSelectEl) return;
-      this.callbacks.onConfigChange({
-        ...this.config,
-        aggregation: this.aggSelectEl.value as ChartAggregationMode,
-      });
-    });
-
-    this.sortSelectEl?.addEventListener('change', () => {
-      if (!this.sortSelectEl) return;
-      this.callbacks.onConfigChange({
-        ...this.config,
-        sortOrder: this.sortSelectEl.value as ChartSortOrder,
-      });
-    });
-
-    this.limitSelectEl?.addEventListener('change', () => {
-      if (!this.limitSelectEl) return;
-      this.callbacks.onConfigChange({
-        ...this.config,
-        maxPoints: Number(this.limitSelectEl.value),
-      });
-    });
-
-    if (this.chartCanvasWrapEl) {
-      this.chartCanvasWrapEl.addEventListener('click', (e) => {
-        const target = e.target as Element | null;
-        const emptyActionBtn = target?.closest<HTMLButtonElement>('[data-empty-chart]');
-        if (emptyActionBtn && this.sheet) {
-          const action = emptyActionBtn.dataset.emptyChart;
-          if (action === 'restore') {
-            const recCols = applySeriesPreset(
-              'recommended',
-              this.sheet,
-              this.profile,
-              this.config.xColIndex
-            );
+      this.typeGroupEl.addEventListener(
+        'click',
+        (e) => {
+          const target = e.target as HTMLElement | null;
+          const typeBtn = target?.closest<HTMLButtonElement>('[data-chart-type]');
+          if (!typeBtn) return;
+          const nextType = typeBtn.dataset.chartType as ChartType;
+          if (nextType !== this.config.type) {
             this.callbacks.onConfigChange({
               ...this.config,
-              yColIndices: recCols,
+              type: nextType,
             });
-          } else if (action === 'open-series') {
-            this.seriesManager?.open();
           }
-          return;
-        }
+        },
+        {signal}
+      );
+    }
 
-        const pointEl = target?.closest<SVGElement>('[data-point-row]');
-        if (pointEl) {
-          const rowIndex = Number(pointEl.dataset.pointRow);
-          this.callbacks.onRowSelect(rowIndex);
-        }
-      });
+    this.xAxisSelectEl?.addEventListener(
+      'change',
+      () => {
+        if (!this.xAxisSelectEl) return;
+        this.callbacks.onConfigChange({
+          ...this.config,
+          xColIndex: Number(this.xAxisSelectEl.value),
+        });
+      },
+      {signal}
+    );
 
-      this.chartCanvasWrapEl.addEventListener('mouseover', (e) => {
-        const target = e.target as Element | null;
-        const pointEl = target?.closest<SVGElement>('[data-point-row]');
-        if (!pointEl) {
-          if (this.activeTooltipTarget) {
-            this.activeTooltipTarget = null;
-            this.tooltipEl?.classList.add('hidden');
+    this.aggSelectEl?.addEventListener(
+      'change',
+      () => {
+        if (!this.aggSelectEl) return;
+        this.callbacks.onConfigChange({
+          ...this.config,
+          aggregation: this.aggSelectEl.value as ChartAggregationMode,
+        });
+      },
+      {signal}
+    );
+
+    this.sortSelectEl?.addEventListener(
+      'change',
+      () => {
+        if (!this.sortSelectEl) return;
+        this.callbacks.onConfigChange({
+          ...this.config,
+          sortOrder: this.sortSelectEl.value as ChartSortOrder,
+        });
+      },
+      {signal}
+    );
+
+    this.limitSelectEl?.addEventListener(
+      'change',
+      () => {
+        if (!this.limitSelectEl) return;
+        this.callbacks.onConfigChange({
+          ...this.config,
+          maxPoints: Number(this.limitSelectEl.value),
+        });
+      },
+      {signal}
+    );
+
+    if (this.chartCanvasWrapEl) {
+      this.chartCanvasWrapEl.addEventListener(
+        'click',
+        (e) => {
+          const target = e.target as Element | null;
+          const emptyActionBtn = target?.closest<HTMLButtonElement>('[data-empty-chart]');
+          if (emptyActionBtn && this.sheet) {
+            const action = emptyActionBtn.dataset.emptyChart;
+            if (action === 'restore') {
+              const recCols = applySeriesPreset(
+                'recommended',
+                this.sheet,
+                this.profile,
+                this.config.xColIndex
+              );
+              this.callbacks.onConfigChange({
+                ...this.config,
+                yColIndices: recCols,
+              });
+            } else if (action === 'open-series') {
+              this.seriesManager?.open();
+            }
+            return;
           }
-          return;
-        }
-        if (pointEl !== this.activeTooltipTarget && this.tooltipEl) {
-          this.activeTooltipTarget = pointEl;
-          const title = pointEl.dataset.tipTitle;
-          const sub = pointEl.dataset.tipSub;
-          if (title) {
-            this.tooltipEl.innerHTML = `<div class="font-semibold">${escapeHtml(title)}</div><div class="text-slate-300 font-mono-tabular">${escapeHtml(sub ?? '')}</div>`;
-            this.tooltipEl.classList.remove('hidden');
-          }
-        }
-        this.positionTooltip(e as MouseEvent);
-      });
 
-      this.chartCanvasWrapEl.addEventListener('mousemove', (e) => {
-        if (this.activeTooltipTarget) {
+          const pointEl = target?.closest<SVGElement>('[data-point-row]');
+          if (pointEl) {
+            const rowIndex = Number(pointEl.dataset.pointRow);
+            this.callbacks.onRowSelect(rowIndex);
+          }
+        },
+        {signal}
+      );
+
+      this.chartCanvasWrapEl.addEventListener(
+        'mouseover',
+        (e) => {
+          const target = e.target as Element | null;
+          const pointEl = target?.closest<SVGElement>('[data-point-row]');
+          if (!pointEl) {
+            if (this.activeTooltipTarget) {
+              this.activeTooltipTarget = null;
+              this.tooltipEl?.classList.add('hidden');
+            }
+            return;
+          }
+          if (pointEl !== this.activeTooltipTarget && this.tooltipEl) {
+            this.activeTooltipTarget = pointEl;
+            const title = pointEl.dataset.tipTitle;
+            const sub = pointEl.dataset.tipSub;
+            if (title) {
+              this.tooltipEl.innerHTML = `<div class="font-semibold">${escapeHtml(title)}</div><div class="text-slate-300 font-mono-tabular">${escapeHtml(sub ?? '')}</div>`;
+              this.tooltipEl.classList.remove('hidden');
+            }
+          }
           this.positionTooltip(e as MouseEvent);
-        }
-      });
+        },
+        {signal}
+      );
 
-      this.chartCanvasWrapEl.addEventListener('mouseleave', () => {
-        this.activeTooltipTarget = null;
-        this.tooltipEl?.classList.add('hidden');
-      });
+      this.chartCanvasWrapEl.addEventListener(
+        'mousemove',
+        (e) => {
+          if (this.activeTooltipTarget) {
+            this.positionTooltip(e as MouseEvent);
+          }
+        },
+        {signal}
+      );
+
+      this.chartCanvasWrapEl.addEventListener(
+        'mouseleave',
+        () => {
+          this.activeTooltipTarget = null;
+          this.tooltipEl?.classList.add('hidden');
+        },
+        {signal}
+      );
     }
 
     if (this.legendEl) {
-      this.legendEl.addEventListener('click', (e) => {
-        const target = e.target as HTMLElement | null;
-        const toggleLegendBtn = target?.closest<HTMLButtonElement>('[data-legend-toggle]');
-        if (toggleLegendBtn) {
-          this.legendExpanded = !this.legendExpanded;
-          this.renderLegend();
-          return;
-        }
-        const btn = target?.closest<HTMLButtonElement>('[data-apply-2d-rec]');
-        if (btn) {
-          const rec = this.recommendations.find(
-            (r) => r.id === btn.dataset.apply2dRec
-          );
-          if (rec) this.callbacks.onApplyRecommendation?.(rec);
-        }
-      });
+      this.legendEl.addEventListener(
+        'click',
+        (e) => {
+          const target = e.target as HTMLElement | null;
+          const toggleLegendBtn = target?.closest<HTMLButtonElement>('[data-legend-toggle]');
+          if (toggleLegendBtn) {
+            this.legendExpanded = !this.legendExpanded;
+            this.renderLegend();
+            return;
+          }
+          const btn = target?.closest<HTMLButtonElement>('[data-apply-2d-rec]');
+          if (btn) {
+            const rec = this.recommendations.find(
+              (r) => r.id === btn.dataset.apply2dRec
+            );
+            if (rec) this.callbacks.onApplyRecommendation?.(rec);
+          }
+        },
+        {signal}
+      );
     }
   }
 
@@ -1380,6 +1422,7 @@ export class InteractiveChart2D {
   }
 
   public dispose(): void {
+    this.abortController.abort();
     this.seriesManager?.dispose();
     this.seriesManager = null;
   }

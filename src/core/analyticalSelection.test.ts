@@ -118,3 +118,35 @@ test('initial and reloaded chart defaults exclude inferred numeric identifiers',
  assert.deepEqual(store.chartConfig.yColIndices,[2]);
  store.resetWithWorkbook(workbook);assert.deepEqual(store.chartConfig.yColIndices,[2]);
 });
+
+test('chartDisplaySummary labels ascending, descending, and source group rankings truthfully',()=>{
+ const base={type:'bar' as const,xColIndex:0,yColIndices:[1],spatialMode:'bar3d' as const,aggregation:'avg' as const,sortOrder:'value-asc' as const,maxPoints:12};
+ assert.match(chartDisplaySummary(base,500,12),/Bottom 12 groups by ascending primary aggregate/);
+ assert.match(chartDisplaySummary({...base,sortOrder:'value-desc'},500,12),/Top 12 groups by descending primary aggregate/);
+ assert.match(chartDisplaySummary({...base,sortOrder:'source'},500,12),/First 12 groups in source order/);
+});
+
+test('loadFile enters overview for imported datasets unless spatial startup is requested; edits keep layout',async t=>{
+ const store=setup();t.after(()=>store.dispose());
+ assert.equal(store.layout,'split');
+ store.commitCellEdit(0,1,'15');
+ assert.equal(store.layout,'split');
+
+ const file={name:'imported.csv',text:async()=>'Dept,Sales\nEng,100\nSales,200'} as unknown as File;
+ await store.loadFile(file);
+ assert.equal(store.layout,'overview');
+
+ // Blank reset stays non-overview when switched away; spatial startup preference skips auto-overview
+ store.setLayout('spatial');
+ store.setPreferSpatialStartup(true);
+ await store.loadFile(file);
+ assert.equal(store.layout,'spatial');
+
+ // Focus in table unhides hidden column and moves selection to requested row
+ store.toggleColumnVisibility(1);
+ store.focusColumnInTable(1,1,'split');
+ assert.equal(store.layout,'split');
+ assert.equal(store.activeColumnView.hidden.includes(1),false);
+ assert.deepEqual(store.selectedCell,{rowIndex:1,colIndex:1});
+});
+

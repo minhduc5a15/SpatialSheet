@@ -148,8 +148,8 @@ class MockElement {
       (c) => c.getAttribute('data-role') === selector || c.tagName === selector.toUpperCase()
     );
     if (existing) return existing;
-    const match = selector.match(/data-role="([^"]+)"|data-action="([^"]+)"/);
-    const roleName = match?.[1] ?? match?.[2] ?? selector;
+    const match = selector.match(/data-role="([^"]+)"|data-action="([^"]+)"|data-overview-filter="([^"]+)"/);
+    const roleName = match?.[1] ?? match?.[2] ?? match?.[3] ?? selector;
     let found = this.children.find((c) => c.dataset.lookup === roleName);
     if (!found) {
       const isInput =
@@ -378,3 +378,33 @@ test('SpreadsheetGrid dispose() detaches all shell/window listeners and cancels 
     dom.teardown();
   }
 });
+
+test('DatasetOverview dispose() detaches all listeners and clears host children', async () => {
+  const dom = setupMockDom();
+  try {
+    const {AppStore} = await import('../core/store');
+    const {DataWorkerClient} = await import('../core/workerClient');
+    const {DatasetOverview} = await import('./DatasetOverview');
+    const store = new AppStore(undefined, new DataWorkerClient({createWorker: () => null}));
+    const host = new MockElement('section') as unknown as HTMLElement & {
+      replaceChildren: () => void;
+    };
+    (host as unknown as {replaceChildren: () => void}).replaceChildren = () => {
+      (host as unknown as MockElement).children = [];
+    };
+
+    const overview = new DatasetOverview(host, store, {
+      onNavigateLayout: () => {},
+      onFocusTableCell: () => {},
+      onOpenSuggested: () => {},
+    });
+    assert.ok((host as unknown as MockElement).listeners.length >= 2);
+    overview.dispose();
+    assert.equal((host as unknown as MockElement).listeners.length, 0);
+    assert.equal((host as unknown as MockElement).children.length, 0);
+    store.dispose();
+  } finally {
+    dom.teardown();
+  }
+});
+

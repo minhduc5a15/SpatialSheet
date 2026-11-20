@@ -16,6 +16,7 @@ import type {
   SpatialChartMode,
   SpatialConfig,
   SpatialDataItem,
+  SuggestedAnalysisItem,
   VisibleRowsSource,
   WorkbookState,
   WorkspaceLayout,
@@ -70,6 +71,7 @@ import {
 import {DataWorkerClient, buildFilterKey} from './workerClient';
 import {matchesContributor} from './analyticalSelection';
 import {resetChartConfig} from './chartValidation';
+import {applySeriesPreset, evaluateSeriesEligibility} from '../ui/ChartSeriesManager';
 import type {DataPointRow} from './chartData';
 
 export type StoreListener = (changed: ReadonlySet<AppDomain>) => void;
@@ -144,6 +146,9 @@ export class AppStore {
   private columnStatsCache = new Map<number, ColumnStats>();
   private columnStatsCacheFilterKey = '';
   private columnViewsBySheetId = new Map<string, ColumnViewState>();
+  private dismissedQualityBySheet = new Map<string, Set<string>>();
+  public inspectorAutoOpen = false;
+  private preferSpatialStartup = false;
   private derivedSpatialCacheKey = '';
   private spatialStale = false;
   private nextSheetIdSeq = 1;
@@ -782,7 +787,7 @@ export class AppStore {
     this.datasetProfile = nextProfile;
     this.chartRecommendations = recommendCharts(this.datasetProfile);
     this.refreshDerivedSpatialData(true);
-    this.emit(['selection', 'chartHighlight', 'profile', 'spatialData']);
+    this.emit(['selection', 'chartHighlight', 'profile', 'spatialData', 'overview']);
   }
 
   public applyRecommendation(rec: ChartRecommendation): void {
@@ -1283,6 +1288,142 @@ export class AppStore {
     this.emit(['layout', 'vizMode']);
   }
 
+  public setPreferSpatialStartup(prefer: boolean): void {
+    this.preferSpatialStartup = prefer;
+  }
+
+  public setInspectorAutoOpen(enabled: boolean): void {
+    if (this.inspectorAutoOpen === enabled) return;
+    this.inspectorAutoOpen = enabled;
+    this.emit(['overview']);
+  }
+
+  public getDismissedQualityIds(sheetId = this.activeSheet.id): ReadonlySet<string> {
+    return this.dismissedQualityBySheet.get(sheetId) ?? new Set<string>();
+  }
+
+  public dismissQualityObservation(id: string): void {
+    const sheetId = this.activeSheet.id;
+    let set = this.dismissedQualityBySheet.get(sheetId);
+    if (!set) {
+      set = new Set<string>();
+      this.dismissedQualityBySheet.set(sheetId, set);
+    }
+    if (set.has(id)) return;
+    set.add(id);
+    this.emit(['overview']);
+  }
+
+  public restoreQualityObservations(): void {
+    const sheetId = this.activeSheet.id;
+    const existing = this.dismissedQualityBySheet.get(sheetId);
+    if (!existing || existing.size === 0) return;
+    this.dismissedQualityBySheet.delete(sheetId);
+    this.emit(['overview']);
+  }
+
+  public focusColumnInTable(
+    colIndex: number,
+    rowIndex?: number,
+    targetLayout: WorkspaceLayout = 'split'
+  ): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const view = this.getPureColumnView(sheet);
+    if (view.hidden.includes(colIndex)) {
+      this.toggleColumnVisibility(colIndex);
+    }
+    let resolvedRow =
+      rowIndex !== undefined
+        ? Math.max(0, Math.min(sheet.rows.length - 1, rowIndex))
+        : (this.selectedCell?.rowIndex ?? this.visibleRowIndices[0] ?? 0);
+    if (sheet.rows.length > 0 && rowIndex !== undefined && !this.isRowVisible(this.visibleRowIndices, resolvedRow)) {
+      this.cancelPendingSearchTimer();
+      this.groupFilter = null;
+      this.searchQuery = '';
+      this.sort = {colIndex: null, direction: null};
+      this.filterSeq++;
+      this.visibleRowIndices = this.buildSequentialIndices(sheet.rows.length);
+      this.clearColumnStatsCache();
+      this.refreshDerivedSpatialData(true);
+      this.emit(['visibleRows', 'spatialData']);
+    }
+    if (sheet.rows.length > 0) {
+      resolvedRow = Math.max(0, Math.min(sheet.rows.length - 1, resolvedRow));
+      this.selectCell({rowIndex: resolvedRow, colIndex});
+    }
+    this.setLayout(targetLayout);
+  }
+
+  public useColumnAsChartX(
+    colIndex: number,
+    targetLayout?: WorkspaceLayout
+  ): void {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) return;
+    const keptY = this.chartConfig.yColIndices.filter((c) => {
+      if (c === colIndex) return false;
+      return evaluateSeriesEligibility(sheet, this.datasetProfile, c, colIndex).eligible;
+    });
+    const nextY =
+      keptY.length > 0
+        ? keptY
+        : applySeriesPreset('recommended', sheet, this.datasetProfile, colIndex);
+    this.setChartConfig({
+      ...this.chartConfig,
+      xColIndex: colIndex,
+      yColIndices: nextY,
+    });
+    if (targetLayout) {
+      if (targetLayout === 'split') this.chartPanelMode = '2d';
+      this.setLayout(targetLayout);
+    }
+  }
+
+  public addColumnAsChartY(
+    colIndex: number,
+    targetLayout?: WorkspaceLayout
+  ): {applied: boolean; reason: string | null} {
+    const sheet = this.activeSheet;
+    if (colIndex < 0 || colIndex >= sheet.columns.length) {
+      return {applied: false, reason: 'Invalid column index'};
+    }
+    const eligibility = evaluateSeriesEligibility(
+      sheet,
+      this.datasetProfile,
+      colIndex,
+      this.chartConfig.xColIndex
+    );
+    if (!eligibility.eligible) {
+      return {applied: false, reason: eligibility.reason};
+    }
+    const nextY = this.chartConfig.yColIndices.includes(colIndex)
+      ? this.chartConfig.yColIndices
+      : [...this.chartConfig.yColIndices, colIndex];
+    this.setChartConfig({
+      ...this.chartConfig,
+      yColIndices: nextY,
+    });
+    if (targetLayout) {
+      if (targetLayout === 'split') this.chartPanelMode = '2d';
+      this.setLayout(targetLayout);
+    }
+    return {applied: true, reason: null};
+  }
+
+  public applySuggestedAnalysis(
+    item: SuggestedAnalysisItem,
+    targetLayout?: WorkspaceLayout
+  ): void {
+    this.applyRecommendation(item.recommendation);
+    const destLayout = targetLayout ?? item.targetLayout;
+    if (destLayout === 'split') {
+      this.chartPanelMode =
+        item.recommendation.targetSurface === '3d' ? '3d' : '2d';
+    }
+    this.setLayout(destLayout);
+  }
+
   public setSplitRatio(ratio: number, persist = true): void {
     const clamped = clampSplitRatio(ratio);
     const changed = Math.abs(this.splitRatio - clamped) > 0.0005;
@@ -1473,6 +1614,7 @@ export class AppStore {
     this.sort = {colIndex: null, direction: null};
     this.clearColumnStatsCache();
     this.columnViewsBySheetId.clear();
+    this.dismissedQualityBySheet.clear();
 
     const sheet = this.activeSheet;
     this.resolveAndCacheInitialColumnView(sheet);
@@ -1764,7 +1906,12 @@ export class AppStore {
       this.loading = {active: false, message: '', progress: null};
       const workerCacheMatches = this.sheetVersion === reservedVersion;
       this.resetWithWorkbook(wb, workerCacheMatches);
-      this.emit(['loading']);
+      if (wb.fileFormat !== 'blank' && !this.preferSpatialStartup) {
+        this.layout = 'overview';
+        this.emit(['loading', 'layout', 'overview']);
+      } else {
+        this.emit(['loading']);
+      }
     } catch (err) {
       if (loadSeq !== this.loadFileSeq) return; // Ignore stale error from superseded load
       this.loading = {active: false, message: '', progress: null};

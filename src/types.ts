@@ -181,7 +181,7 @@ export interface ChartRecommendation {
   suggestedSpatial?: Partial<SpatialConfig>;
 }
 
-export type WorkspaceLayout = 'split' | 'table' | 'charts' | 'spatial';
+export type WorkspaceLayout = 'overview' | 'split' | 'table' | 'charts' | 'spatial';
 
 export type SortDirection = 'asc' | 'desc' | null;
 
@@ -301,6 +301,7 @@ export type AppDomain =
   | 'spatialData'
   | 'chartHighlight'
   | 'layout'
+  | 'overview'
   | 'vizMode'
   | 'loading'
   | 'error'
@@ -329,3 +330,149 @@ export type AnalyticalSelection =
       query?: ContributorQuery; previewRowIndices?: number[];
       itemId?: number; chartRowKey?: number; note?: string;
     };
+
+export type CatalogSortBy = 'source' | 'name' | 'missing' | 'role' | 'cardinality';
+
+export interface CatalogFilterState {
+  search: string;
+  role: SemanticType | 'all';
+  issuesOnly: boolean;
+  sortBy: CatalogSortBy;
+}
+
+export interface DatasetOverviewSummary {
+  fileName: string;
+  fileFormat: WorkbookState['fileFormat'];
+  sheetId: string;
+  sheetName: string;
+  totalRows: number;
+  visibleRows: number;
+  isFiltered: boolean;
+  totalCols: number;
+  visibleCols: number;
+  hiddenCols: number;
+  pinnedCols: number;
+  totalCells: number;
+  missingCells: number;
+  missingRate: number;
+  roleCounts: Record<SemanticType, number>;
+}
+
+export interface ColumnCatalogEntry {
+  colIndex: number;
+  letter: string;
+  name: string;
+  baseType: ColumnType;
+  semanticType: SemanticType;
+  inferredSemanticType: SemanticType;
+  roleOverride: SemanticType | null;
+  unit: string | null;
+  totalRows: number;
+  nonEmptyCount: number;
+  missingCount: number;
+  missingRate: number;
+  cardinality: number;
+  isHidden: boolean;
+  isPinned: boolean;
+  visualPosition: number;
+  hasIssues: boolean;
+  issueCount: number;
+  primaryIssueSummary: string | null;
+}
+
+export interface ColumnValueFrequency {
+  value: string;
+  count: number;
+  share: number;
+}
+
+export interface ColumnDetailSummary {
+  colIndex: number;
+  name: string;
+  letter: string;
+  semanticType: SemanticType;
+  inferredSemanticType: SemanticType;
+  roleOverride: SemanticType | null;
+  baseType: ColumnType;
+  unit: string | null;
+  totalRows: number;
+  nonEmptyCount: number;
+  missingCount: number;
+  missingRate: number;
+  uniqueCount: number;
+  numericStats: {
+    validCount: number;
+    nonNumericCount: number;
+    min: number;
+    q1: number;
+    median: number;
+    mean: number;
+    q3: number;
+    max: number;
+    negativeCount: number;
+    zeroCount: number;
+    positiveCount: number;
+  } | null;
+  categoricalStats: {
+    topValues: ColumnValueFrequency[];
+    otherCount: number;
+  } | null;
+  booleanStats: {
+    trueCount: number;
+    falseCount: number;
+    unexpectedCount: number;
+  } | null;
+  temporalStats: {
+    validCount: number;
+    invalidCount: number;
+    earliestIso: string | null;
+    latestIso: string | null;
+  } | null;
+  identifierStats: {
+    uniqueNonEmptyCount: number;
+    duplicateValueCount: number;
+    duplicateRowCount: number;
+    topDuplicates: Array<{value: string; count: number}>;
+  } | null;
+  textStats: {
+    minLength: number;
+    maxLength: number;
+    avgLength: number;
+    samples: string[];
+  } | null;
+}
+
+export type QualityIssueCategory =
+  | 'missing'
+  | 'type-consistency'
+  | 'constant'
+  | 'identifier';
+
+export type QualitySeverity = 'info' | 'attention';
+
+export interface QualityExample {
+  rowIndex: number;
+  colIndex: number;
+  value: string;
+}
+
+export interface QualityObservation {
+  id: string;
+  category: QualityIssueCategory;
+  severity: QualitySeverity;
+  colIndex: number | null;
+  columnName: string | null;
+  title: string;
+  explanation: string;
+  affectedCount: number;
+  affectedRate: number;
+  firstCell: CellCoord | null;
+  examples: QualityExample[];
+}
+
+export interface SuggestedAnalysisItem {
+  recommendation: ChartRecommendation;
+  targetLayout: WorkspaceLayout;
+  summary: string;
+}
+

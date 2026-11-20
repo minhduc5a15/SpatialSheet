@@ -44,7 +44,7 @@ const LONG_TEXT_THRESHOLD = 90;
 export interface SpreadsheetCallbacks {
   onCellCommit: (rowIndex: number, colIndex: number, value: string) => void;
   onSelectRow?: (rowIndex: number) => void;
-  onSelectCell: (coord: CellCoord | null) => void;
+  onSelectCell: (coord: CellCoord | null, origin?: 'pointer' | 'keyboard' | 'programmatic') => void;
   onSortColumn: (colIndex: number) => void;
   onRenameColumn: (colIndex: number, newName: string) => void;
   onDeleteColumn: (colIndex: number) => void;
@@ -406,7 +406,7 @@ export class SpreadsheetGrid {
           this.callbacks.onSelectCell({
             rowIndex: Number(rStr),
             colIndex: Number(cStr),
-          });
+          }, 'pointer');
         }
       },
       {signal}
@@ -1987,7 +1987,7 @@ export class SpreadsheetGrid {
     this.editingCell = {rowIndex, colIndex};
     this.activeCellInputCommitted = false;
     this.replaceInitChar = initialChar;
-    this.callbacks.onSelectCell({rowIndex, colIndex});
+    this.callbacks.onSelectCell({rowIndex, colIndex}, 'programmatic');
     this.renderVirtualWindow(true);
   }
 
@@ -2025,7 +2025,7 @@ export class SpreadsheetGrid {
       this.callbacks.onToggleHideColumn?.(colIdx);
     }
     const row = this.selectedCell?.rowIndex ?? this.visibleRowIndices[0] ?? 0;
-    this.callbacks.onSelectCell({rowIndex: row, colIndex: colIdx});
+    this.callbacks.onSelectCell({rowIndex: row, colIndex: colIdx}, 'programmatic');
     this.scrollToColumn(colIdx);
     this.focusCellButton(row, colIdx);
   }
@@ -2056,7 +2056,7 @@ export class SpreadsheetGrid {
     );
     const nextCol = visibleCols[nextColPos];
 
-    this.callbacks.onSelectCell({rowIndex: nextRow, colIndex: nextCol});
+    this.callbacks.onSelectCell({rowIndex: nextRow, colIndex: nextCol}, 'keyboard');
     this.scrollToRow(nextRow);
     if (deltaCol !== 0) {
       this.scrollToColumn(nextCol);

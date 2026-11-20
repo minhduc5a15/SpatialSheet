@@ -31,7 +31,10 @@ export function svgIcon(
     | 'sliders'
     | 'maximize'
     | 'check'
-    | 'copy',
+    | 'copy'
+    | 'overview'
+    | 'alert'
+    | 'compass',
   className = 'w-4 h-4'
 ): string {
   const common = `class="${className}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"`;
@@ -99,6 +102,12 @@ export function svgIcon(
       return `<svg ${common}><polyline points="20 6 9 17 4 12"/></svg>`;
     case 'copy':
       return `<svg ${common}><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+    case 'overview':
+      return `<svg ${common}><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>`;
+    case 'alert':
+      return `<svg ${common}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+    case 'compass':
+      return `<svg ${common}><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>`;
     default:
       return `<svg ${common}><circle cx="12" cy="12" r="4"/></svg>`;
   }

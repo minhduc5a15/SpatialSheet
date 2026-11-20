@@ -3,6 +3,7 @@ import {datasetCsv} from './fixtures/datasets';
 
 test('startup imports Unicode, quoted multiline fields, and completes worker loading', async ({page}) => {
   await importFixture(page, 'unicode.csv', 2, 3);
+  await page.getByRole('button', {name: 'Split', exact: true}).click();
   expect(page.workers().some(worker => worker.url().includes('dataWorker'))).toBe(true);
   await expect(cell(page, 'A1')).toHaveText('Nguyễn');
   await expect(cell(page, 'A2')).toHaveText('東京');
@@ -18,6 +19,7 @@ test('startup imports Unicode, quoted multiline fields, and completes worker loa
 
 test('split pointer resizing, bounds, reset, preset persistence preserve selection and chart', async ({page}) => {
   await importCsv(page, datasetCsv(), 100, 37);
+  await page.getByRole('button', {name: 'Split', exact: true}).click();
   await cell(page, 'C1').click();
   await page.getByLabel('Chart aggregation', {exact: true}).selectOption('sum');
   const divider = page.getByRole('separator', {name: 'Resize spreadsheet and chart panes'});
@@ -113,6 +115,7 @@ test('keyboard follows visible order across pinned boundary and commits/cancels 
 
 test('horizontal keyboard navigation scrolls the focused source cell into view', async ({page}) => {
   await importCsv(page, datasetCsv(), 100, 37);
+  await page.getByRole('button', {name: 'Split', exact: true}).click();
   await cell(page, 'A1').click();
   for (let c = 0; c < 20; c++) await page.keyboard.press('ArrowRight');
   await expect(cell(page, 'U1')).toBeFocused();
@@ -163,6 +166,7 @@ test('37-column Series Manager search, presets, semantic gating, and rendered va
 
 test('Table, Split, Charts, and normal-browser 3D transitions retain configuration', async ({page}) => {
   await importCsv(page, datasetCsv(), 100, 37);
+  await page.getByRole('button', {name: 'Split', exact: true}).click();
   await cell(page, 'C1').click();
   await page.getByLabel('Chart aggregation', {exact: true}).selectOption('sum');
   for (const mode of ['Table', 'Split', 'Charts', '3D XR', 'Split']) {
@@ -198,6 +202,7 @@ test('Table, Split, Charts, and normal-browser 3D transitions retain configurati
 
 test('repeated managers, split drags, modes, and column resizing remain responsive and bounded', async ({page}) => {
   await importCsv(page, datasetCsv(), 100, 37);
+  await page.getByRole('button', {name: 'Split', exact: true}).click();
   let settledNodes: number | undefined;
   for (let i = 0; i < 5; i++) {
     await role(page, 'col-manager-trigger').click();

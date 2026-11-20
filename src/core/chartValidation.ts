@@ -31,7 +31,11 @@ export function chartDisplaySummary(config: ChartConfig, visible: number, shown:
   const relevance = getSecondaryControlsForChartType(config.type);
   const agg = relevance.showAggregation ? config.aggregation ?? 'none' : 'none';
   const sort = relevance.showSort ? config.sortOrder ?? 'source' : 'source';
-  if (agg !== 'none') return `${sort === 'source' ? 'First' : 'Top'} ${shown} groups ${sort === 'source' ? 'in source order' : `by ${sort === 'value-desc' ? 'descending' : 'ascending'} primary aggregate`} · ${agg} across ${visible.toLocaleString('en-US')} filtered rows`;
+  if (agg !== 'none') {
+    const rankLabel = sort === 'source' ? 'First' : sort === 'value-asc' ? 'Bottom' : 'Top';
+    const orderDesc = sort === 'source' ? 'in source order' : `by ${sort === 'value-desc' ? 'descending' : 'ascending'} primary aggregate`;
+    return `${rankLabel} ${shown} groups ${orderDesc} · ${agg} across ${visible.toLocaleString('en-US')} filtered rows`;
+  }
   if (sort !== 'source') return `${shown} records by ${sort === 'value-desc' ? 'descending' : 'ascending'} primary value${visible > 25000 ? ' from a systematic sample of 4,000 candidates' : ` from ${visible.toLocaleString('en-US')} filtered rows`}`;
   return `${visible > shown ? 'Systematic sample: ' : 'Displaying '}${shown} of ${visible.toLocaleString('en-US')} filtered records`;
 }

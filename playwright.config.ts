@@ -1,4 +1,10 @@
 import {defineConfig, devices} from '@playwright/test';
+import {existsSync} from 'node:fs';
+
+const containerChromiumPath = '/ms-playwright/chrome-headless-shell-linux64/chrome-headless-shell';
+const executablePath =
+  process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ??
+  (existsSync(containerChromiumPath) ? containerChromiumPath : undefined);
 
 export default defineConfig({
   testDir: './e2e',
@@ -16,6 +22,20 @@ export default defineConfig({
     viewport: {width: 1440, height: 900},
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
+    ...(executablePath
+      ? {
+          launchOptions: {
+            executablePath,
+            headless: true,
+            chromiumSandbox: false,
+            args: [
+              '--use-gl=angle',
+              '--use-angle=swiftshader',
+              '--enable-unsafe-swiftshader',
+            ],
+          },
+        }
+      : {}),
   },
   projects: [{name: 'chromium', use: {...devices['Desktop Chrome'], viewport: {width: 1440, height: 900}}}],
   webServer: {

@@ -11,6 +11,7 @@ import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
 import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
 import {DataInspector} from './ui/DataInspector';
+import {DatasetOverview} from './ui/DatasetOverview';
 import {WorkspaceSplitter} from './ui/WorkspaceSplitter';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
@@ -31,12 +32,14 @@ class SpatialSheetApp {
   private spreadsheet!: SpreadsheetGrid;
   private chart2d!: InteractiveChart2D;
   private inspector!: DataInspector;
+  private overview!: DatasetOverview;
   private splitter!: WorkspaceSplitter;
   private spatialStage!: SpatialDataStage;
   private spatialOverlay!: SpatialInspectorOverlay;
 
   // Layout containers
   private mainEl!: HTMLElement;
+  private overviewHostEl!: HTMLElement;
   private gridHostEl!: HTMLElement;
   private splitterEl!: HTMLElement;
   private vizHostEl!: HTMLElement;
@@ -53,9 +56,12 @@ class SpatialSheetApp {
   private dropOverlayEl!: HTMLElement;
   private exitSimBtn!: HTMLButtonElement;
   private errorBannerEl!: HTMLElement;
+  private inspectToggleBtn!: HTMLButtonElement;
+  private autoOpenCheckbox!: HTMLInputElement;
 
   private lastTabsKey = '';
   private previewSplitRatio: number | null = null;
+  private autoOpenPaused = false;
   private readonly abortController = new AbortController();
   private resizeObservers: ResizeObserver[] = [];
   private storeUnsubscribes: Array<() => void> = [];
@@ -72,6 +78,7 @@ class SpatialSheetApp {
     if (params.get('mode') === 'spatial') {
       this.store.layout = 'spatial';
       this.store.chartPanelMode = '3d';
+      this.store.setPreferSpatialStartup(true);
     }
 
     this.renderAppShell();
@@ -179,7 +186,7 @@ class SpatialSheetApp {
             <div data-role="sheet-tabs" class="flex items-center gap-1 overflow-x-auto" role="tablist" aria-label="Sheet tabs"></div>
           </div>
 
-          <div class="flex flex-wrap items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
             <!-- Search -->
             <div class="relative">
               <span class="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none">
@@ -217,7 +224,11 @@ class SpatialSheetApp {
             </div>
 
             <!-- Workspace View Mode -->
-            <div class="flex items-center gap-1 p-1 bg-slate-100 rounded-lg" role="group" aria-label="Workspace layout">
+            <div class="flex items-center gap-1 p-1 bg-slate-100 rounded-lg min-w-0 max-w-full overflow-x-auto" role="group" aria-label="Workspace layout">
+              <button type="button" data-layout="overview" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('overview', 'w-3.5 h-3.5')}
+                <span>Overview</span>
+              </button>
               <button type="button" data-layout="split" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
                 ${svgIcon('split', 'w-3.5 h-3.5')}
                 <span>Split</span>
@@ -238,10 +249,19 @@ class SpatialSheetApp {
           </div>
         </div>
 
-        <button type="button" data-action="inspect-data" class="inspector-toggle">Inspect data</button>
+        <div class="inspector-utility-bar">
+          <label class="inspector-auto-open">
+            <input type="checkbox" data-action="auto-open-inspector" />
+            <span>Auto-open on selection</span>
+          </label>
+          <button type="button" data-action="inspect-data" class="inspector-toggle" aria-expanded="false">Inspect data</button>
+        </div>
         <div class="analytical-workspace">
         <!-- Main Workspace Canvas -->
         <main data-role="workspace-main" class="flex-1 min-h-0 p-3 lg:p-4 flex flex-col lg:flex-row gap-4 lg:gap-0 overflow-y-auto lg:overflow-hidden">
+          <!-- Dataset Overview Pane -->
+          <section data-role="overview-host" class="hidden w-full h-full min-h-0 overflow-y-auto sheet-scroll" aria-label="Dataset Overview"></section>
+
           <!-- Spreadsheet Pane -->
           <section data-role="grid-host" class="w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col"></section>
 
@@ -313,6 +333,7 @@ class SpatialSheetApp {
     `;
 
     this.mainEl = this.root.querySelector('[data-role="workspace-main"]')!;
+    this.overviewHostEl = this.root.querySelector('[data-role="overview-host"]')!;
     this.gridHostEl = this.root.querySelector('[data-role="grid-host"]')!;
     this.splitterEl = this.root.querySelector('[data-role="workspace-splitter"]')!;
     this.vizHostEl = this.root.querySelector('[data-role="viz-host"]')!;
@@ -335,6 +356,12 @@ class SpatialSheetApp {
       '[data-action="exit-simulator"]'
     )!;
     this.errorBannerEl = this.root.querySelector('[data-role="error-banner"]')!;
+    this.inspectToggleBtn = this.root.querySelector(
+      '[data-action="inspect-data"]'
+    )!;
+    this.autoOpenCheckbox = this.root.querySelector(
+      '[data-action="auto-open-inspector"]'
+    )!;
   }
 
   private initSubsystems(): void {
@@ -356,9 +383,15 @@ class SpatialSheetApp {
       onCellCommit: (rowIndex, colIndex, value) => {
         this.store.commitCellEdit(rowIndex, colIndex, value);
       },
-      onSelectRow: (row) => this.store.selectRow(row),
-      onSelectCell: (coord) => {
+      onSelectRow: (row) => {
+        this.store.selectRow(row);
+        this.maybeAutoOpenInspector();
+      },
+      onSelectCell: (coord, origin) => {
         this.store.selectCell(coord);
+        if (origin === 'pointer' && coord) {
+          this.maybeAutoOpenInspector();
+        }
       },
       onSortColumn: (colIndex) => {
         this.store.toggleSortColumn(colIndex);
@@ -413,10 +446,12 @@ class SpatialSheetApp {
       onPointSelect: (point, col, aggregation) => {
         this.store.selectChartPoint(point, col, aggregation);
         if (aggregation === 'none') this.spreadsheet.scrollToRow(point.rowIndex);
+        this.maybeAutoOpenInspector();
       },
       onRowSelect: (rowIndex) => {
         this.store.highlightRowFromChart(rowIndex);
         this.spreadsheet.scrollToRow(rowIndex);
+        this.maybeAutoOpenInspector();
       },
       onApplyRecommendation: (rec) => {
         this.store.applyRecommendation(rec);
@@ -429,6 +464,7 @@ class SpatialSheetApp {
         if (item && item.aggregation === 'none') {
           this.spreadsheet.scrollToRow(item.firstRowIndex);
         }
+        if (item) this.maybeAutoOpenInspector();
       },
       onItemHover: (item, clientX, clientY) => {
         this.spatialOverlay.showTooltip(item, clientX, clientY);
@@ -447,7 +483,10 @@ class SpatialSheetApp {
         onOverrideColumnRole: (colIndex, role) =>
           this.store.overrideColumnRole(colIndex, role),
         onApplyRecommendation: (rec) => this.store.applyRecommendation(rec),
-        onSelectItem: (item) => this.store.selectSpatialItem(item),
+        onSelectItem: (item) => {
+          this.store.selectSpatialItem(item);
+          if (item) this.maybeAutoOpenInspector();
+        },
         onJumpToRow: (rowIndex) => {
           this.store.jumpToRow(rowIndex);
           this.spreadsheet.scrollToRow(rowIndex);
@@ -456,15 +495,97 @@ class SpatialSheetApp {
       }
     );
 
-    this.inspector = new DataInspector(this.root.querySelector('[data-role="data-inspector"]')!, this.store,
+    this.overview = new DatasetOverview(this.overviewHostEl, this.store, {
+      onNavigateLayout: (layout) => this.store.setLayout(layout),
+      onFocusTableCell: (colIndex, rowIndex, targetLayout) => {
+        this.store.focusColumnInTable(colIndex, rowIndex, targetLayout);
+        if (this.store.selectedCell) {
+          this.spreadsheet.focusSourceCell(
+            this.store.selectedCell.rowIndex,
+            this.store.selectedCell.colIndex
+          );
+        }
+      },
+      onOpenSuggested: (item, targetLayout) => {
+        this.store.applySuggestedAnalysis(item, targetLayout);
+      },
+    });
+
+    this.inspector = new DataInspector(
+      this.root.querySelector('[data-role="data-inspector"]')!,
+      this.store,
       (row, col) => {
-        if (this.store.layout === 'charts' || this.store.layout === 'spatial') this.store.setLayout('split');
+        if (
+          this.store.layout === 'overview' ||
+          this.store.layout === 'charts' ||
+          this.store.layout === 'spatial'
+        ) {
+          this.store.setLayout('split');
+        }
         this.store.selectCell({rowIndex: row, colIndex: col});
-        if (this.store.activeColumnView.hidden.includes(col)) this.store.toggleColumnVisibility(col);
+        if (this.store.activeColumnView.hidden.includes(col)) {
+          this.store.toggleColumnVisibility(col);
+        }
         this.spreadsheet.focusSourceCell(row, col);
-      }, () => {this.applySplitWidths(this.store.splitRatio); this.syncSpatialSize();});
-    this.root.querySelector('[data-action="inspect-data"]')!.addEventListener('click', () => this.inspector.toggle(), {signal: this.abortController.signal});
-    this.storeUnsubscribes.push(this.store.subscribe(['selection','sheetData','visibleRows','profile'], () => this.inspector.update()));
+      },
+      () => {
+        this.applySplitWidths(this.store.splitRatio);
+        this.syncSpatialSize();
+        this.syncInspectToggleState();
+      },
+      () => {
+        this.autoOpenPaused = true;
+        this.syncInspectToggleState();
+      }
+    );
+
+    this.inspectToggleBtn.addEventListener(
+      'click',
+      () => {
+        if (!this.inspector.isOpen()) {
+          this.autoOpenPaused = false;
+        }
+        this.inspector.toggle();
+        this.syncInspectToggleState();
+      },
+      {signal: this.abortController.signal}
+    );
+    this.autoOpenCheckbox.checked = this.store.inspectorAutoOpen;
+    this.autoOpenCheckbox.addEventListener(
+      'change',
+      () => {
+        this.store.setInspectorAutoOpen(this.autoOpenCheckbox.checked);
+        if (this.autoOpenCheckbox.checked) {
+          this.autoOpenPaused = false;
+        }
+      },
+      {signal: this.abortController.signal}
+    );
+
+    this.storeUnsubscribes.push(
+      this.store.subscribe(['selection', 'sheetData', 'visibleRows', 'profile'], () =>
+        this.inspector.update()
+      )
+    );
+    this.storeUnsubscribes.push(
+      this.store.subscribe(
+        [
+          'workbook',
+          'sheetData',
+          'visibleRows',
+          'columnView',
+          'profile',
+          'overview',
+          'chartConfig',
+        ],
+        () => {
+          this.overview.update();
+          if (this.autoOpenCheckbox) {
+            this.autoOpenCheckbox.checked = this.store.inspectorAutoOpen;
+          }
+        }
+      )
+    );
 
     const options = new xb.Options();
     options.canvas = this.xrCanvasEl;
@@ -785,6 +906,21 @@ class SpatialSheetApp {
     this.errorBannerEl.classList.add('flex');
   }
 
+  private maybeAutoOpenInspector(): void {
+    if (this.store.inspectorAutoOpen && !this.autoOpenPaused) {
+      this.inspector.open(false);
+    }
+  }
+
+  private syncInspectToggleState(): void {
+    if (this.inspectToggleBtn) {
+      this.inspectToggleBtn.setAttribute(
+        'aria-expanded',
+        String(this.inspector.isOpen())
+      );
+    }
+  }
+
   private syncLayoutAndVizVisibility(): void {
     const {layout, chartPanelMode, isSimulatorFullscreen} = this.store;
 
@@ -806,17 +942,25 @@ class SpatialSheetApp {
           : 'px-3 py-1 text-xs rounded-md text-slate-600 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer';
       });
 
-    if (layout === 'table') {
+    if (layout === 'overview') {
+      this.overviewHostEl.classList.remove('hidden');
+      this.gridHostEl.classList.add('hidden');
+      this.vizHostEl.classList.add('hidden');
+      this.splitterEl.className = 'hidden';
+    } else if (layout === 'table') {
+      this.overviewHostEl.classList.add('hidden');
       this.gridHostEl.className =
         'w-full min-h-[340px] lg:min-h-0 lg:h-full flex-1 flex flex-col';
       this.vizHostEl.classList.add('hidden');
       this.splitterEl.className = 'hidden';
     } else if (layout === 'charts' || layout === 'spatial') {
+      this.overviewHostEl.classList.add('hidden');
       this.gridHostEl.classList.add('hidden');
       this.splitterEl.className = 'hidden';
       this.vizHostEl.className =
         'w-full min-h-[340px] lg:min-h-0 lg:h-full flex-1 flex flex-col gap-2';
     } else {
+      this.overviewHostEl.classList.add('hidden');
       this.gridHostEl.className =
         'w-full min-h-[340px] lg:min-h-0 lg:h-full lg:min-w-[300px] flex flex-col';
       this.splitterEl.className =
@@ -828,8 +972,9 @@ class SpatialSheetApp {
     this.applySplitWidths(this.previewSplitRatio ?? this.store.splitRatio);
 
     const show3D =
-      layout === 'spatial' || (layout !== 'table' && chartPanelMode === '3d');
-    const show2D = layout !== 'table' && !show3D;
+      layout === 'spatial' ||
+      ((layout === 'split' || layout === 'charts') && chartPanelMode === '3d');
+    const show2D = (layout === 'split' || layout === 'charts') && !show3D;
 
     this.chart2dHostEl.classList.toggle('hidden', !show2D);
     if (!isSimulatorFullscreen) {
@@ -859,6 +1004,13 @@ class SpatialSheetApp {
 
   private applySplitWidths(ratio: number): void {
     const {layout} = this.store;
+    if (layout === 'overview') {
+      this.gridHostEl.style.width = '';
+      this.gridHostEl.style.flex = '';
+      this.vizHostEl.style.width = '';
+      this.vizHostEl.style.flex = '';
+      return;
+    }
     if (layout === 'table') {
       this.gridHostEl.style.width = '';
       this.gridHostEl.style.flex = '1 1 0%';
@@ -967,6 +1119,9 @@ class SpatialSheetApp {
         'click',
         () => {
           this.store.resetWithWorkbook(createBlankWorkbook());
+          if (this.store.layout === 'overview') {
+            this.store.setLayout('split');
+          }
         },
         {signal}
       );
@@ -1183,6 +1338,7 @@ class SpatialSheetApp {
     this.splitter.dispose();
     this.spreadsheet.dispose();
     this.chart2d.dispose();
+    this.overview.dispose();
     this.inspector.dispose();
     this.spatialOverlay.dispose();
     this.store.dispose();

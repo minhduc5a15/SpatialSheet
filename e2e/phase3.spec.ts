@@ -13,12 +13,16 @@ const qualityCsv = [
   'ID-9,East,90,false,2024-09-10,PROD,"Supplementary reference commentary explaining baseline ninth row"',
 ].join('\n');
 
-test('Overview auto-enters only on file import, not on New Sheet, ?mode=spatial, edits, or undo', async ({page}) => {
+test('Overview auto-enters only on file import, not on New Sheet, edits, or undo', async ({page}) => {
   await page.goto('/');
   await expect(role(page, 'overview-host')).toBeHidden();
   await expect(role(page, 'grid-host')).toBeVisible();
 
-  await importCsv(page, qualityCsv, 9, 7);
+  await role(page, 'file-input').setInputFiles({
+    name: 'generated.csv', mimeType: 'text/csv', buffer: Buffer.from(qualityCsv),
+  });
+  await expect(role(page, 'file-meta')).toContainText('9 rows · 7 cols');
+  await expect(role(page, 'loading-status')).toBeHidden();
   await expect(role(page, 'overview-host')).toBeVisible();
   await expect(role(page, 'grid-host')).toBeHidden();
   await expect(role(page, 'overview-header')).toContainText('generated.csv');
@@ -41,8 +45,9 @@ test('Overview auto-enters only on file import, not on New Sheet, ?mode=spatial,
   await page.getByRole('button', {name: 'New Sheet', exact: true}).click();
   await expect(role(page, 'overview-host')).toBeHidden();
   await expect(role(page, 'grid-host')).toBeVisible();
+});
 
-  // ?mode=spatial stays in spatial mode on import
+test('Direct spatial startup preserves 3D mode after file import', async ({page}) => {
   await page.goto('/?mode=spatial');
   await role(page, 'file-input').setInputFiles({
     name: 'spatial.csv',

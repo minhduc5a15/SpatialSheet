@@ -1,3 +1,6 @@
+import {ChartBuilder} from './ChartBuilder';
+import {chartDisplaySummary} from '../core/chartValidation';
+import type {AnalyticalSelection} from '../types';
 import type {
   ChartAggregationMode,
   ChartConfig,
@@ -11,12 +14,8 @@ import type {
 import {
   CHART_PALETTE,
   formatDisplayNumber,
-  parseNumericValue,
 } from '../core/tabular';
-import {sampleChartIndices} from '../core/virtualWindow';
 import {
-  ChartSeriesManager,
-  MAX_RECOMMENDED_CHART_SERIES,
   applySeriesPreset,
   getSecondaryControlsForChartType,
   getSeriesColor,
@@ -30,233 +29,12 @@ const DEFAULT_MAX_CHART_POINTS = 32;
 export interface Chart2DCallbacks {
   onConfigChange: (config: ChartConfig) => void;
   onRowSelect: (rowIndex: number) => void;
+  onPointSelect?: (point: DataPointRow, colIndex: number, aggregation: ChartAggregationMode) => void;
   onApplyRecommendation?: (rec: ChartRecommendation) => void;
 }
 
-export interface DataPointRow {
-  rowIndex: number;
-  label: string;
-  values: (number | null)[];
-  hasAnyNumeric: boolean;
-  xNumeric: number | null;
-  groupCount?: number;
-}
-
-export interface ExtractChart2DOptions {
-  maxPoints?: number;
-  aggregation?: ChartAggregationMode;
-  sortOrder?: ChartSortOrder;
-  profile?: DatasetProfile | null;
-}
-
-function parseChartCellValue(raw: string, isBoolCol: boolean): number | null {
-  const p = parseNumericValue(raw);
-  if (p.value !== null) return p.value;
-  if (!isBoolCol) return null;
-  const low = raw.trim().toLowerCase();
-  if (low === 'true' || low === 'yes' || low === 'y') return 1;
-  if (low === 'false' || low === 'no' || low === 'n') return 0;
-  return null;
-}
-
-function isBooleanColumn(
-  profile: DatasetProfile | null | undefined,
-  colIdx: number
-): boolean {
-  const col = profile?.columns[colIdx];
-  const sem = col?.roleOverride ?? col?.semanticType;
-  return sem === 'boolean';
-}
-
-export function extractChart2DPoints(
-  sheet: SheetData,
-  visibleRowIndices: VisibleRowsSource,
-  xColIndex: number,
-  yColIndices: number[],
-  options?: ExtractChart2DOptions
-): {points: DataPointRow[]; hasAnyNumeric: boolean} {
-  const maxPoints = Math.max(4, options?.maxPoints ?? DEFAULT_MAX_CHART_POINTS);
-  const aggregation: ChartAggregationMode = options?.aggregation ?? 'none';
-  const sortOrder: ChartSortOrder = options?.sortOrder ?? 'source';
-  const profile = options?.profile ?? null;
-  const boolFlags = yColIndices.map((c) => isBooleanColumn(profile, c));
-
-  // Fast default path (no aggregation & source order)
-  if (aggregation === 'none' && sortOrder === 'source') {
-    const sampledIndices = sampleChartIndices(visibleRowIndices, maxPoints);
-    let hasAnyNumeric = false;
-    const points: DataPointRow[] = new Array<DataPointRow>(sampledIndices.length);
-
-    for (let i = 0; i < sampledIndices.length; i++) {
-      const rowIndex = sampledIndices[i];
-      const row = sheet.rows[rowIndex] ?? [];
-      const rawLabel = (row[xColIndex] ?? '').trim() || `Row ${rowIndex + 1}`;
-      const xParsed = parseNumericValue(rawLabel).value;
-      const values = new Array<number | null>(yColIndices.length);
-      let rowHasNum = false;
-      for (let s = 0; s < yColIndices.length; s++) {
-        const val = parseChartCellValue(row[yColIndices[s]] ?? '', boolFlags[s]);
-        if (val !== null) {
-          values[s] = val;
-          rowHasNum = true;
-          hasAnyNumeric = true;
-        } else {
-          values[s] = null;
-        }
-      }
-      points[i] = {
-        rowIndex,
-        label: rawLabel,
-        values,
-        hasAnyNumeric: rowHasNum,
-        xNumeric: xParsed,
-        groupCount: 1,
-      };
-    }
-
-    return {points, hasAnyNumeric};
-  }
-
-  // Raw sorted path
-  if (aggregation === 'none') {
-    const scanCap = visibleRowIndices.length <= 25000 ? visibleRowIndices.length : 4000;
-    const candidateIndices =
-      visibleRowIndices.length <= scanCap
-        ? visibleRowIndices
-        : sampleChartIndices(visibleRowIndices, scanCap);
-
-    let hasAnyNumeric = false;
-    const allRows: DataPointRow[] = new Array<DataPointRow>(candidateIndices.length);
-    for (let i = 0; i < candidateIndices.length; i++) {
-      const rowIndex = candidateIndices[i];
-      const row = sheet.rows[rowIndex] ?? [];
-      const rawLabel = (row[xColIndex] ?? '').trim() || `Row ${rowIndex + 1}`;
-      const xParsed = parseNumericValue(rawLabel).value;
-      const values = new Array<number | null>(yColIndices.length);
-      let rowHasNum = false;
-      for (let s = 0; s < yColIndices.length; s++) {
-        const val = parseChartCellValue(row[yColIndices[s]] ?? '', boolFlags[s]);
-        if (val !== null) {
-          values[s] = val;
-          rowHasNum = true;
-          hasAnyNumeric = true;
-        } else {
-          values[s] = null;
-        }
-      }
-      allRows[i] = {
-        rowIndex,
-        label: rawLabel,
-        values,
-        hasAnyNumeric: rowHasNum,
-        xNumeric: xParsed,
-        groupCount: 1,
-      };
-    }
-
-    if (sortOrder === 'value-desc' || sortOrder === 'value-asc') {
-      const dir = sortOrder === 'value-desc' ? -1 : 1;
-      allRows.sort((a, b) => {
-        const av = a.values[0];
-        const bv = b.values[0];
-        if (av === null && bv === null) return 0;
-        if (av === null) return 1;
-        if (bv === null) return -1;
-        return (av - bv) * dir;
-      });
-    }
-
-    return {
-      points: allRows.slice(0, maxPoints),
-      hasAnyNumeric,
-    };
-  }
-
-  // Grouped aggregation path ('sum' | 'avg' | 'count')
-  const groups = new Map<
-    string,
-    {
-      label: string;
-      firstRowIndex: number;
-      xNumeric: number | null;
-      sums: number[];
-      counts: number[];
-      rowCount: number;
-    }
-  >();
-
-  for (let i = 0; i < visibleRowIndices.length; i++) {
-    const rowIndex = visibleRowIndices[i];
-    const row = sheet.rows[rowIndex] ?? [];
-    const rawLabel = (row[xColIndex] ?? '').trim() || '(Empty)';
-    let group = groups.get(rawLabel);
-    if (!group) {
-      group = {
-        label: rawLabel,
-        firstRowIndex: rowIndex,
-        xNumeric: parseNumericValue(rawLabel).value,
-        sums: new Array<number>(yColIndices.length).fill(0),
-        counts: new Array<number>(yColIndices.length).fill(0),
-        rowCount: 0,
-      };
-      groups.set(rawLabel, group);
-    }
-    group.rowCount += 1;
-    for (let s = 0; s < yColIndices.length; s++) {
-      const val = parseChartCellValue(row[yColIndices[s]] ?? '', boolFlags[s]);
-      if (val !== null) {
-        group.sums[s] += val;
-        group.counts[s] += 1;
-      }
-    }
-  }
-
-  let hasAnyNumeric = false;
-  const aggregatedPoints: DataPointRow[] = [];
-  for (const g of groups.values()) {
-    const values = new Array<number | null>(yColIndices.length);
-    let rowHasNum = false;
-    for (let s = 0; s < yColIndices.length; s++) {
-      if (aggregation === 'count') {
-        values[s] = g.counts[s] > 0 ? g.counts[s] : g.rowCount;
-        rowHasNum = true;
-        hasAnyNumeric = true;
-      } else if (g.counts[s] > 0) {
-        values[s] =
-          aggregation === 'avg' ? g.sums[s] / g.counts[s] : g.sums[s];
-        rowHasNum = true;
-        hasAnyNumeric = true;
-      } else {
-        values[s] = null;
-      }
-    }
-    aggregatedPoints.push({
-      rowIndex: g.firstRowIndex,
-      label: g.label,
-      values,
-      hasAnyNumeric: rowHasNum,
-      xNumeric: g.xNumeric,
-      groupCount: g.rowCount,
-    });
-  }
-
-  if (sortOrder === 'value-desc' || sortOrder === 'value-asc') {
-    const dir = sortOrder === 'value-desc' ? -1 : 1;
-    aggregatedPoints.sort((a, b) => {
-      const av = a.values[0];
-      const bv = b.values[0];
-      if (av === null && bv === null) return 0;
-      if (av === null) return 1;
-      if (bv === null) return -1;
-      return (av - bv) * dir;
-    });
-  }
-
-  return {
-    points: aggregatedPoints.slice(0, maxPoints),
-    hasAnyNumeric,
-  };
-}
+export {extractChart2DPoints} from '../core/chartData';
+import {extractChart2DPoints, type DataPointRow} from '../core/chartData';
 
 function escapeHtml(str: string): string {
   return str
@@ -272,6 +50,8 @@ function truncateLabel(label: string, maxLen = 14): string {
 
 export class InteractiveChart2D {
   private container: HTMLElement;
+  private builder: ChartBuilder | null = null;
+  private analyticalSelection: AnalyticalSelection | null = null;
   private callbacks: Chart2DCallbacks;
   private sheet: SheetData | null = null;
   private profile: DatasetProfile | null = null;
@@ -288,26 +68,11 @@ export class InteractiveChart2D {
   private highlightedRowIndex: number | null = null;
 
   private chartControlsEl: HTMLElement | null = null;
-  private typeGroupEl: HTMLElement | null = null;
-  private xAxisSelectEl: HTMLSelectElement | null = null;
-  private seriesManagerHostEl: HTMLElement | null = null;
-  private seriesManager: ChartSeriesManager | null = null;
-  private secondaryControlsEl: HTMLElement | null = null;
-  private aggWrapEl: HTMLElement | null = null;
-  private aggSelectEl: HTMLSelectElement | null = null;
-  private sortWrapEl: HTMLElement | null = null;
-  private sortSelectEl: HTMLSelectElement | null = null;
-  private limitWrapEl: HTMLElement | null = null;
-  private limitSelectEl: HTMLSelectElement | null = null;
-  private clarityChipEl: HTMLElement | null = null;
-
   private chartCanvasWrapEl: HTMLElement | null = null;
   private legendEl: HTMLElement | null = null;
   private tooltipEl: HTMLElement | null = null;
 
   // Memoization keys & caches
-  private lastXSelectKey = '';
-  private lastControlsKey = '';
   private lastPointsKey: {
     sheet: SheetData | null;
     profile: DatasetProfile | null;
@@ -332,101 +97,9 @@ export class InteractiveChart2D {
   }
 
   private renderShell(): void {
-    const chartTypes: {
-      type: ChartType;
-      label: string;
-      icon: 'barChart' | 'lineChart' | 'pieChart' | 'scatterChart';
-    }[] = [
-      {type: 'bar', label: 'Bar', icon: 'barChart'},
-      {type: 'line', label: 'Line', icon: 'lineChart'},
-      {type: 'pie', label: 'Pie', icon: 'pieChart'},
-      {type: 'scatter', label: 'Scatter', icon: 'scatterChart'},
-    ];
-
-    const typeButtonsHtml = chartTypes
-      .map(
-        (item) => `
-          <button
-            type="button"
-            data-chart-type="${item.type}"
-            aria-pressed="false"
-            class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer text-slate-600 hover:text-slate-900"
-          >
-            ${svgIcon(item.icon, 'w-3.5 h-3.5')}
-            <span>${item.label}</span>
-          </button>
-        `
-      )
-      .join('');
-
     this.container.innerHTML = `
       <div class="flex flex-col h-full bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <!-- Chart Toolbar -->
-        <div
-          data-role="chart-controls"
-          class="flex flex-col gap-1.5 px-3 py-2 border-b border-slate-200 bg-slate-50/70"
-        >
-          <!-- Primary Controls Row -->
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div data-role="chart-type-group" class="flex items-center gap-1 p-1 bg-slate-200/70 rounded-lg" role="group" aria-label="Chart type">
-              ${typeButtonsHtml}
-            </div>
-            <div class="flex flex-wrap items-center gap-2">
-              <label class="inline-flex items-center gap-1.5 text-xs text-slate-600">
-                <span class="whitespace-nowrap">X Axis</span>
-                <select
-                  data-role="x-axis-select"
-                  aria-label="Select X-axis column"
-                  class="max-w-[148px] bg-white border border-slate-200 rounded-md px-2 py-1 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-                ></select>
-              </label>
-              <div data-role="series-manager-host"></div>
-            </div>
-          </div>
-
-          <!-- Secondary Relevant Controls Row -->
-          <div data-role="chart-secondary-controls" class="flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
-            <label data-role="ctrl-agg-wrap" class="inline-flex items-center gap-1">
-              <span>Agg</span>
-              <select
-                data-role="chart-agg-select"
-                aria-label="Chart aggregation"
-                class="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[11px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-              >
-                <option value="none">Raw</option>
-                <option value="sum">Sum</option>
-                <option value="avg">Avg</option>
-                <option value="count">Count</option>
-              </select>
-            </label>
-            <label data-role="ctrl-sort-wrap" class="inline-flex items-center gap-1">
-              <span>Sort</span>
-              <select
-                data-role="chart-sort-select"
-                aria-label="Chart sort order"
-                class="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[11px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-              >
-                <option value="source">Source</option>
-                <option value="value-desc">Value ↓</option>
-                <option value="value-asc">Value ↑</option>
-              </select>
-            </label>
-            <label data-role="ctrl-limit-wrap" class="inline-flex items-center gap-1">
-              <span>Points</span>
-              <select
-                data-role="chart-limit-select"
-                aria-label="Chart point limit"
-                class="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[11px] text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
-              >
-                <option value="12">12</option>
-                <option value="24">24</option>
-                <option value="32">32</option>
-                <option value="64">64</option>
-              </select>
-            </label>
-            <span data-role="chart-clarity-chip" class="hidden ml-auto px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800 text-[11px]"></span>
-          </div>
-        </div>
+        <div data-role="chart-controls"></div>
 
         <!-- SVG Chart Stage -->
         <div class="relative flex-1 min-h-[240px] p-3 flex flex-col">
@@ -446,106 +119,24 @@ export class InteractiveChart2D {
     `;
 
     this.chartControlsEl = this.container.querySelector('[data-role="chart-controls"]');
-    this.typeGroupEl = this.container.querySelector('[data-role="chart-type-group"]');
-    this.xAxisSelectEl = this.container.querySelector('[data-role="x-axis-select"]');
-    this.seriesManagerHostEl = this.container.querySelector('[data-role="series-manager-host"]');
-    this.secondaryControlsEl = this.container.querySelector('[data-role="chart-secondary-controls"]');
-    this.aggWrapEl = this.container.querySelector('[data-role="ctrl-agg-wrap"]');
-    this.aggSelectEl = this.container.querySelector('[data-role="chart-agg-select"]');
-    this.sortWrapEl = this.container.querySelector('[data-role="ctrl-sort-wrap"]');
-    this.sortSelectEl = this.container.querySelector('[data-role="chart-sort-select"]');
-    this.limitWrapEl = this.container.querySelector('[data-role="ctrl-limit-wrap"]');
-    this.limitSelectEl = this.container.querySelector('[data-role="chart-limit-select"]');
-    this.clarityChipEl = this.container.querySelector('[data-role="chart-clarity-chip"]');
+    this.builder = new ChartBuilder(this.chartControlsEl!, config => this.callbacks.onConfigChange(config));
 
     this.chartCanvasWrapEl = this.container.querySelector('[data-role="chart-canvas-wrap"]');
     this.legendEl = this.container.querySelector('[data-role="chart-legend"]');
     this.tooltipEl = this.container.querySelector('[data-role="chart-tooltip"]');
-
-    if (this.seriesManagerHostEl) {
-      this.seriesManager = new ChartSeriesManager(this.seriesManagerHostEl, {
-        onChangeSeries: (nextYColIndices) => {
-          this.callbacks.onConfigChange({
-            ...this.config,
-            yColIndices: nextYColIndices,
-          });
-        },
-      });
-    }
 
     this.bindDelegatedEvents();
   }
 
   private bindDelegatedEvents(): void {
     const {signal} = this.abortController;
-    if (this.typeGroupEl) {
-      this.typeGroupEl.addEventListener(
-        'click',
-        (e) => {
-          const target = e.target as HTMLElement | null;
-          const typeBtn = target?.closest<HTMLButtonElement>('[data-chart-type]');
-          if (!typeBtn) return;
-          const nextType = typeBtn.dataset.chartType as ChartType;
-          if (nextType !== this.config.type) {
-            this.callbacks.onConfigChange({
-              ...this.config,
-              type: nextType,
-            });
-          }
-        },
-        {signal}
-      );
-    }
-
-    this.xAxisSelectEl?.addEventListener(
-      'change',
-      () => {
-        if (!this.xAxisSelectEl) return;
-        this.callbacks.onConfigChange({
-          ...this.config,
-          xColIndex: Number(this.xAxisSelectEl.value),
-        });
-      },
-      {signal}
-    );
-
-    this.aggSelectEl?.addEventListener(
-      'change',
-      () => {
-        if (!this.aggSelectEl) return;
-        this.callbacks.onConfigChange({
-          ...this.config,
-          aggregation: this.aggSelectEl.value as ChartAggregationMode,
-        });
-      },
-      {signal}
-    );
-
-    this.sortSelectEl?.addEventListener(
-      'change',
-      () => {
-        if (!this.sortSelectEl) return;
-        this.callbacks.onConfigChange({
-          ...this.config,
-          sortOrder: this.sortSelectEl.value as ChartSortOrder,
-        });
-      },
-      {signal}
-    );
-
-    this.limitSelectEl?.addEventListener(
-      'change',
-      () => {
-        if (!this.limitSelectEl) return;
-        this.callbacks.onConfigChange({
-          ...this.config,
-          maxPoints: Number(this.limitSelectEl.value),
-        });
-      },
-      {signal}
-    );
-
     if (this.chartCanvasWrapEl) {
+      this.chartCanvasWrapEl.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          const point = (event.target as Element).closest<SVGElement>('[data-point-row]');
+          if (point) {event.preventDefault(); point.dispatchEvent(new MouseEvent('click', {bubbles: true}));}
+        }
+      }, {signal});
       this.chartCanvasWrapEl.addEventListener(
         'click',
         (e) => {
@@ -565,7 +156,7 @@ export class InteractiveChart2D {
                 yColIndices: recCols,
               });
             } else if (action === 'open-series') {
-              this.seriesManager?.open();
+              this.builder?.openSeries();
             }
             return;
           }
@@ -573,7 +164,12 @@ export class InteractiveChart2D {
           const pointEl = target?.closest<SVGElement>('[data-point-row]');
           if (pointEl) {
             const rowIndex = Number(pointEl.dataset.pointRow);
-            this.callbacks.onRowSelect(rowIndex);
+            const point = this.cachedPoints.find(p => p.rowIndex === rowIndex);
+            const colIndex = Number(pointEl.dataset.pointCol ?? this.config.yColIndices[0]);
+            if (point && this.callbacks.onPointSelect) {
+              const agg = getSecondaryControlsForChartType(this.config.type).showAggregation ? this.config.aggregation ?? 'none' : 'none';
+              this.callbacks.onPointSelect(point, colIndex, agg);
+            } else this.callbacks.onRowSelect(rowIndex);
           }
         },
         {signal}
@@ -656,7 +252,9 @@ export class InteractiveChart2D {
     highlightedRowIndex: number | null;
     recommendations?: ChartRecommendation[];
     profile?: DatasetProfile | null;
+    analyticalSelection?: AnalyticalSelection | null;
   }): void {
+    this.analyticalSelection = params.analyticalSelection ?? null;
     this.sheet = params.sheet;
     this.visibleRowIndices = params.visibleRowIndices;
     this.config = {
@@ -678,8 +276,9 @@ export class InteractiveChart2D {
   }
 
   /** Fast highlight update without touching controls or re-sampling dataset. */
-  public setHighlight(highlightedRowIndex: number | null): void {
-    if (this.highlightedRowIndex === highlightedRowIndex) return;
+  public setHighlight(highlightedRowIndex: number | null, selection?: AnalyticalSelection | null): void {
+    if (this.highlightedRowIndex === highlightedRowIndex && this.analyticalSelection === selection) return;
+    this.analyticalSelection = selection ?? null;
     this.highlightedRowIndex = highlightedRowIndex;
     if (this.sheet && this.cachedHasNumeric) {
       this.renderChart();
@@ -687,86 +286,7 @@ export class InteractiveChart2D {
   }
 
   private renderControlsIfNeeded(): void {
-    if (!this.chartControlsEl || !this.sheet) return;
-    const sheet = this.sheet;
-    const agg = this.config.aggregation ?? 'none';
-    const sort = this.config.sortOrder ?? 'source';
-    const maxPts = this.config.maxPoints ?? DEFAULT_MAX_CHART_POINTS;
-
-    // 1. Update X-axis options only when sheet columns or xColIndex change
-    const xKey = `${sheet.id}|${sheet.columns.join('\x00')}|${this.config.xColIndex}`;
-    if (xKey !== this.lastXSelectKey && this.xAxisSelectEl) {
-      this.lastXSelectKey = xKey;
-      this.xAxisSelectEl.innerHTML = sheet.columns
-        .map(
-          (col, idx) =>
-            `<option value="${idx}" ${idx === this.config.xColIndex ? 'selected' : ''}>${escapeHtml(col)}</option>`
-        )
-        .join('');
-    }
-
-    // 2. Update Series Manager popover state cleanly without unmounting DOM
-    this.seriesManager?.update({
-      sheet,
-      profile: this.profile,
-      xColIndex: this.config.xColIndex,
-      yColIndices: this.config.yColIndices,
-      chartType: this.config.type,
-    });
-
-    const controlsKey = `${this.config.type}|${this.config.yColIndices.join(',')}|${agg}|${sort}|${maxPts}`;
-    if (controlsKey === this.lastControlsKey) return;
-    this.lastControlsKey = controlsKey;
-
-    // 3. Chart type buttons
-    this.typeGroupEl
-      ?.querySelectorAll<HTMLButtonElement>('[data-chart-type]')
-      .forEach((btn) => {
-        const active = btn.dataset.chartType === this.config.type;
-        btn.setAttribute('aria-pressed', String(active));
-        btn.className = `inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-          active
-            ? 'bg-white text-blue-700 shadow-xs font-semibold'
-            : 'text-slate-600 hover:text-slate-900'
-        }`;
-      });
-
-    // 4. Secondary controls strict relevance gating
-    const vis = getSecondaryControlsForChartType(this.config.type);
-    this.aggWrapEl?.classList.toggle('hidden', !vis.showAggregation);
-    this.aggWrapEl?.classList.toggle('inline-flex', vis.showAggregation);
-    if (this.aggSelectEl) this.aggSelectEl.value = agg;
-
-    this.sortWrapEl?.classList.toggle('hidden', !vis.showSort);
-    this.sortWrapEl?.classList.toggle('inline-flex', vis.showSort);
-    if (this.sortSelectEl) this.sortSelectEl.value = sort;
-
-    this.limitWrapEl?.classList.toggle('hidden', !vis.showLimit);
-    this.limitWrapEl?.classList.toggle('inline-flex', vis.showLimit);
-    if (this.limitSelectEl) this.limitSelectEl.value = String(maxPts);
-
-    const anySecondary = vis.showAggregation || vis.showSort || vis.showLimit;
-    const tooManySeries = this.config.yColIndices.length > MAX_RECOMMENDED_CHART_SERIES;
-    const singleSeriesNote =
-      (this.config.type === 'pie' || this.config.type === 'scatter') &&
-      this.config.yColIndices.length > 1;
-
-    if (this.clarityChipEl) {
-      if (tooManySeries) {
-        this.clarityChipEl.textContent = `Showing ${this.config.yColIndices.length} series (≤${MAX_RECOMMENDED_CHART_SERIES} recommended)`;
-        this.clarityChipEl.classList.remove('hidden');
-      } else if (singleSeriesNote) {
-        this.clarityChipEl.textContent = `Plotting primary: ${sheet.columns[this.config.yColIndices[0]] ?? ''}`;
-        this.clarityChipEl.classList.remove('hidden');
-      } else {
-        this.clarityChipEl.classList.add('hidden');
-      }
-    }
-
-    this.secondaryControlsEl?.classList.toggle(
-      'hidden',
-      !anySecondary && !tooManySeries && !singleSeriesNote
-    );
+    if (this.sheet) this.builder?.update(this.sheet, this.profile, this.config, this.recommendations);
   }
 
   private getMemoizedPoints(): {points: DataPointRow[]; hasAnyNumeric: boolean} {
@@ -877,12 +397,12 @@ export class InteractiveChart2D {
       ? this.config.maxPoints ?? DEFAULT_MAX_CHART_POINTS
       : DEFAULT_MAX_CHART_POINTS;
 
-    const sampleNoteHtml =
-      effAgg !== 'none'
-        ? `<span class="text-[11px] text-slate-500 font-mono-tabular">Grouped (${effAgg}) · ${points.length} buckets from ${totalVisible.toLocaleString('en-US')} rows</span>`
-        : totalVisible > effMax
-          ? `<span class="text-[11px] text-slate-400 font-mono-tabular">Sampled ${points.length} of ${totalVisible.toLocaleString('en-US')} rows</span>`
-          : '';
+    const displayNote = this.config.type === 'pie'
+      ? `Pie: ${Math.min(12, points.filter(p => p.values[0] !== null && p.values[0] > 0).length)} positive slices from ${points.length} candidates · proportions of displayed slices · ${totalVisible} filtered records`
+      : this.config.type === 'scatter'
+        ? `${chartDisplaySummary(this.config, totalVisible, points.length)} · ${points.filter(p => p.xNumeric !== null && p.values[0] !== null).length} valid numeric pairs plotted`
+        : chartDisplaySummary(this.config, totalVisible, points.length);
+    const sampleNoteHtml = `<span data-role="chart-display-summary" class="text-xs text-slate-500">${escapeHtml(displayNote)}</span>`;
 
     const suggested2D = this.recommendations.find(
       (r) =>
@@ -905,6 +425,9 @@ export class InteractiveChart2D {
 
   private renderChart(): void {
     if (!this.chartCanvasWrapEl || !this.legendEl || !this.sheet) return;
+    const active = document.activeElement as SVGElement | null;
+    const focusedRow = active && this.chartCanvasWrapEl.contains(active) ? active.dataset.pointRow : undefined;
+    const focusedCol = active?.dataset.pointCol;
     this.activeTooltipTarget = null;
     this.tooltipEl?.classList.add('hidden');
 
@@ -972,6 +495,26 @@ export class InteractiveChart2D {
     } else {
       this.renderBarChart(points);
     }
+    this.decoratePoints();
+    if (focusedRow !== undefined) {
+      const selector = `[data-point-row="${Number(focusedRow)}"]${focusedCol !== undefined ? `[data-point-col="${Number(focusedCol)}"]` : ''}`;
+      this.chartCanvasWrapEl.querySelector<SVGElement>(selector)?.focus({preventScroll: true});
+    }
+  }
+
+  private decoratePoints(): void {
+    this.chartCanvasWrapEl?.querySelectorAll<SVGElement>('[data-point-row]').forEach(el => {
+      const row = Number(el.dataset.pointRow);
+      const col = Number(el.dataset.pointCol ?? this.config.yColIndices[0]);
+      const selection = this.analyticalSelection;
+      const selected = selection?.kind === 'aggregate'
+        ? selection.origin === '2d' && selection.chartRowKey === row && selection.colIndex === col
+        : this.highlightedRowIndex === row;
+      el.setAttribute('role', 'button'); el.setAttribute('tabindex', '0');
+      el.setAttribute('aria-label', `${el.dataset.tipTitle ?? 'Chart point'} · ${el.dataset.tipSub ?? this.sheet?.columns[col] ?? ''}`);
+      el.setAttribute('aria-pressed', String(selected));
+      el.classList.toggle('analytical-point-selected', selected);
+    });
   }
 
   private getMinMaxValues(points: DataPointRow[]): {minVal: number; maxVal: number} {
@@ -1063,7 +606,7 @@ export class InteractiveChart2D {
             rx="${barW >= 6 ? 3 : 1}"
             fill="${color}"
             opacity="${this.highlightedRowIndex !== null && !isRowSelected ? '0.55' : '0.92'}"
-            data-point-row="${pt.rowIndex}"
+            data-point-row="${pt.rowIndex}" data-point-col="${yColIdx}"
             data-tip-title="${escapeHtml(pt.label)}${escapeHtml(countSuffix)}"
             data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(val, colType))}"
             class="cursor-pointer transition-opacity hover:opacity-100"
@@ -1325,9 +868,7 @@ export class InteractiveChart2D {
 
     const validYPoints = points.filter((pt) => pt.values[0] !== null);
     const hasNumericX = validYPoints.some((pt) => pt.xNumeric !== null);
-    const scatterPoints = hasNumericX
-      ? validYPoints.filter((pt) => pt.xNumeric !== null)
-      : validYPoints;
+    const scatterPoints = validYPoints.filter((pt) => pt.xNumeric !== null);
 
     if (scatterPoints.length === 0) {
       wrap.innerHTML = `<div class="flex items-center justify-center h-full text-xs text-slate-500">Valid numeric values are required to render a scatter chart.</div>`;
@@ -1390,7 +931,7 @@ export class InteractiveChart2D {
               fill-opacity="0.85"
               stroke="#ffffff"
               stroke-width="2"
-              data-point-row="${pt.rowIndex}"
+              data-point-row="${pt.rowIndex}" data-point-col="${yColIdx}"
               data-tip-title="${escapeHtml(pt.label)}"
               data-tip-sub="${escapeHtml(colName)}: ${escapeHtml(formatDisplayNumber(yv, colType))}"
               class="cursor-pointer"
@@ -1425,7 +966,6 @@ export class InteractiveChart2D {
     this.abortController.abort();
     this.activeTooltipTarget = null;
     this.tooltipEl?.classList.add('hidden');
-    this.seriesManager?.dispose();
-    this.seriesManager = null;
+    this.builder?.dispose();
   }
 }

@@ -43,6 +43,7 @@ const LONG_TEXT_THRESHOLD = 90;
 
 export interface SpreadsheetCallbacks {
   onCellCommit: (rowIndex: number, colIndex: number, value: string) => void;
+  onSelectRow?: (rowIndex: number) => void;
   onSelectCell: (coord: CellCoord | null) => void;
   onSortColumn: (colIndex: number) => void;
   onRenameColumn: (colIndex: number, newName: string) => void;
@@ -390,6 +391,8 @@ export class SpreadsheetGrid {
           return;
         }
 
+        const rowButton = target.closest<HTMLElement>('[data-select-row]');
+        if (rowButton) {this.callbacks.onSelectRow?.(Number(rowButton.dataset.selectRow)); return;}
         const delRowBtn = target.closest<HTMLElement>('[data-delete-row]');
         if (delRowBtn) {
           this.callbacks.onDeleteRow(Number(delRowBtn.dataset.deleteRow));
@@ -1798,7 +1801,7 @@ export class SpreadsheetGrid {
         <tr data-row-index="${rowIdx}" data-disp-idx="${dispIdx}" ${isRowHighlighted ? 'data-highlighted="1"' : ''} class="group ${rowBg} hover:bg-blue-50/40" style="height:${GRID_ROW_HEIGHT}px">
           <td class="sticky left-0 z-[15] bg-slate-50 border-b border-r border-slate-200 px-1.5 py-0 text-center select-none overflow-hidden" style="left:0;height:${GRID_ROW_HEIGHT}px">
             <div class="flex items-center justify-between gap-1">
-              <span class="font-mono-tabular text-[11px] text-slate-400 truncate text-right flex-1">${rowIdx + 1}</span>
+              <button type="button" data-select-row="${rowIdx}" aria-label="Select row ${rowIdx + 1}" class="font-mono-tabular text-[11px] text-slate-500 truncate text-right flex-1">${rowIdx + 1}</button>
               <button
                 type="button"
                 data-delete-row="${rowIdx}"
@@ -1986,6 +1989,10 @@ export class SpreadsheetGrid {
     this.replaceInitChar = initialChar;
     this.callbacks.onSelectCell({rowIndex, colIndex});
     this.renderVirtualWindow(true);
+  }
+
+  public focusSourceCell(rowIndex: number, colIndex: number): void {
+    this.scrollToRow(rowIndex); this.scrollToColumn(colIndex); this.focusCellButton(rowIndex, colIndex);
   }
 
   public scrollToColumn(sourceColIndex: number): void {

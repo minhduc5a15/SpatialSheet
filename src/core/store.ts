@@ -1,5 +1,7 @@
 import type {
   AppDomain,
+  AnalyticalSelection,
+  ContributorQuery,
   CellCoord,
   ChartConfig,
   ChartRecommendation,
@@ -66,6 +68,9 @@ import {
   suggestChartConfig,
 } from './tabular';
 import {DataWorkerClient, buildFilterKey} from './workerClient';
+import {matchesContributor} from './analyticalSelection';
+import {resetChartConfig} from './chartValidation';
+import type {DataPointRow} from './chartData';
 
 export type StoreListener = (changed: ReadonlySet<AppDomain>) => void;
 
@@ -89,6 +94,20 @@ export class AppStore {
   public sort: SortState = {colIndex: null, direction: null};
   public visibleRowIndices: VisibleRowsSource = [];
   public selectedCell: CellCoord | null = null;
+  // Grid cursor is the compatibility projection. Rich chart/group context is owned here,
+  // never in an Inspector-local copy, and expires with its source/derivation revision.
+  private analyticalContext: AnalyticalSelection | null = null;
+  private groupFilter: ContributorQuery | null = null;
+  public get groupFilterLabel(): string | null {
+    return this.groupFilter?.fields.map(f => `${this.activeSheet.columns[f.colIndex]}: ${f.value}`).join(', ') ?? null;
+  }
+  public get analyticalSelection(): AnalyticalSelection | null {
+    if (this.analyticalContext) return this.analyticalContext;
+    const c = this.selectedCell;
+    return c && this.activeSheet.rows[c.rowIndex] && c.colIndex < this.activeSheet.columns.length
+      ? {kind: 'cell', sheetId: this.activeSheet.id, ...c} : null;
+  }
+
   public highlightedRowIndex: number | null = null;
   public chartConfig: ChartConfig;
   public layout: WorkspaceLayout = 'split';
@@ -149,6 +168,7 @@ export class AppStore {
       firstSheet.rows.length > 0 ? {rowIndex: 0, colIndex: 0} : null;
 
     this.datasetProfile = profileDataset(firstSheet, this.sheetVersion);
+    this.chartConfig = resetChartConfig(firstSheet, this.chartConfig.spatialMode, this.datasetProfile);
     this.spatialConfig = createDefaultSpatialConfig(
       this.datasetProfile,
       this.chartConfig
@@ -258,6 +278,10 @@ export class AppStore {
   }
 
   private nextSheetVersion(): number {
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
+    if (this.groupFilter) this.visibleRowIndices = filterAndSortRowsBuffer(this.activeSheet, this.searchQuery, this.sort);
+    this.groupFilter = null;
     this.sheetVersion += 1;
     return this.sheetVersion;
   }
@@ -302,6 +326,7 @@ export class AppStore {
 
   private hasActiveFilterOrSort(): boolean {
     return (
+      this.groupFilter !== null ||
       this.searchQuery.trim().length > 0 ||
       (this.sort.colIndex !== null && this.sort.direction !== null)
     );
@@ -395,6 +420,7 @@ export class AppStore {
         colIndex: colIdx,
         visibleRowIndices: reqVisible,
         searchQuery: reqSearch,
+        filterKeyOverride: this.groupFilter ? `${buildFilterKey(reqSearch, reqSort)}|group:${JSON.stringify(this.groupFilter)}` : undefined,
         sort: reqSort,
       })
       .then((stats) => {
@@ -437,7 +463,7 @@ export class AppStore {
 
   private buildSpatialCacheKey(): string {
     const cfg = this.spatialConfig;
-    const visKey = `${this.visibleRowIndices.length}:${buildFilterKey(this.searchQuery, this.sort)}`;
+    const visKey = `${this.visibleRowIndices.length}:${buildFilterKey(this.searchQuery, this.sort)}:${JSON.stringify(this.groupFilter)}`;
     const overridesKey = this.datasetProfile.columns
       .map((c) => `${c.colIndex}:${c.roleOverride ?? ''}`)
       .join(',');
@@ -459,6 +485,7 @@ export class AppStore {
     );
     this.chartRecommendations = recommendCharts(this.datasetProfile);
     if (resetSpatialDefaults) {
+      this.chartConfig = resetChartConfig(this.activeSheet, this.chartConfig.spatialMode, this.datasetProfile);
       this.spatialConfig = createDefaultSpatialConfig(
         this.datasetProfile,
         this.chartConfig
@@ -543,6 +570,7 @@ export class AppStore {
         sheetVersion: reqVersion,
         visibleRowIndices: reqVisible,
         searchQuery: this.searchQuery,
+        filterKeyOverride: this.groupFilter ? `${buildFilterKey(this.searchQuery, this.sort)}|group:${JSON.stringify(this.groupFilter)}` : undefined,
         sort: this.sort,
         profile: this.datasetProfile,
         config: this.spatialConfig,
@@ -588,12 +616,16 @@ export class AppStore {
   }
 
   public selectCell(coord: CellCoord | null): void {
+    const hadContext = this.analyticalContext !== null || this.selectedSpatialItem !== null;
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
+    if (coord && (!this.activeSheet.rows[coord.rowIndex] || coord.colIndex < 0 || coord.colIndex >= this.activeSheet.columns.length)) coord = null;
     const nextRow = coord ? coord.rowIndex : null;
     const sameCell =
       this.selectedCell?.rowIndex === coord?.rowIndex &&
       this.selectedCell?.colIndex === coord?.colIndex;
     const sameRow = this.highlightedRowIndex === nextRow;
-    if (sameCell && sameRow) return;
+    if (sameCell && sameRow && !hadContext) return;
 
     const prevCol = this.selectedCell?.colIndex ?? -1;
     this.selectedCell = coord;
@@ -617,6 +649,7 @@ export class AppStore {
   }
 
   public highlightRowFromChart(rowIndex: number): void {
+    this.analyticalContext = null;
     if (rowIndex < 0 || rowIndex >= this.activeSheet.rows.length) return;
     const nextCoord: CellCoord = {
       rowIndex,
@@ -646,25 +679,76 @@ export class AppStore {
   }
 
   public selectSpatialItem(item: SpatialDataItem | null): void {
+    if (item && (this.spatialTransformLoading || this.spatialStale || !this.derivedSpatialData.items.includes(item))) return;
     this.selectedSpatialItem = item;
-    if (!item) {
-      this.emit(['spatialData']);
-      return;
+    this.analyticalContext = null;
+    this.selectedCell = null;
+    this.highlightedRowIndex = null;
+    if (item) {
+      const colIndex = item.measureColIndex ?? this.spatialConfig.yColIndex;
+      if (item.aggregation !== 'none') {
+        this.analyticalContext = {
+          kind: 'aggregate', origin: '3d', sheetId: this.activeSheet.id,
+          label: item.label, colIndex, value: item.yValue, aggregation: item.aggregation,
+          representedRowCount: item.recordCount, contributingCount: item.recordCount,
+          query: item.provenance, previewRowIndices: item.provenance ? undefined : item.rowIndices.slice(0, 100),
+          itemId: item.id,
+          note: item.provenance ? this.derivedSpatialData.dataStateSummary : 'Bounded example records retained by the spatial engine; this is not the complete group.',
+        };
+      } else {
+        this.selectedCell = {rowIndex: item.firstRowIndex, colIndex};
+        this.highlightedRowIndex = item.firstRowIndex;
+        this.analyticalContext = {kind: 'spatial-item', sheetId: this.activeSheet.id, ...this.selectedCell, itemId: item.id};
+      }
     }
-
-    const targetRow = item.firstRowIndex;
-    const targetCol = this.spatialConfig.yColIndex ?? 0;
-    this.selectedCell = {rowIndex: targetRow, colIndex: targetCol};
-    this.highlightedRowIndex = targetRow;
-    const statsChanged = this.refreshActiveColumnStats(true);
-    this.emit(
-      statsChanged
-        ? ['selection', 'chartHighlight', 'spatialData', 'stats']
-        : ['selection', 'chartHighlight', 'spatialData']
-    );
+    this.refreshActiveColumnStats(true);
+    this.emit(['selection', 'chartHighlight', 'spatialData', 'stats']);
   }
 
+  public selectRow(rowIndex: number): void {
+    this.selectCell({rowIndex, colIndex: this.selectedCell?.colIndex ?? 0});
+    if (!this.selectedCell) return;
+    this.analyticalContext = {kind: 'row', sheetId: this.activeSheet.id, ...this.selectedCell};
+    this.emit(['selection']);
+  }
+
+  public selectChartPoint(point: DataPointRow, colIndex: number, aggregation: ChartConfig['aggregation']): void {
+    if (!this.activeSheet.rows[point.rowIndex] || !this.chartConfig.yColIndices.includes(colIndex)) return;
+    if (!aggregation || aggregation === 'none') {
+      this.selectCell({rowIndex: point.rowIndex, colIndex});
+      this.analyticalContext = {kind: 'chart-point', sheetId: this.activeSheet.id, rowIndex: point.rowIndex, colIndex};
+    } else {
+      const seriesIndex = this.chartConfig.yColIndices.indexOf(colIndex);
+      const valid = point.validCounts?.[seriesIndex];
+      this.selectedCell = null;
+      this.highlightedRowIndex = null;
+      this.selectedSpatialItem = null;
+      this.analyticalContext = {
+        kind: 'aggregate', origin: '2d', sheetId: this.activeSheet.id, label: point.label,
+        colIndex, aggregation, value: point.values[seriesIndex] ?? null,
+        representedRowCount: point.groupCount ?? 0, contributingCount: valid,
+        excludedCount: valid === undefined ? undefined : (point.groupCount ?? 0) - valid,
+        chartRowKey: point.rowIndex,
+        query: {fields: [{colIndex: this.chartConfig.xColIndex, value: point.label, emptyLabel: '(Empty)'}],
+          numericColIndex: colIndex, booleanValues: (this.datasetProfile.columns[colIndex]?.roleOverride ?? this.datasetProfile.columns[colIndex]?.semanticType) === 'boolean'},
+      };
+    }
+    this.emit(['selection', 'chartHighlight', 'spatialData']);
+  }
+
+  public async filterToSelectionGroup(): Promise<void> {
+    const selection = this.analyticalSelection;
+    if (selection?.kind !== 'aggregate' || !selection.query) return;
+    // Group membership includes missing measures; the Inspector labels excluded inputs separately.
+    this.groupFilter = {fields: selection.query.fields};
+    await this.recomputeVisibleRows();
+  }
+
+  public resetChart(): void { this.setChartConfig(resetChartConfig(this.activeSheet, this.chartConfig.spatialMode, this.datasetProfile)); }
+
   public jumpToRow(rowIndex: number): void {
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
     if (rowIndex < 0 || rowIndex >= this.activeSheet.rows.length) return;
     const colIndex = this.spatialConfig.yColIndex ?? 0;
     this.selectedCell = {rowIndex, colIndex};
@@ -678,10 +762,12 @@ export class AppStore {
   }
 
   public setSpatialConfig(partial: Partial<SpatialConfig>): void {
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
     this.spatialConfig = {...this.spatialConfig, ...partial};
     this.clampSpatialColumns();
     this.refreshDerivedSpatialData(true);
-    this.emit(['spatialData']);
+    this.emit(['selection', 'chartHighlight', 'spatialData']);
   }
 
   public overrideColumnRole(colIndex: number, role: SemanticType | null): void {
@@ -691,13 +777,17 @@ export class AppStore {
       role
     );
     if (nextProfile === this.datasetProfile) return;
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
     this.datasetProfile = nextProfile;
     this.chartRecommendations = recommendCharts(this.datasetProfile);
     this.refreshDerivedSpatialData(true);
-    this.emit(['profile', 'spatialData']);
+    this.emit(['selection', 'chartHighlight', 'profile', 'spatialData']);
   }
 
   public applyRecommendation(rec: ChartRecommendation): void {
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
     if (rec.targetSurface === '2d') {
       this.chartConfig = {
         ...this.chartConfig,
@@ -709,7 +799,7 @@ export class AppStore {
         this.clampSpatialColumns();
         this.refreshDerivedSpatialData(true);
       }
-      this.emit(['chartConfig', 'spatialData']);
+      this.emit(['chartConfig', 'selection', 'chartHighlight', 'spatialData']);
       return;
     }
 
@@ -722,7 +812,7 @@ export class AppStore {
     this.clampSpatialColumns();
     this.selectedSpatialItem = null;
     this.refreshDerivedSpatialData(true);
-    this.emit(['chartConfig', 'vizMode', 'spatialData']);
+    this.emit(['chartConfig', 'vizMode', 'selection', 'chartHighlight', 'spatialData']);
   }
 
   public commitCellEdit(
@@ -787,6 +877,7 @@ export class AppStore {
   }
 
   public clearSearch(): void {
+    this.groupFilter = null;
     this.cancelPendingSearchTimer();
     this.searchQuery = '';
     void this.recomputeVisibleRows();
@@ -837,41 +928,29 @@ export class AppStore {
     }
     const resolvedIndices =
       indices ?? filterAndSortRowsBuffer(sheet, reqSearch, reqSort);
-    this.visibleRowIndices = resolvedIndices;
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
+    this.visibleRowIndices = this.groupFilter
+      ? Int32Array.from(Array.from(resolvedIndices).filter(r => matchesContributor(sheet.rows[r], this.groupFilter!)))
+      : resolvedIndices;
 
-    let selectionChanged = false;
     if (
       this.highlightedRowIndex !== null &&
-      !this.isRowVisible(resolvedIndices, this.highlightedRowIndex)
+      !this.isRowVisible(this.visibleRowIndices, this.highlightedRowIndex)
     ) {
       this.highlightedRowIndex = null;
-      selectionChanged = true;
     }
     if (
       this.selectedCell !== null &&
-      !this.isRowVisible(resolvedIndices, this.selectedCell.rowIndex)
+      !this.isRowVisible(this.visibleRowIndices, this.selectedCell.rowIndex)
     ) {
       this.selectedCell = null;
-      selectionChanged = true;
-    }
-    if (
-      this.selectedSpatialItem !== null &&
-      !this.isRowVisible(resolvedIndices, this.selectedSpatialItem.firstRowIndex) &&
-      !this.selectedSpatialItem.rowIndices.some((r) =>
-        this.isRowVisible(resolvedIndices, r)
-      )
-    ) {
-      this.selectedSpatialItem = null;
     }
 
     this.clearColumnStatsCache();
     this.refreshActiveColumnStats(true);
     this.refreshDerivedSpatialData(true);
-    this.emit(
-      selectionChanged
-        ? ['visibleRows', 'selection', 'chartHighlight', 'stats', 'spatialData']
-        : ['visibleRows', 'stats', 'spatialData']
-    );
+    this.emit(['visibleRows', 'selection', 'chartHighlight', 'stats', 'spatialData']);
   }
 
   public addRow(): number {
@@ -1112,6 +1191,7 @@ export class AppStore {
       this.sheetVersion,
       shiftedOverrides
     );
+    this.chartConfig = resetChartConfig(nextSheet, this.chartConfig.spatialMode, this.datasetProfile);
     this.chartRecommendations = recommendCharts(this.datasetProfile);
     this.spatialConfig = createDefaultSpatialConfig(
       this.datasetProfile,
@@ -1159,6 +1239,8 @@ export class AppStore {
   }
 
   public setChartConfig(nextConfig: ChartConfig): void {
+    this.analyticalContext = null;
+    this.selectedSpatialItem = null;
     const prevX = this.chartConfig.xColIndex;
     const prevY = this.chartConfig.yColIndices[0];
     this.chartConfig = nextConfig;
@@ -1173,11 +1255,12 @@ export class AppStore {
       this.spatialConfig = {...this.spatialConfig, ...updatedSpatial};
     }
     this.refreshDerivedSpatialData(true);
-    this.emit(['chartConfig', 'spatialData']);
+    this.emit(['chartConfig', 'selection', 'chartHighlight', 'spatialData']);
   }
 
   public setSpatialMode(mode: SpatialChartMode): void {
     if (this.chartConfig.spatialMode === mode) return;
+    this.analyticalContext = null;
     this.chartConfig = {...this.chartConfig, spatialMode: mode};
     this.spatialConfig = resolveModeSwitchConfig(
       this.datasetProfile,
@@ -1186,7 +1269,7 @@ export class AppStore {
     );
     this.selectedSpatialItem = null;
     this.refreshDerivedSpatialData(true);
-    this.emit(['chartConfig', 'vizMode', 'spatialData']);
+    this.emit(['chartConfig', 'vizMode', 'selection', 'chartHighlight', 'spatialData']);
   }
 
   public setLayout(layout: WorkspaceLayout): void {

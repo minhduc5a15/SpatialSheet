@@ -88,6 +88,10 @@ export class SpatialInspectorOverlay {
     this.callbacks = callbacks;
     this.mountContainers();
     this.bindEvents();
+    this.topBarEl.addEventListener('change', event => {
+      const target = event.target as HTMLSelectElement;
+      if (target.matches('[data-inspect-object]')) this.callbacks.onSelectItem(this.derived?.items.find(item => String(item.id) === target.value) ?? null);
+    }, {signal: this.abortController.signal});
   }
 
   private mountContainers(): void {
@@ -378,7 +382,7 @@ export class SpatialInspectorOverlay {
         : '';
 
     const footerLine =
-      item.recordCount > 1
+      item.aggregation !== 'none'
         ? `Records aggregated: ${item.recordCount.toLocaleString('en-US')}`
         : `Source Row #${item.firstRowIndex + 1}`;
 
@@ -432,6 +436,8 @@ export class SpatialInspectorOverlay {
       .join('');
 
     this.topBarEl.innerHTML = `
+      <label class="text-xs">Inspect object <select aria-label="Inspect spatial object" data-inspect-object class="bg-slate-800 rounded max-w-[180px]">
+      <option value="">Choose plotted object</option>${this.derived.items.map(item => `<option value="${item.id}">${escapeHtml(item.label)} · ${item.yValue}${item.aggregation !== 'none' ? ` (${item.aggregation}, ${item.recordCount} records)` : ''}</option>`).join('')}</select></label>
       <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="3D chart style">
         ${modeButtonsHtml}
       </div>

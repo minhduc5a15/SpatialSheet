@@ -862,6 +862,7 @@ function transformBar3D(ctx: {
         recordCount: 1,
         firstRowIndex: e.rowIndex,
         rowIndices: [e.rowIndex],
+        measureColIndex: e.yCol,
         xBucketIndex: xi,
         xBucketCount: xCount,
         zBucketIndex: zi,
@@ -1205,6 +1206,15 @@ function transformBar3D(ctx: {
       recordCount: bucket.count,
       firstRowIndex: bucket.firstRowIndex,
       rowIndices: bucket.rowIndices,
+      measureColIndex: hasMultipleYCols ? sheet.columns.indexOf(bucket.seriesLabel) : yColIdx,
+      provenance: {
+        fields: [{colIndex: xColIdx, value: bucket.xLabel, emptyLabel: '(Blank)'},
+          ...(groupColIdx !== null ? [{colIndex: groupColIdx, value: bucket.seriesLabel, emptyLabel: '(Blank)'}] : [])],
+        ...(effectiveAgg !== 'count' ? {
+          numericColIndex: hasMultipleYCols ? sheet.columns.indexOf(bucket.seriesLabel) : yColIdx,
+          booleanValues: (hasMultipleYCols ? getEffectiveSemanticType(profile.columns[sheet.columns.indexOf(bucket.seriesLabel)]) : yRole) === 'boolean',
+        } : {}),
+      },
       aggStats: {
         sum: bucket.sum,
         avg: bucket.count > 0 ? bucket.sum / bucket.count : 0,
@@ -1638,6 +1648,7 @@ function transformScatter3D(ctx: {
       recordCount: 1,
       firstRowIndex: row.rowIndex,
       rowIndices: [row.rowIndex],
+      measureColIndex: yColIdx,
     };
   });
 
@@ -1876,6 +1887,11 @@ function transformRing3D(ctx: {
       recordCount: b.count,
       firstRowIndex: b.firstRowIndex,
       rowIndices: b.rowIndices,
+      measureColIndex: yColIdx,
+      provenance: positiveBuckets.includes(b) ? {
+        fields: [{colIndex: xColIdx, value: b.xLabel, emptyLabel: '(Blank)'}],
+        ...(effectiveAgg !== 'count' ? {numericColIndex: yColIdx, booleanValues: yRole === 'boolean'} : {}),
+      } : undefined,
       aggStats: {
         sum: b.sum,
         avg: b.count > 0 ? b.sum / b.count : 0,

@@ -279,6 +279,7 @@ export class DataWorkerClient {
     colIndex: number;
     visibleRowIndices: VisibleRowsSource;
     searchQuery: string;
+    filterKeyOverride?: string;
     sort: SortState;
   }): Promise<ColumnStats | null> {
     const requestId = this.nextRequestId++;
@@ -300,7 +301,7 @@ export class DataWorkerClient {
       return stats;
     }
 
-    const filterKey = buildFilterKey(params.searchQuery, params.sort);
+    const filterKey = params.filterKeyOverride ?? buildFilterKey(params.searchQuery, params.sort);
     const useAllRows =
       params.searchQuery.trim().length === 0 &&
       (params.sort.colIndex === null || params.sort.direction === null) &&
@@ -355,6 +356,7 @@ export class DataWorkerClient {
     sheetVersion: number;
     visibleRowIndices: VisibleRowsSource;
     searchQuery: string;
+    filterKeyOverride?: string;
     sort: SortState;
     profile: DatasetProfile;
     config: SpatialConfig;
@@ -381,7 +383,7 @@ export class DataWorkerClient {
       return derived;
     }
 
-    const filterKey = buildFilterKey(params.searchQuery, params.sort);
+    const filterKey = params.filterKeyOverride ?? buildFilterKey(params.searchQuery, params.sort);
     const useAllRows =
       params.searchQuery.trim().length === 0 &&
       (params.sort.colIndex === null || params.sort.direction === null) &&

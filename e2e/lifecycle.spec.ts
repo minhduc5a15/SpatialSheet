@@ -92,3 +92,14 @@ test('grid disposal closes an open Column Manager and detaches its trigger', asy
   await trigger.click();
   await expect(manager).toBeHidden();
 });
+
+
+test('Inspector disposal closes full text dialog and removes field actions', async ({page}) => {
+  await page.evaluate(() => window.lifecycle.openInspector());
+  await page.getByRole('button',{name:'View full Label',exact:true}).click();
+  await expect(page.getByRole('dialog',{name:'Full field text'})).toBeVisible();
+  await page.evaluate(() => window.lifecycle.dispose('inspector'));
+  await expect(page.getByRole('dialog',{name:'Full field text'})).toHaveCount(0);
+  await expect(page.locator('#inspector')).toBeHidden();
+  await expect(page.locator('#inspector button')).toHaveCount(0);
+});

@@ -10,6 +10,7 @@ import {AppStore} from './core/store';
 import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
 import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
+import {DataInspector} from './ui/DataInspector';
 import {WorkspaceSplitter} from './ui/WorkspaceSplitter';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
@@ -29,6 +30,7 @@ class SpatialSheetApp {
 
   private spreadsheet!: SpreadsheetGrid;
   private chart2d!: InteractiveChart2D;
+  private inspector!: DataInspector;
   private splitter!: WorkspaceSplitter;
   private spatialStage!: SpatialDataStage;
   private spatialOverlay!: SpatialInspectorOverlay;
@@ -236,6 +238,8 @@ class SpatialSheetApp {
           </div>
         </div>
 
+        <button type="button" data-action="inspect-data" class="inspector-toggle">Inspect data</button>
+        <div class="analytical-workspace">
         <!-- Main Workspace Canvas -->
         <main data-role="workspace-main" class="flex-1 min-h-0 p-3 lg:p-4 flex flex-col lg:flex-row gap-4 lg:gap-0 overflow-y-auto lg:overflow-hidden">
           <!-- Spreadsheet Pane -->
@@ -260,7 +264,7 @@ class SpatialSheetApp {
                   class="px-3 py-1 text-xs rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >3D Stage</button>
               </div>
-              <span class="text-xs text-slate-500 hidden sm:inline">Click chart to select row</span>
+              <span class="text-xs text-slate-500 hidden sm:inline">Select a point to inspect data</span>
             </div>
 
             <!-- 2D Interactive Chart Container -->
@@ -276,6 +280,8 @@ class SpatialSheetApp {
             </div>
           </section>
         </main>
+        <aside data-role="data-inspector"></aside>
+        </div>
 
         <!-- Drag & Drop File Overlay -->
         <div
@@ -350,6 +356,7 @@ class SpatialSheetApp {
       onCellCommit: (rowIndex, colIndex, value) => {
         this.store.commitCellEdit(rowIndex, colIndex, value);
       },
+      onSelectRow: (row) => this.store.selectRow(row),
       onSelectCell: (coord) => {
         this.store.selectCell(coord);
       },
@@ -403,6 +410,10 @@ class SpatialSheetApp {
       onConfigChange: (nextConfig) => {
         this.store.setChartConfig(nextConfig);
       },
+      onPointSelect: (point, col, aggregation) => {
+        this.store.selectChartPoint(point, col, aggregation);
+        if (aggregation === 'none') this.spreadsheet.scrollToRow(point.rowIndex);
+      },
       onRowSelect: (rowIndex) => {
         this.store.highlightRowFromChart(rowIndex);
         this.spreadsheet.scrollToRow(rowIndex);
@@ -415,7 +426,7 @@ class SpatialSheetApp {
     this.spatialStage = new SpatialDataStage({
       onItemSelect: (item) => {
         this.store.selectSpatialItem(item);
-        if (item) {
+        if (item && item.aggregation === 'none') {
           this.spreadsheet.scrollToRow(item.firstRowIndex);
         }
       },
@@ -444,6 +455,16 @@ class SpatialSheetApp {
         onResetCamera: () => this.spatialStage.resetCamera(),
       }
     );
+
+    this.inspector = new DataInspector(this.root.querySelector('[data-role="data-inspector"]')!, this.store,
+      (row, col) => {
+        if (this.store.layout === 'charts' || this.store.layout === 'spatial') this.store.setLayout('split');
+        this.store.selectCell({rowIndex: row, colIndex: col});
+        if (this.store.activeColumnView.hidden.includes(col)) this.store.toggleColumnVisibility(col);
+        this.spreadsheet.focusSourceCell(row, col);
+      }, () => {this.applySplitWidths(this.store.splitRatio); this.syncSpatialSize();});
+    this.root.querySelector('[data-action="inspect-data"]')!.addEventListener('click', () => this.inspector.toggle(), {signal: this.abortController.signal});
+    this.storeUnsubscribes.push(this.store.subscribe(['selection','sheetData','visibleRows','profile'], () => this.inspector.update()));
 
     const options = new xb.Options();
     options.canvas = this.xrCanvasEl;
@@ -616,12 +637,13 @@ class SpatialSheetApp {
               sheet: this.store.activeSheet,
               visibleRowIndices: this.store.visibleRowIndices,
               config: this.store.chartConfig,
+      analyticalSelection: this.store.analyticalSelection,
               highlightedRowIndex: this.store.highlightedRowIndex,
               recommendations: this.store.chartRecommendations,
               profile: this.store.datasetProfile,
             });
           } else if (changed.has('chartHighlight')) {
-            this.chart2d.setHighlight(this.store.highlightedRowIndex);
+            this.chart2d.setHighlight(this.store.highlightedRowIndex, this.store.analyticalSelection);
           }
         }
       )
@@ -655,7 +677,7 @@ class SpatialSheetApp {
       config: this.store.spatialConfig,
       derived: this.store.derivedSpatialData,
       recommendations: this.store.chartRecommendations,
-      selectedItem: this.store.selectedSpatialItem,
+      selectedItem: null,
     });
   }
 
@@ -680,6 +702,7 @@ class SpatialSheetApp {
       sheet: this.store.activeSheet,
       visibleRowIndices: this.store.visibleRowIndices,
       config: this.store.chartConfig,
+      analyticalSelection: this.store.analyticalSelection,
       highlightedRowIndex: this.store.highlightedRowIndex,
       recommendations: this.store.chartRecommendations,
       profile: this.store.datasetProfile,
@@ -1160,6 +1183,7 @@ class SpatialSheetApp {
     this.splitter.dispose();
     this.spreadsheet.dispose();
     this.chart2d.dispose();
+    this.inspector.dispose();
     this.spatialOverlay.dispose();
     this.store.dispose();
   }

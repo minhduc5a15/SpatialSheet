@@ -130,6 +130,9 @@ export interface SpatialDataItem {
   recordCount: number;
   firstRowIndex: number;
   rowIndices: number[];
+  /** Compact source predicate; rowIndices remains a bounded preview. */
+  provenance?: ContributorQuery;
+  measureColIndex?: number;
   aggStats?: {
     sum: number;
     avg: number;
@@ -304,3 +307,25 @@ export type AppDomain =
   | 'history';
 
 export type VisibleRowsSource = number[] | Int32Array;
+
+/** Source indices only. Aggregate values come from the existing derivation, never the Inspector. */
+export interface GroupField {
+  colIndex: number;
+  value: string;
+  emptyLabel: string;
+}
+export interface ContributorQuery {
+  fields: GroupField[];
+  numericColIndex?: number;
+  booleanValues?: boolean;
+}
+export type AnalyticalSelection =
+  | {kind: 'cell'; sheetId: string; rowIndex: number; colIndex: number}
+  | {kind: 'row' | 'chart-point' | 'spatial-item'; sheetId: string; rowIndex: number; colIndex: number; itemId?: number}
+  | {
+      kind: 'aggregate'; sheetId: string; origin: '2d' | '3d'; label: string;
+      aggregation: AggregationFn; colIndex: number; value: number | null;
+      representedRowCount: number; contributingCount?: number; excludedCount?: number;
+      query?: ContributorQuery; previewRowIndices?: number[];
+      itemId?: number; chartRowKey?: number; note?: string;
+    };

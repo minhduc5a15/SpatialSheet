@@ -1,5 +1,8 @@
 // Browser-only harness. Production components are imported directly; no application test hooks.
 import '../../src/index.css';
+import {DataInspector} from '../../src/ui/DataInspector';
+import {AppStore} from '../../src/core/store';
+import {DataWorkerClient} from '../../src/core/workerClient';
 import {WorkspaceSplitter} from '../../src/ui/WorkspaceSplitter';
 import {SpreadsheetGrid} from '../../src/ui/SpreadsheetGrid';
 import {InteractiveChart2D} from '../../src/ui/InteractiveChart2D';
@@ -56,8 +59,11 @@ const overlay = new SpatialInspectorOverlay(spatialHost, document.querySelector(
   onApplyRecommendation: action, onSelectItem: action, onJumpToRow: action, onResetCamera: action,
 });
 overlay.update({sheet, profile, config, derived: transformSpatialDataset({sheet, visibleRowIndices: visible, profile, config, mode: 'bar3d'}), recommendations: [], selectedItem: null});
-const components = {splitter, grid, chart, overlay};
+const inspectorStore = new AppStore({fileName:'fixture.csv',fileFormat:'csv',activeSheetIndex:0,sheets:[sheet]},new DataWorkerClient({createWorker:()=>null}));
+const inspector = new DataInspector(host('inspector','position:fixed;right:0;top:0;height:90vh;z-index:100'), inspectorStore, action, action);
+const components = {splitter, grid, chart, overlay, inspector};
 const api = {
+  openInspector() {inspectorStore.selectCell({rowIndex:0,colIndex:0}); inspector.open();},
   dispose(name: keyof typeof components) {components[name].dispose();},
   snapshot() {return {actions, pendingFrames: rafs.size, activeObservers: observers.filter(o => o.active).length};},
   // Force an already-queued observer delivery after disconnect to test the disposal guard.

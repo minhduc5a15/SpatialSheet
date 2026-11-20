@@ -8,8 +8,18 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
-    "test": "npx --yes tsx --test src/core/*.test.ts src/ui/*.test.ts"
+    "lint": "tsc --noEmit && tsc -p tsconfig.e2e.json",
+    "test": "npm run test:unit",
+    "test:unit": "node --import tsx --test src/core/*.test.ts src/ui/*.test.ts",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "verify": "npm run lint && npm run test:unit && npm run build && npm run test:e2e",
+    "bench": "npm run bench:micro && npm run bench:store",
+    "bench:micro": "node --import tsx src/benchmarks/microBench.ts",
+    "bench:store": "node --import tsx src/benchmarks/columnBench.ts",
+    "bench:heavy": "node --import tsx src/benchmarks/columnBench.ts --heavy",
+    "bench:browser": "playwright test --config playwright.bench.config.ts",
+    "bench:browser:heavy": "SPATIALSHEET_HEAVY=1 playwright test --config playwright.bench.config.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-simd-compat": "^0.19.3",
@@ -32,12 +42,19 @@
     "xrblocks": "~0.24.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.65.1",
     "@types/dom-speech-recognition": "^0.0.7",
     "@types/node": "^25.0.8",
     "@types/three": "^0.186.0",
     "@types/webxr": "^0.5.24",
     "troika-types": "^0.0.6",
+    "tsx": "4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.0"
+  },
+  "packageManager": "bun@1.4.5",
+  "engines": {
+    "node": ">=24 <26",
+    "bun": "1.4.5"
   }
 }

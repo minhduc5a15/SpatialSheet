@@ -1423,6 +1423,8 @@ export class InteractiveChart2D {
 
   public dispose(): void {
     this.abortController.abort();
+    this.activeTooltipTarget = null;
+    this.tooltipEl?.classList.add('hidden');
     this.seriesManager?.dispose();
     this.seriesManager = null;
   }

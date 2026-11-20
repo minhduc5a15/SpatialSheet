@@ -1,0 +1,209 @@
+[
+  {
+    "environment": {
+      "node": "v24.22.3",
+      "browser": "159.0.8154.6",
+      "os": "linux 7.0.0-43-generic",
+      "cpu": "Intel(R) Core(TM) i5-10500H CPU @ 2.50GHz"
+    },
+    "dataset": {
+      "rows": 100,
+      "cols": 37
+    },
+    "methodology": "One cold navigation/import; five command-to-two-RAF samples per interaction, including Playwright protocol and pointer steps. Long Tasks cover whole page lifetime. Heap is CDP main-page isolate only, no forced GC. Not FPS or a performance gate.",
+    "initialRenderMs": 510.68154599999997,
+    "csvImportMs": 71.72384299999999,
+    "verticalScrollMs": [
+      178.11235800000009,
+      171.6781500000002,
+      159.87270500000022,
+      155.27505199999996,
+      148.92415299999993
+    ],
+    "horizontalScrollMs": [
+      192.00691300000017,
+      177.3179799999998,
+      114.09799000000021,
+      166.1455190000006,
+      156.45352000000003
+    ],
+    "columnResizeMs": [
+      430.70940900000005,
+      346.999949,
+      193.79968800000006,
+      211.48675100000037,
+      221.78225699999984
+    ],
+    "splitDragMs": [
+      491.08353499999976,
+      250.74777099999983,
+      200.54027899999983,
+      199.9125809999996,
+      183.25707599999987
+    ],
+    "heap": {
+      "usedSize": 11604516,
+      "totalSize": 17702912,
+      "embedderHeapUsedSize": 118076352,
+      "backingStorageSize": 15445046
+    },
+    "dom": {
+      "documents": 1,
+      "nodes": 58157,
+      "jsEventListeners": 403
+    },
+    "longTasks": [
+      110,
+      117,
+      98
+    ],
+    "longTasksSupported": true,
+    "domElements": 1431,
+    "canvases": 1,
+    "chartInstances": 1,
+    "xrCanvases": 1,
+    "viewport": [
+      1440,
+      900
+    ]
+  },
+  {
+    "environment": {
+      "node": "v24.22.3",
+      "browser": "159.0.8154.6",
+      "os": "linux 7.0.0-43-generic",
+      "cpu": "Intel(R) Core(TM) i5-10500H CPU @ 2.50GHz"
+    },
+    "dataset": {
+      "rows": 3000,
+      "cols": 40
+    },
+    "methodology": "One cold navigation/import; five command-to-two-RAF samples per interaction, including Playwright protocol and pointer steps. Long Tasks cover whole page lifetime. Heap is CDP main-page isolate only, no forced GC. Not FPS or a performance gate.",
+    "initialRenderMs": 417.0268180000003,
+    "csvImportMs": 294.14989199999945,
+    "verticalScrollMs": [
+      173.82819300000028,
+      148.65197399999852,
+      185.89667100000042,
+      179.2808559999994,
+      170.9063210000004
+    ],
+    "horizontalScrollMs": [
+      94.59067099999993,
+      91.35091000000102,
+      161.04075999999986,
+      154.31082199999946,
+      162.59852000000137
+    ],
+    "columnResizeMs": [
+      568.1851539999998,
+      290.8238170000004,
+      244.6703409999991,
+      202.90837800000008,
+      274.6262569999999
+    ],
+    "splitDragMs": [
+      321.9946920000002,
+      201.68331599999874,
+      266.3981220000005,
+      233.27847800000018,
+      217.0860499999999
+    ],
+    "heap": {
+      "usedSize": 19497636,
+      "totalSize": 32854016,
+      "embedderHeapUsedSize": 118769808,
+      "backingStorageSize": 16766239
+    },
+    "dom": {
+      "documents": 1,
+      "nodes": 58178,
+      "jsEventListeners": 403
+    },
+    "longTasks": [
+      85,
+      107,
+      118,
+      84,
+      50
+    ],
+    "longTasksSupported": true,
+    "domElements": 1431,
+    "canvases": 1,
+    "chartInstances": 1,
+    "xrCanvases": 1,
+    "viewport": [
+      1440,
+      900
+    ]
+  },
+  {
+    "environment": {
+      "node": "v24.22.3",
+      "browser": "159.0.8154.6",
+      "os": "linux 7.0.0-43-generic",
+      "cpu": "Intel(R) Core(TM) i5-10500H CPU @ 2.50GHz"
+    },
+    "dataset": {
+      "rows": 100000,
+      "cols": 100
+    },
+    "methodology": "One cold navigation/import; five command-to-two-RAF samples per interaction, including Playwright protocol and pointer steps. Long Tasks cover whole page lifetime. Heap is CDP main-page isolate only, no forced GC. Not FPS or a performance gate.",
+    "initialRenderMs": 409.73731999999836,
+    "csvImportMs": 7094.5597720000005,
+    "verticalScrollMs": [
+      155.29838799999925,
+      99.0267649999987,
+      181.92155999999886,
+      170.17393599999923,
+      198.3843629999974
+    ],
+    "horizontalScrollMs": [
+      92.15496299999722,
+      160.0540600000022,
+      148.29232700000284,
+      94.08132800000021,
+      164.5647960000024
+    ],
+    "columnResizeMs": [
+      269.92513600000166,
+      216.7294890000012,
+      245.5153530000025,
+      275.66345100000035,
+      226.96101500000077
+    ],
+    "splitDragMs": [
+      248.7017049999995,
+      299.891176000001,
+      215.44350499999928,
+      265.42237699999896,
+      250.056571000001
+    ],
+    "heap": {
+      "usedSize": 277485220,
+      "totalSize": 318623744,
+      "embedderHeapUsedSize": 120738016,
+      "backingStorageSize": 58391245
+    },
+    "dom": {
+      "documents": 1,
+      "nodes": 58494,
+      "jsEventListeners": 403
+    },
+    "longTasks": [
+      80,
+      119,
+      3881,
+      1045
+    ],
+    "longTasksSupported": true,
+    "domElements": 1491,
+    "canvases": 1,
+    "chartInstances": 1,
+    "xrCanvases": 1,
+    "viewport": [
+      1440,
+      900
+    ]
+  }
+]

@@ -913,5 +913,19 @@ export class SpatialInspectorOverlay {
 
   public dispose(): void {
     this.abortController.abort();
+    this.isConfigOpen = false;
+    this.isRecsOpen = false;
+    // These nodes are mounted by the overlay, outside the shared toolbar shell.
+    // Remove them so a disposed drawer cannot cover a replacement visualization.
+    for (const el of [this.tooltipEl, this.validationOverlayEl, this.recsPopoverEl,
+      this.configDrawerEl, this.inspectorDrawerEl]) {
+      el.remove();
+    }
+    this.sheet = null;
+    this.profile = null;
+    this.config = null;
+    this.derived = null;
+    this.selectedItem = null;
+    this.recommendations = [];
   }
 }

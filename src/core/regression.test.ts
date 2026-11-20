@@ -77,12 +77,13 @@ function makeDummyFile(name: string, content = 'a,b\n1,2'): File {
 }
 
 function flushMicrotasks(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
-test('workerClient: superseded parseFile promises settle cleanly as null and stale parsed response does not clobber newer version', async () => {
+test('workerClient: superseded parseFile promises settle cleanly as null and stale parsed response does not clobber newer version', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
+  t.after(() => client.dispose());
 
   const file1 = makeDummyFile('first.csv');
   const file2 = makeDummyFile('second.csv');
@@ -99,7 +100,7 @@ test('workerClient: superseded parseFile promises settle cleanly as null and sta
   // Even before worker responds, p1 must settle immediately as null (not hang)
   const r1 = await Promise.race([
     p1,
-    new Promise((res) => setTimeout(() => res('HUNG'), 25)),
+    new Promise((res) => setImmediate(() => res('UNSETTLED'))),
   ]);
   assert.equal(r1, null);
 
@@ -145,13 +146,12 @@ test('workerClient: superseded parseFile promises settle cleanly as null and sta
   });
   const filterRes = await filterPromise;
   assert.deepEqual(Array.from(filterRes ?? []), [1]);
-
-  client.dispose();
 });
 
-test('workerClient: concurrent filterAndSort requests settle every earlier promise as null and ignore stale worker replies', async () => {
+test('workerClient: concurrent filterAndSort requests settle every earlier promise as null and ignore stale worker replies', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
+  t.after(() => client.dispose());
   const sheet = makeLargeWorkbook(2600).sheets[0];
 
   const p1 = client.filterAndSort({
@@ -222,14 +222,13 @@ test('workerClient: concurrent filterAndSort requests settle every earlier promi
   const [r4, r5] = await Promise.all([p4, p5]);
   assert.equal(r4, null);
   assert.equal(r5?.length, 2600);
-
-  client.dispose();
 });
 
-test('AppStore: concurrent loadFile ignores stale progress, stale workbook, and stale errors', async () => {
+test('AppStore: concurrent loadFile ignores stale progress, stale workbook, and stale errors', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
   const store = new AppStore(undefined, client);
+  t.after(() => store.dispose());
 
   const load1 = store.loadFile(makeDummyFile('stale.csv'));
   const load2 = store.loadFile(makeDummyFile('winner.csv'));
@@ -268,14 +267,15 @@ test('AppStore: concurrent loadFile ignores stale progress, stale workbook, and 
   assert.equal(store.workbook.fileName, 'winner.csv');
   assert.equal(store.errorMessage, null);
   assert.equal(store.loading.active, false);
-
-  store.dispose();
 });
 
-test('AppStore: rapid debounced search coalesces into one worker query and cancels when cleared or sorted', async () => {
+test('AppStore: rapid debounced search coalesces into one worker query and cancels when cleared or sorted', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
   const store = new AppStore(makeLargeWorkbook(3000), client);
+
+  t.after(() => store.dispose());
+  t.mock.timers.enable({apis: ['setTimeout']});
 
   // Clear initial compute-stats post from constructor
   mockWorker.posted.length = 0;
@@ -289,7 +289,7 @@ test('AppStore: rapid debounced search coalesces into one worker query and cance
     0
   );
 
-  await new Promise((res) => setTimeout(res, 50));
+  t.mock.timers.tick(50);
 
   const filterPosts = mockWorker.posted.filter(
     (p) => p.msg.type === 'filter-sort'
@@ -307,7 +307,7 @@ test('AppStore: rapid debounced search coalesces into one worker query and cance
     sheetVersion: postedReq.sheetVersion,
     indicesBuffer: Int32Array.from([10, 11, 12]).buffer,
   });
-  await flushMicrotasks();
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.deepEqual(Array.from(store.visibleRowIndices), [10, 11, 12]);
 
   // Now queue another debounced search, then immediately clearSearch() before timer fires
@@ -315,21 +315,21 @@ test('AppStore: rapid debounced search coalesces into one worker query and cance
   store.setSearchQueryDebounced('Alpha', 25);
   store.clearSearch();
 
-  await new Promise((res) => setTimeout(res, 50));
+  t.mock.timers.tick(50);
+  await new Promise<void>(resolve => setImmediate(resolve));
   assert.equal(store.searchQuery, '');
   assert.equal(store.visibleRowIndices.length, 3000);
   assert.equal(
     mockWorker.posted.filter((p) => p.msg.type === 'filter-sort').length,
     0
   );
-
-  store.dispose();
 });
 
-test('AppStore: cell edit while sorted (sorting while editing) triggers requery and rejects stale worker responses', async () => {
+test('AppStore: cell edit while sorted (sorting while editing) triggers requery and rejects stale worker responses', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
   const store = new AppStore(makeLargeWorkbook(2600), client);
+  t.after(() => store.dispose());
   mockWorker.posted.length = 0;
 
   // Start async sort on col 1 ascending
@@ -370,14 +370,13 @@ test('AppStore: cell edit while sorted (sorting while editing) triggers requery 
   });
   await flushMicrotasks();
   assert.deepEqual(Array.from(store.visibleRowIndices), [2599, 2598, 1, 0]);
-
-  store.dispose();
 });
 
-test('AppStore: deleteRow, deleteColumn, and undo maintain filter/sort index bounds while async worker filter is pending', async () => {
+test('AppStore: deleteRow, deleteColumn, and undo maintain filter/sort index bounds while async worker filter is pending', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
   const store = new AppStore(makeLargeWorkbook(2600), client);
+  t.after(() => store.dispose());
   mockWorker.posted.length = 0;
 
   // Complete an initial filter yielding [2, 5, 10]
@@ -445,14 +444,13 @@ test('AppStore: deleteRow, deleteColumn, and undo maintain filter/sort index bou
     assert.ok(store.visibleRowIndices[i] >= 0);
     assert.ok(store.visibleRowIndices[i] < store.activeSheet.rows.length);
   }
-
-  store.dispose();
 });
 
-test('AppStore: repeated cell selection is a no-op and column stats use per-column cache + async worker for large datasets', async () => {
+test('AppStore: repeated cell selection is a no-op and column stats use per-column cache + async worker for large datasets', async (t) => {
   const mockWorker = new MockWorker();
   const client = new DataWorkerClient({createWorker: () => mockWorker});
   const store = new AppStore(makeLargeWorkbook(2600), client);
+  t.after(() => store.dispose());
 
   let selectionEmits = 0;
   let statsEmits = 0;
@@ -552,6 +550,4 @@ test('AppStore: repeated cell selection is a no-op and column stats use per-colu
     mockWorker.posted.filter((p) => p.msg.type === 'compute-stats').length,
     0
   );
-
-  store.dispose();
 });

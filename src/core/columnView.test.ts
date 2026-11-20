@@ -510,3 +510,60 @@ test('columnViewPersistence skips blank templates, avoids cell data, handles cor
   assert.equal(clearPersistedColumnView(idA, brokenStorage), false);
 });
 
+
+test('source-column invariants survive every deletion position, history, sort/filter, and sheet switches', async () => {
+  for (let deleted = 0; deleted < 4; deleted++) {
+    const sheet = makeSheet('primary', 'Primary', ['A', 'B', 'C', 'D'], [
+      ['a2', 'b2', 'c2', 'd2'], ['a1', 'b1', 'c1', 'd1'],
+    ]);
+    const other = makeSheet('other', 'Other', ['X', 'Y'], [['x', 'y']]);
+    const store = new AppStore(makeWorkbookForStore([sheet, other]), new DataWorkerClient({createWorker: () => null}), null);
+    try {
+      store.toggleColumnPin(2);
+      store.toggleColumnVisibility(1);
+      store.moveColumnVisual(3, -1);
+      for (let c = 0; c < 4; c++) store.setColumnWidth(c, 160 + c * 20);
+      const initialCsv = serializeCsv(store.activeSheet);
+      const check = () => {
+        const current = store.activeSheet;
+        const view = store.activeColumnView;
+        assert.deepEqual([...view.order].sort((a, b) => a - b), current.columns.map((_, c) => c));
+        for (const list of [view.hidden, view.pinned]) {
+          assert.equal(new Set(list).size, list.length);
+          assert.ok(list.every(c => Number.isInteger(c) && c >= 0 && c < current.columns.length));
+        }
+        for (const key of Object.keys(view.widths)) assert.ok(Number(key) < current.columns.length);
+        for (let c = 0; c < current.columns.length; c++) {
+          const original = sheet.columns.indexOf(current.columns[c]);
+          assert.equal(view.widths[c], 160 + original * 20, `width belongs to ${current.columns[c]}`);
+          assert.equal(view.pinned.includes(c), original === 2);
+          assert.equal(view.hidden.includes(c), original === 1);
+          assert.deepEqual(current.rows.map(row => row[c]), sheet.rows.map(row => row[original]));
+        }
+      };
+      check();
+      store.deleteColumn(deleted);
+      check();
+      store.undo();
+      check();
+      assert.equal(serializeCsv(store.activeSheet), initialCsv);
+      store.redo();
+      check();
+      const view = structuredClone(store.activeColumnView);
+      store.toggleSortColumn(0);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(Array.from(store.visibleRowIndices), [1, 0]);
+      store.setSearchQueryDebounced(store.activeSheet.rows[1][0], 0);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(Array.from(store.visibleRowIndices), [1]);
+      assert.deepEqual(store.activeColumnView, view);
+      store.clearSearch();
+      store.switchSheet(1);
+      assert.deepEqual(store.activeColumnView, createColumnViewState(other));
+      store.setColumnWidth(0, 400);
+      store.switchSheet(0);
+      assert.deepEqual(store.activeColumnView, view);
+      check();
+    } finally {store.dispose();}
+  }
+});

@@ -1,5 +1,5 @@
 import type {SheetData, WorkbookState} from '../types';
-import {computeAutoFitColumnWidth, getVisibleColumnsPlan, moveColumnVisualInView} from '../core/columnView';
+import {computeAutoFitColumnWidth, getVisibleColumnsPlan} from '../core/columnView';
 import {AppStore} from '../core/store';
 import {inferColumnTypes} from '../core/tabular';
 import {computePinnedColumnVirtualWindow} from '../core/virtualWindow';
@@ -66,7 +66,7 @@ function runScenario(rows: number, cols: number): void {
   store.toggleColumnPin(0);
   store.toggleColumnPin(1);
   store.toggleColumnVisibility(2);
-  moveColumnVisualInView(store.activeColumnView, 5, -1);
+  store.moveColumnVisual(5, -1);
   const autoW = computeAutoFitColumnWidth(sheet, 2);
   store.setColumnWidth(2, autoW);
 
@@ -99,6 +99,7 @@ function runScenario(rows: number, cols: number): void {
   store.dispose();
 }
 
+console.log(JSON.stringify({kind: 'store/integration', node: process.version, platform: process.platform, arch: process.arch, methodology: 'One cold sample per size; initialization, view operations plus virtualization, structural history; generation excluded. No timing thresholds.'}));
 runScenario(100, 37);
 runScenario(3000, 40);
-runScenario(100_000, 100);
+if (process.argv.includes('--heavy')) runScenario(100_000, 100);

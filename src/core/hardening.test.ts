@@ -67,7 +67,7 @@ class CrashingMockWorker implements WorkerLike {
 }
 
 function flushMicrotasks(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function createPrng(seed: number): () => number {
@@ -82,7 +82,7 @@ function createPrng(seed: number): () => number {
 // 1. ASYNC / WORKER ORCHESTRATION & STORE RECOVERY
 // ============================================================================
 
-test('AppStore: worker crash during stats, filter-sort, and spatial transform clears loading and recovers synchronously', async () => {
+test('AppStore: worker crash during stats, filter-sort, and spatial transform clears loading and recovers synchronously', async (t) => {
   const worker = new CrashingMockWorker();
   const client = new DataWorkerClient({createWorker: () => worker});
   const bigSheet = makeSyntheticLargeSheet(2600, 4, 'big-crash');
@@ -94,6 +94,7 @@ test('AppStore: worker crash during stats, filter-sort, and spatial transform cl
   };
 
   const store = new AppStore(wb, client);
+  t.after(() => store.dispose());
   store.setLayout('spatial');
   store.setSpatialConfig({aggregation: 'sum'}); // triggers off-thread transformSpatial
   assert.equal(store.activeColumnStats.loading, true);
@@ -130,13 +131,12 @@ test('AppStore: worker crash during stats, filter-sort, and spatial transform cl
   assert.equal(store.activeColumnStats.loading, false);
   assert.equal(store.activeColumnStats.colIndex, 3);
   assert.equal(store.activeColumnStats.stats?.count, 2600);
-
-  store.dispose();
 });
 
-test('DataWorkerClient: error response from worker (e.g. cache miss) settles pending promise and invalidates cache', async () => {
+test('DataWorkerClient: error response from worker (e.g. cache miss) settles pending promise and invalidates cache', async (t) => {
   const worker = new CrashingMockWorker();
   const client = new DataWorkerClient({createWorker: () => worker});
+  t.after(() => client.dispose());
   const sheet = makeSyntheticLargeSheet(2600, 3);
 
   const p1 = client.filterAndSort({
@@ -156,7 +156,7 @@ test('DataWorkerClient: error response from worker (e.g. cache miss) settles pen
 
   const res1 = await Promise.race([
     p1,
-    new Promise((r) => setTimeout(() => r('HUNG'), 30)),
+    new Promise((r) => setImmediate(() => r('UNSETTLED'))),
   ]);
   assert.equal(res1, null);
 
@@ -177,16 +177,15 @@ test('DataWorkerClient: error response from worker (e.g. cache miss) settles pen
     indicesBuffer: Int32Array.from([1]).buffer,
   });
   await p2;
-  client.dispose();
 });
 
-test('AppStore: addNewSheet generates unique IDs even when called twice in same millisecond', () => {
+test('AppStore: addNewSheet generates unique IDs even when called twice in same millisecond', (t) => {
   const store = new AppStore();
+  t.after(() => store.dispose());
   store.addNewSheet();
   store.addNewSheet();
   const ids = store.workbook.sheets.map((s) => s.id);
   assert.equal(new Set(ids).size, ids.length);
-  store.dispose();
 });
 
 // ============================================================================
@@ -466,12 +465,13 @@ test('spatialTransform: log scale supports small positive numbers (< 1e-6), ring
 // 5. STORE CROSS-VIEW SYNC & PROPERTY-BASED INVARIANTS
 // ============================================================================
 
-test('AppStore: filtering reconciles highlightedRowIndex and selectedSpatialItem when highlighted row is filtered out', async () => {
+test('AppStore: filtering reconciles highlightedRowIndex and selectedSpatialItem when highlighted row is filtered out', async (t) => {
   const wb = makeWorkbookFromCsv('small.csv', DUPLICATE_TOPK_CSV);
   const noopWorker = new DataWorkerClient({
     createWorker: () => null as unknown as WorkerLike,
   });
   const store = new AppStore(wb, noopWorker);
+  t.after(() => store.dispose());
 
   store.selectCell({rowIndex: 0, colIndex: 2}); // Row 0 is CatA
   assert.equal(store.highlightedRowIndex, 0);
@@ -488,17 +488,16 @@ test('AppStore: filtering reconciles highlightedRowIndex and selectedSpatialItem
   // Out-of-bounds highlightRowFromChart must be ignored safely
   store.highlightRowFromChart(999);
   assert.equal(store.highlightedRowIndex, null);
-
-  store.dispose();
 });
 
-test('Property-based invariants: seeded random edit, sort, filter, delete, undo, redo sequences never produce out-of-bounds indices or corrupt state', async () => {
+test('Property-based invariants: seeded random edit, sort, filter, delete, undo, redo sequences never produce out-of-bounds indices or corrupt state', async (t) => {
   const rng = createPrng(20260518);
   const wb = makeWorkbookFromCsv('bench.csv', AI_LLM_BENCHMARK_CSV);
   const noopWorker = new DataWorkerClient({
     createWorker: () => null as unknown as WorkerLike,
   });
   const store = new AppStore(wb, noopWorker);
+  t.after(() => store.dispose());
 
   const queries = ['', 'OpenAI', 'Google', 'Frontier', 'nonexistent_xyz'];
   const modes = ['bar3d', 'scatter3d', 'ring3d'] as const;
@@ -573,8 +572,6 @@ test('Property-based invariants: seeded random edit, sort, filter, delete, undo,
   // Re-verify unused NEGATIVE_AND_TINY_CSV fixture compiles & parses cleanly
   const negTiny = parseCsvText(NEGATIVE_AND_TINY_CSV, 'NegTiny');
   assert.equal(negTiny.rows.length, 4);
-
-  store.dispose();
 });
 
 test('InteractiveChart2D: extractChart2DPoints preserves null for missing/non-numeric cells without fabricating zeros', () => {

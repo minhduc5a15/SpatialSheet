@@ -225,10 +225,11 @@ test('AppStore end-to-end 100x37 workflow: pin, hide, reorder, edit, undo/redo, 
   }
 });
 
-test('AppStore & virtualization handles 3,000x40 and 100,000x100 sheets deterministically', () => {
+test('AppStore & virtualization handles 3,000x40 and 100,000x100 sheets deterministically', (t) => {
   // 3,000 x 40
   const medium = buildBenchmarkSheet(3000, 40);
   const medStore = createSyncStore(medium);
+  t.after(() => medStore.dispose());
   medStore.toggleColumnPin(0);
   medStore.toggleColumnPin(1);
   medStore.toggleColumnVisibility(2);
@@ -248,11 +249,11 @@ test('AppStore & virtualization handles 3,000x40 and 100,000x100 sheets determin
     overscan: 2,
   });
   assert.ok(medSlice.visibleUnpinnedCols.length < 40);
-  medStore.dispose();
 
   // 100,000 x 100
   const huge = buildBenchmarkSheet(100_000, 100);
   const hugeStore = createSyncStore(huge);
+  t.after(() => hugeStore.dispose());
 
   hugeStore.toggleColumnPin(0);
   hugeStore.toggleColumnPin(1);
@@ -278,5 +279,4 @@ test('AppStore & virtualization handles 3,000x40 and 100,000x100 sheets determin
   assert.equal(plan.pinnedCols.length, 2);
   assert.ok(colWin.virtualized);
   assert.ok(colWin.visibleUnpinnedCols.length <= 14);
-  hugeStore.dispose();
 });

@@ -64,7 +64,7 @@ cd SpatialSheet
 bun install --frozen-lockfile
 ```
 
-> **Dependency note:** At the time this README was prepared, the latest Phase 3 commit had a `bun.lock` inconsistent with `package.json`, causing `bun install --frozen-lockfile` to fail in CI. Until the lockfile is regenerated and committed using Bun 1.4.5, use `bun install` locally. Do **not** remove frozen-lockfile validation from CI as a workaround.
+> **Dependency management:** SpatialSheet uses Bun 1.4.5 and maintains a committed `bun.lock` for reproducible installations. Run `bun install --frozen-lockfile` to install dependencies. When adding or updating packages, regenerate and commit the lockfile using the project's declared Bun version.
 
 ### Start the development server
 

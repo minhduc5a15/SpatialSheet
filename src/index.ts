@@ -1,11 +1,14 @@
 import * as xb from 'xrblocks';
 import type {SpatialChartMode, WorkspaceLayout} from './types';
-import {createBlankWorkbook} from './core/tabular';
+import {columnIndexToLetter, createBlankWorkbook} from './core/tabular';
 import {
   computeSplitPaneWidths,
   isDesktopSplitViewport,
 } from './core/workspaceLayout';
 import {exportSheetAsCsv, exportWorkbookAsExcel} from './core/excelIO';
+import {resetChartConfig} from './core/chartValidation';
+import {buildAppCommands, validateCommandRegistry, type AppCommand} from './core/commands';
+import {dispatchKeyboardShortcut, isMacPlatform} from './core/shortcuts';
 import {AppStore} from './core/store';
 import {SpreadsheetGrid} from './ui/SpreadsheetGrid';
 import {InteractiveChart2D} from './ui/InteractiveChart2D';
@@ -13,6 +16,9 @@ import {SpatialInspectorOverlay} from './ui/SpatialInspectorOverlay';
 import {DataInspector} from './ui/DataInspector';
 import {DatasetOverview} from './ui/DatasetOverview';
 import {WorkspaceSplitter} from './ui/WorkspaceSplitter';
+import {CommandPalette} from './ui/CommandPalette';
+import {KeyboardShortcutsHelp} from './ui/KeyboardShortcutsHelp';
+import {ToastManager} from './ui/ToastManager';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
 import {renderBrandLogoHtml} from './ui/branding';
@@ -36,6 +42,9 @@ class SpatialSheetApp {
   private splitter!: WorkspaceSplitter;
   private spatialStage!: SpatialDataStage;
   private spatialOverlay!: SpatialInspectorOverlay;
+  private toastManager!: ToastManager;
+  private shortcutsHelp!: KeyboardShortcutsHelp;
+  private commandPalette!: CommandPalette;
 
   // Layout containers
   private mainEl!: HTMLElement;
@@ -62,6 +71,8 @@ class SpatialSheetApp {
   private lastTabsKey = '';
   private previewSplitRatio: number | null = null;
   private autoOpenPaused = false;
+  private wasLoading = false;
+  private lastShownErrorMsg = '';
   private readonly abortController = new AbortController();
   private resizeObservers: ResizeObserver[] = [];
   private storeUnsubscribes: Array<() => void> = [];
@@ -153,8 +164,30 @@ class SpatialSheetApp {
             </button>
           </nav>
 
-          <!-- Zone 3: Primary CTA -->
-          <div class="flex items-center gap-2 shrink-0">
+          <!-- Zone 3: Quick Palette, Shortcuts Help & Primary CTA -->
+          <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+            <button
+              type="button"
+              data-action="open-command-palette"
+              aria-label="Open Command Palette"
+              title="Command Palette (${isMacPlatform() ? '⌘K' : 'Ctrl+K'})"
+              class="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 border border-slate-200/80 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              ${svgIcon('command', 'w-3.5 h-3.5 text-emerald-700')}
+              <span class="hidden sm:inline">Commands</span>
+              <kbd class="hidden md:inline-flex sp-kbd ml-0.5">${isMacPlatform() ? '⌘K' : 'Ctrl K'}</kbd>
+            </button>
+
+            <button
+              type="button"
+              data-action="open-shortcuts-help"
+              aria-label="Keyboard shortcuts help"
+              title="Keyboard shortcuts (?)"
+              class="inline-flex items-center justify-center w-8 h-8 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-100 hover:text-slate-900 border border-slate-200 rounded-lg transition-colors shrink-0 cursor-pointer"
+            >
+              <span aria-hidden="true">?</span>
+            </button>
+
             <button
               type="button"
               data-action="toggle-xr"
@@ -196,6 +229,7 @@ class SpatialSheetApp {
                 type="search"
                 data-role="search-input"
                 aria-label="Search table"
+                title="Search table (${isMacPlatform() ? '⌘F' : 'Ctrl+F'})"
                 placeholder="Search data..."
                 class="w-44 sm:w-56 pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
               />
@@ -587,6 +621,30 @@ class SpatialSheetApp {
       )
     );
 
+    const overlayHost = (this.root.firstElementChild as HTMLElement | null) ?? this.root;
+    this.toastManager = new ToastManager(overlayHost);
+    this.shortcutsHelp = new KeyboardShortcutsHelp(overlayHost);
+    this.commandPalette = new CommandPalette(overlayHost, {
+      getCommands: () => this.buildPaletteCommands(),
+      getContextLabel: () => {
+        const wb = this.store.workbook;
+        const sheet = this.store.activeSheet;
+        const cell = this.store.selectedCell;
+        const cellRef = cell
+          ? `Cell ${columnIndexToLetter(cell.colIndex)}${cell.rowIndex + 1} (${sheet.columns[cell.colIndex] ?? ''})`
+          : this.store.analyticalSelection?.kind === 'aggregate'
+            ? `Group: ${this.store.analyticalSelection.label}`
+            : 'No selection';
+        return `${wb.fileName} · ${sheet.name} · ${this.store.layout} · ${cellRef}`;
+      },
+      onNotify: (toast) => this.toastManager.show(toast),
+      onOpenShortcutsHelp: () => {
+        this.spreadsheet.closeColumnManager();
+        this.chart2d.closeSeriesManager();
+        this.shortcutsHelp.open();
+      },
+    });
+
     const options = new xb.Options();
     options.canvas = this.xrCanvasEl;
     options.xrButton.enabled = false;
@@ -873,11 +931,21 @@ class SpatialSheetApp {
   private syncLoadingBanner(): void {
     const {active, message, progress} = this.store.loading;
     if (!active) {
+      if (this.wasLoading && !this.store.errorMessage) {
+        const wb = this.store.workbook;
+        const sheet = this.store.activeSheet;
+        this.toastManager?.show({
+          kind: 'success',
+          message: `Loaded ${wb.fileName} · ${sheet.rows.length.toLocaleString('en-US')} rows · ${sheet.columns.length} cols`,
+        });
+      }
+      this.wasLoading = false;
       this.loadingBadgeEl.classList.add('hidden');
       this.loadingBadgeEl.classList.remove('inline-flex');
       this.loadingBadgeEl.innerHTML = '';
       return;
     }
+    this.wasLoading = true;
     const pct =
       progress !== null ? ` (${Math.round(progress * 100)}%)` : '';
     const badgeLogo = renderBrandLogoHtml({
@@ -894,6 +962,7 @@ class SpatialSheetApp {
   private syncErrorBanner(): void {
     const msg = this.store.errorMessage;
     if (!msg) {
+      this.lastShownErrorMsg = '';
       this.errorBannerEl.classList.add('hidden');
       this.errorBannerEl.classList.remove('flex');
       return;
@@ -904,6 +973,10 @@ class SpatialSheetApp {
     `;
     this.errorBannerEl.classList.remove('hidden');
     this.errorBannerEl.classList.add('flex');
+    if (msg !== this.lastShownErrorMsg) {
+      this.lastShownErrorMsg = msg;
+      this.toastManager?.show({kind: 'error', message: msg});
+    }
   }
 
   private maybeAutoOpenInspector(): void {
@@ -1080,6 +1153,10 @@ class SpatialSheetApp {
         }
         if (target.closest('[data-action="add-sheet"]')) {
           this.store.addNewSheet();
+          this.toastManager?.show({
+            kind: 'success',
+            message: `Added ${this.store.activeSheet.name}`,
+          });
         }
       },
       {signal}
@@ -1122,6 +1199,10 @@ class SpatialSheetApp {
           if (this.store.layout === 'overview') {
             this.store.setLayout('split');
           }
+          this.toastManager?.show({
+            kind: 'success',
+            message: 'Created new blank workbook',
+          });
         },
         {signal}
       );
@@ -1133,6 +1214,10 @@ class SpatialSheetApp {
         'click',
         () => {
           exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName);
+          this.toastManager?.show({
+            kind: 'success',
+            message: `Exported ${this.store.activeSheet.name} as CSV`,
+          });
         },
         {signal}
       );
@@ -1142,13 +1227,53 @@ class SpatialSheetApp {
         'click',
         () => {
           exportWorkbookAsExcel(this.store.workbook);
+          this.toastManager?.show({
+            kind: 'success',
+            message: 'Exported workbook as Excel (.xlsx)',
+          });
         },
         {signal}
       );
 
     // Undo / Redo
-    this.undoBtn.addEventListener('click', () => this.store.undo(), {signal});
-    this.redoBtn.addEventListener('click', () => this.store.redo(), {signal});
+    this.undoBtn.addEventListener(
+      'click',
+      () => {
+        if (!this.store.history.canUndo) return;
+        this.store.undo();
+        this.toastManager?.show({kind: 'info', message: 'Undid last change'});
+      },
+      {signal}
+    );
+    this.redoBtn.addEventListener(
+      'click',
+      () => {
+        if (!this.store.history.canRedo) return;
+        this.store.redo();
+        this.toastManager?.show({kind: 'success', message: 'Redid change'});
+      },
+      {signal}
+    );
+
+    // Command Palette & Shortcuts Help triggers
+    this.root
+      .querySelector('[data-action="open-command-palette"]')
+      ?.addEventListener(
+        'click',
+        () => {
+          this.openCommandPalette();
+        },
+        {signal}
+      );
+    this.root
+      .querySelector('[data-action="open-shortcuts-help"]')
+      ?.addEventListener(
+        'click',
+        () => {
+          this.openShortcutsHelp();
+        },
+        {signal}
+      );
 
     // Debounced Search
     this.searchInput.addEventListener(
@@ -1204,25 +1329,13 @@ class SpatialSheetApp {
       {signal}
     );
 
-    // Global keyboard shortcuts (Undo/Redo)
+    // Centralized global keyboard shortcut dispatcher (capture phase guarantees topmost overlay precedence)
     window.addEventListener(
       'keydown',
       (e) => {
-        const target = e.target as HTMLElement | null;
-        const isTextInput =
-          target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA';
-        if (isTextInput) return;
-
-        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-          e.preventDefault();
-          if (e.shiftKey) this.store.redo();
-          else this.store.undo();
-        } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-          e.preventDefault();
-          this.store.redo();
-        }
+        this.handleGlobalKeyDown(e);
       },
-      {signal}
+      {capture: true, signal}
     );
 
     // Drag and Drop file upload
@@ -1318,6 +1431,234 @@ class SpatialSheetApp {
     });
   }
 
+  private openCommandPalette(): void {
+    this.spreadsheet.closeColumnManager();
+    this.chart2d.closeSeriesManager();
+    this.shortcutsHelp.close();
+    this.commandPalette.open();
+  }
+
+  private openShortcutsHelp(): void {
+    this.commandPalette.close(true);
+    this.spreadsheet.closeColumnManager();
+    this.chart2d.closeSeriesManager();
+    this.shortcutsHelp.open();
+  }
+
+  private handleGlobalKeyDown(e: KeyboardEvent): void {
+    const isPaletteOpen = this.commandPalette.isOpen();
+    const isHelpOpen = this.shortcutsHelp.isOpen();
+
+    const triggerRedo = () => {
+      e.preventDefault();
+      if (this.store.history.canRedo) {
+        this.store.redo();
+        this.toastManager.show({kind: 'success', message: 'Redid change'});
+      } else {
+        this.toastManager.show({kind: 'info', message: 'Nothing to redo'});
+      }
+    };
+
+    dispatchKeyboardShortcut(e, e.target, {
+      'overlay.close': () => {
+        if (isPaletteOpen) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          this.commandPalette.close(true);
+          return true;
+        }
+        if (isHelpOpen) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          this.shortcutsHelp.close();
+          return true;
+        }
+        if (this.spreadsheet.isLongTextModalOpen()) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          this.spreadsheet.closeLongTextModalIfOpen();
+          return true;
+        }
+        // Let native <dialog>, ColumnManager, ChartSeriesManager, DataInspector, and cell inputs handle Escape
+        return false;
+      },
+      'palette.open': () => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        if (isPaletteOpen) {
+          this.commandPalette.close(true);
+        } else {
+          this.openCommandPalette();
+        }
+      },
+      'help.shortcuts': () => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (isHelpOpen) {
+          this.shortcutsHelp.close();
+        } else {
+          this.openShortcutsHelp();
+        }
+      },
+      'search.focus': () => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.commandPalette.close(false);
+        this.searchInput.focus();
+        this.searchInput.select();
+      },
+      'history.undo': () => {
+        e.preventDefault();
+        if (this.store.history.canUndo) {
+          this.store.undo();
+          this.toastManager.show({kind: 'info', message: 'Undid last change'});
+        } else {
+          this.toastManager.show({kind: 'info', message: 'Nothing to undo'});
+        }
+      },
+      'history.redo': triggerRedo,
+      'history.redoAlt': triggerRedo,
+    });
+  }
+
+  private buildPaletteCommands(): AppCommand[] {
+    const commands = buildAppCommands({
+      workbook: this.store.workbook,
+      activeSheet: this.store.activeSheet,
+      activeColumnView: this.store.activeColumnView,
+      datasetProfile: this.store.datasetProfile,
+      layout: this.store.layout,
+      chartPanelMode: this.store.chartPanelMode,
+      chartType: this.store.chartConfig.type,
+      xColIndex: this.store.chartConfig.xColIndex,
+      selectedCell: this.store.selectedCell,
+      analyticalSelection: this.store.analyticalSelection,
+      canUndo: this.store.history.canUndo,
+      canRedo: this.store.history.canRedo,
+      isInspectorOpen: this.inspector.isOpen(),
+      hasGroupFilter: Boolean(this.store.groupFilterLabel),
+      hasSearchOrSort: this.store.isFilteredOrSorted,
+      is3DStageVisible:
+        this.store.layout === 'spatial' ||
+        ((this.store.layout === 'split' || this.store.layout === 'charts') &&
+          this.store.chartPanelMode === '3d'),
+
+      setLayout: (layout) => this.store.setLayout(layout),
+      setChartPanelMode: (mode) => this.store.setChartPanelMode(mode),
+      focusColumnInTable: (colIndex, rowIndex, targetLayout) => {
+        this.store.focusColumnInTable(colIndex, rowIndex, targetLayout);
+        if (this.store.selectedCell) {
+          this.spreadsheet.focusSourceCell(
+            this.store.selectedCell.rowIndex,
+            this.store.selectedCell.colIndex
+          );
+        }
+      },
+      toggleColumnPin: (colIndex) => this.store.toggleColumnPin(colIndex),
+      toggleColumnVisibility: (colIndex) => this.store.toggleColumnVisibility(colIndex),
+      restoreAllColumns: () => this.store.restoreAllColumns(),
+      resetColumnView: () => this.store.resetColumnView(),
+      autoFitColumn: (colIndex) => this.store.autoFitColumn(colIndex),
+      useColumnAsChartX: (colIndex, targetLayout) =>
+        this.store.useColumnAsChartX(colIndex, targetLayout),
+      addColumnAsChartY: (colIndex, targetLayout) =>
+        this.store.addColumnAsChartY(colIndex, targetLayout),
+      setChartType: (type) => {
+        if (this.store.layout !== 'split' && this.store.layout !== 'charts') {
+          this.store.setLayout('charts');
+        }
+        this.store.setChartPanelMode('2d');
+        this.store.setChartConfig({...this.store.chartConfig, type});
+      },
+      resetChart: () => {
+        if (this.store.layout !== 'split' && this.store.layout !== 'charts') {
+          this.store.setLayout('charts');
+        }
+        this.store.setChartPanelMode('2d');
+        this.store.setChartConfig(
+          resetChartConfig(
+            this.store.activeSheet,
+            this.store.chartConfig.spatialMode,
+            this.store.datasetProfile
+          )
+        );
+      },
+      toggleInspector: () => {
+        if (!this.inspector.isOpen()) {
+          this.autoOpenPaused = false;
+        }
+        this.inspector.toggle();
+        this.syncInspectToggleState();
+      },
+      clearSelection: () => this.store.selectCell(null),
+      filterToSelectionGroup: () => this.store.filterToSelectionGroup(),
+      inspectContributingRecords: () => {
+        this.autoOpenPaused = false;
+        this.inspector.open(true);
+        this.syncInspectToggleState();
+        this.root.querySelector<HTMLButtonElement>('[data-inspect="contributors"]')?.click();
+      },
+      clearSearch: () => {
+        this.searchInput.value = '';
+        this.store.clearSearch();
+      },
+      switchSheet: (sheetIndex) => this.store.switchSheet(sheetIndex),
+      addNewSheet: () => this.store.addNewSheet(),
+      addRow: () => {
+        if (this.store.layout === 'overview' || this.store.layout === 'charts' || this.store.layout === 'spatial') {
+          this.store.setLayout('split');
+        }
+        const idx = this.store.addRow();
+        this.spreadsheet.scrollToRow(idx);
+      },
+      addColumn: () => {
+        if (this.store.layout === 'overview' || this.store.layout === 'charts' || this.store.layout === 'spatial') {
+          this.store.setLayout('split');
+        }
+        this.store.addColumn();
+      },
+      undo: () => this.store.undo(),
+      redo: () => this.store.redo(),
+      openFilePicker: () => {
+        this.root.querySelector<HTMLInputElement>('[data-role="file-input"]')?.click();
+      },
+      newBlankWorkbook: () => {
+        this.store.resetWithWorkbook(createBlankWorkbook());
+        if (this.store.layout === 'overview') {
+          this.store.setLayout('split');
+        }
+      },
+      exportCsv: () =>
+        exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName),
+      exportXlsx: () => exportWorkbookAsExcel(this.store.workbook),
+      openColumnManager: () => {
+        if (this.store.layout !== 'split' && this.store.layout !== 'table') {
+          this.store.setLayout('split');
+        }
+        this.spreadsheet.openColumnManager();
+      },
+      openSeriesManager: () => {
+        if (this.store.layout !== 'split' && this.store.layout !== 'charts') {
+          this.store.setLayout('charts');
+        }
+        this.store.setChartPanelMode('2d');
+        this.chart2d.openSeriesManager();
+      },
+      focusSearch: () => {
+        this.searchInput.focus();
+        this.searchInput.select();
+      },
+      openShortcutsHelp: () => this.openShortcutsHelp(),
+      reset3DCamera: () => this.spatialStage.resetCamera(),
+    });
+    validateCommandRegistry(commands);
+    return commands;
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -1335,6 +1676,9 @@ class SpatialSheetApp {
     for (const unsub of this.storeUnsubscribes) unsub();
     this.storeUnsubscribes = [];
 
+    this.commandPalette.dispose();
+    this.shortcutsHelp.dispose();
+    this.toastManager.dispose();
     this.splitter.dispose();
     this.spreadsheet.dispose();
     this.chart2d.dispose();

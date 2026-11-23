@@ -329,6 +329,10 @@ export class AppStore {
     return Int32Array.from(kept);
   }
 
+  public get isFilteredOrSorted(): boolean {
+    return this.hasActiveFilterOrSort();
+  }
+
   private hasActiveFilterOrSort(): boolean {
     return (
       this.groupFilter !== null ||

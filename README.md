@@ -30,6 +30,8 @@ The project emphasizes **transparent data transformations**, **source-record tra
 | **3D workspace** | Interactive 3D bar, scatter, and ring representations with configurable mappings and analytical interactions. |
 | **Unified Data Inspector** | Inspect selected cells, rows, chart points, spatial objects, and aggregates; view full text; copy values; and navigate to contributing records. |
 | **Suggested analyses** | Deterministic, schema-aware suggestions that open supported 2D or 3D views. |
+| **Command Palette & Shortcuts** | Global `Ctrl/Cmd+K` Command Palette (`Commands`), `?` Keyboard Shortcuts Help, contextual column/aggregate actions, and input-safe global shortcuts. |
+| **Interaction feedback** | ARIA-live toast notifications, accessible focus restoration across modals/drawers, and actionable empty/filter recovery states. |
 | **Flexible layout** | Overview, Table, Split, Charts, and 3D XR workspaces, with a resizable desktop split and responsive inspector. |
 | **Export** | Export a sheet as CSV or a workbook as Excel. |
 
@@ -46,7 +48,7 @@ The repository includes screenshots captured during the earlier Inspector/Chart 
 
 </details>
 
-> These images document Phase 2 UI behavior and may not show the latest Dataset Overview interface.
+> These images document Phase 2 UI behavior and may not show the latest Dataset Overview and Command Palette interface.
 
 ## Getting started
 
@@ -85,13 +87,14 @@ The build output is written to `dist/`. The `preview` command serves the product
 
 ## Usage
 
-1. **Import a dataset.** Use **Open CSV / Excel** to select a supported file. The file picker currently accepts `.csv`, `.tsv`, `.txt`, `.xlsx`, `.xls`, `.ods`, and `.json` inputs; exact parsing support depends on the import implementation and the file's contents.
+1. **Import a dataset.** Use **Open CSV / Excel** (or drag and drop) to select a supported file. The file picker currently accepts `.csv`, `.tsv`, `.txt`, `.xlsx`, `.xls`, `.ods`, and `.json` inputs; exact parsing support depends on the import implementation and the file's contents.
 2. **Explore the Overview.** Inspect sheet dimensions, inferred column roles, missing values, potential data-quality issues, and suggested analyses.
-3. **Work with the table.** Edit cells, search or sort records, and customize column visibility, positioning, or widths.
-4. **Build a chart.** Open **Charts** or **Split**, select a chart type, choose fields and series, and configure available aggregation and sorting controls.
-5. **Explore in 3D.** Open **3D XR** to work with supported spatial mappings and interact with rendered data objects.
-6. **Inspect the source.** Open **Inspect data** to examine selected records and aggregated values, including source rows contributing to supported aggregates.
-7. **Export results.** Export source workbook data to CSV or Excel as needed.
+3. **Work with the table.** Edit cells, search (`Ctrl/Cmd+F`) or sort records, and customize column visibility, positioning, or widths.
+4. **Navigate faster with keyboard workflows.** Press `Ctrl/Cmd+K` (or click **Commands**) to jump between views, focus or pin columns, switch sheets, and run contextual chart or inspector actions; press `?` outside text inputs to open **Keyboard Shortcuts**.
+5. **Build a chart.** Open **Charts** or **Split**, select a chart type, choose fields and series, and configure available aggregation and sorting controls.
+6. **Explore in 3D.** Open **3D XR** to work with supported spatial mappings and interact with rendered data objects.
+7. **Inspect the source.** Open **Inspect data** to examine selected records and aggregated values, including source rows contributing to supported aggregates.
+8. **Export results.** Export source workbook data to CSV or Excel as needed.
 
 **Important data semantics:** hiding, pinning, or visually reordering columns does **not** change their order in the underlying workbook or in a CSV export. Structural edits, such as deleting a column, do change the source data and can be undone.
 
@@ -111,7 +114,10 @@ src/
 │   ├── chartValidation.ts       # Chart configuration validation
 │   ├── chartRecommender.ts      # Rule-based chart recommendations
 │   ├── analyticalSelection.ts   # Source-record and aggregate resolution
-│   ├── columnView.ts            # Visual column mapping
+│   ├── commands.ts               # Dynamic & contextual Command Palette registry
+│   ├── commandSearch.ts          # Fuzzy/prefix command ranking & grouping
+│   ├── shortcuts.ts              # Unified conflict-free keyboard shortcut registry
+│   ├── columnView.ts             # Visual column mapping
 │   ├── columnViewPersistence.ts # Browser-persisted layout preferences
 │   ├── spatialTransform.ts      # Spatial data transformation
 │   └── history.ts               # Workbook undo/redo history
@@ -120,8 +126,12 @@ src/
 │   ├── SpreadsheetGrid.ts       # Virtualized spreadsheet
 │   ├── InteractiveChart2D.ts    # 2D rendering and interaction
 │   ├── ChartBuilder.ts          # Chart configuration UI
+│   ├── ChartSeriesManager.ts    # Searchable chart series selector
 │   ├── DataInspector.ts         # Unified source-data inspector
 │   ├── ColumnManager.ts        # Column layout controls
+│   ├── CommandPalette.ts        # Accessible combobox/listbox command modal
+│   ├── KeyboardShortcutsHelp.ts # Platform-aware shortcut reference dialog
+│   ├── ToastManager.ts          # ARIA-live non-intrusive toast manager
 │   └── WorkspaceSplitter.ts    # Resizable split layout
 ├── xr/
 │   └── SpatialDataStage.ts      # 3D spatial stage
@@ -188,10 +198,13 @@ GitHub Actions runs static/unit/build checks and browser tests on pushes and pul
 
 ## Roadmap
 
-The following are **planned directions**, not features already delivered:
+Delivered in recent phases:
 
-- [ ] Command palette and keyboard-first analytical workflows
-- [ ] Further accessibility and interaction polish
+- [x] Command palette and keyboard-first analytical workflows
+- [x] Accessibility, empty-state clarity, and non-intrusive toast feedback
+
+Planned directions:
+
 - [ ] Performance investigation and optimization for large imports
 - [ ] Optional AI-assisted analysis with validated, inspectable actions
 - [ ] Broader browser/device compatibility verification

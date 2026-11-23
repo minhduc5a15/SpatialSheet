@@ -187,6 +187,10 @@ export class DataInspector {
     return this.openState;
   }
 
+  public isFullTextDialogOpen(): boolean {
+    return this.dialog.open;
+  }
+
   toggle(): void {
     if (this.openState) this.close(true);
     else this.open(true);

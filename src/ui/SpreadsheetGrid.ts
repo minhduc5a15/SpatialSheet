@@ -515,7 +515,8 @@ export class SpreadsheetGrid {
             e.key.length === 1 &&
             !e.ctrlKey &&
             !e.metaKey &&
-            !e.altKey
+            !e.altKey &&
+            e.key !== '?'
           ) {
             e.preventDefault();
             this.startEditing(rowIndex, colIndex, e.key);
@@ -1030,6 +1031,30 @@ export class SpreadsheetGrid {
     this.longTextTriggerBtn.classList.toggle('inline-flex', visible);
   }
 
+  public isLongTextModalOpen(): boolean {
+    return Boolean(
+      this.longTextModalEl && !this.longTextModalEl.classList.contains('hidden')
+    );
+  }
+
+  public closeLongTextModalIfOpen(): void {
+    if (this.isLongTextModalOpen()) {
+      this.closeLongTextModal();
+    }
+  }
+
+  public isColumnManagerOpen(): boolean {
+    return this.columnManager?.getIsOpen() ?? false;
+  }
+
+  public openColumnManager(): void {
+    this.columnManager?.toggle(true);
+  }
+
+  public closeColumnManager(): void {
+    this.columnManager?.toggle(false);
+  }
+
   private closeLongTextModal(): void {
     this.modalAbortController?.abort();
     this.modalAbortController = null;
@@ -1266,8 +1291,8 @@ export class SpreadsheetGrid {
             decorative: true,
             className: 'w-12 h-12 mb-3 opacity-90',
           })}
-          <p class="text-sm font-medium text-slate-900">This sheet has no rows yet</p>
-          <p class="text-xs text-slate-500 mt-1">Click below to add the first row or open a CSV / Excel file.</p>
+          <p class="text-sm font-semibold text-slate-900">This sheet has no rows yet</p>
+          <p class="text-xs text-slate-500 mt-1 max-w-xs">Add the first row to start entering data, or open a CSV / Excel file from the top bar.</p>
           <button
             type="button"
             data-empty-action="add-row"
@@ -1285,8 +1310,8 @@ export class SpreadsheetGrid {
       this.clearTableRefs();
       this.tableContainerEl.innerHTML = `
         <div class="flex flex-col items-center justify-center h-full min-h-[260px] p-8 text-center">
-          <p class="text-sm font-medium text-slate-900">No rows match your search</p>
-          <p class="text-xs text-slate-500 mt-1">Try a different keyword or clear the current filter.</p>
+          <p class="text-sm font-semibold text-slate-900">No rows match your search or group filter</p>
+          <p class="text-xs text-slate-500 mt-1 max-w-xs">All rows are filtered out right now. Adjust your search keyword or clear the active filter to restore rows.</p>
           <button
             type="button"
             data-empty-action="clear-search"

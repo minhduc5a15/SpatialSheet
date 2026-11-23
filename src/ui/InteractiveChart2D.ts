@@ -285,6 +285,18 @@ export class InteractiveChart2D {
     }
   }
 
+  public openSeriesManager(): void {
+    this.builder?.openSeries();
+  }
+
+  public isSeriesManagerOpen(): boolean {
+    return this.builder?.isSeriesOpen() ?? false;
+  }
+
+  public closeSeriesManager(): void {
+    this.builder?.closeSeries();
+  }
+
   private renderControlsIfNeeded(): void {
     if (this.sheet) this.builder?.update(this.sheet, this.profile, this.config, this.recommendations);
   }
@@ -476,8 +488,15 @@ export class InteractiveChart2D {
             decorative: true,
             className: 'w-12 h-12 mb-3 opacity-90',
           })}
-          <p class="text-sm font-medium text-slate-700">No chartable numeric data yet</p>
-          <p class="text-xs text-slate-500 mt-1 max-w-xs">Choose numeric columns in Series Manager or enter numeric values in the spreadsheet.</p>
+          <p class="text-sm font-semibold text-slate-800">No chartable numeric values in current selection</p>
+          <p class="text-xs text-slate-500 mt-1 max-w-xs">The selected series or filtered rows have no numeric values. Choose numeric columns in Series Manager or clear active filters.</p>
+          <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
+            <button
+              type="button"
+              data-empty-chart="open-series"
+              class="px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer"
+            >Choose series</button>
+          </div>
         </div>
       `;
       this.legendEl.innerHTML = '';

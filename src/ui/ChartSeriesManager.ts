@@ -333,6 +333,10 @@ export class ChartSeriesManager {
     }
   }
 
+  public getIsOpen(): boolean {
+    return this.isOpen;
+  }
+
   public open(): void {
     this.toggle(true);
   }

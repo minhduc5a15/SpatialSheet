@@ -118,6 +118,10 @@ export class ColumnManager {
         : `Columns (${total})${pinSuffix}`;
   }
 
+  public getIsOpen(): boolean {
+    return this.isOpen;
+  }
+
   public toggle(forceOpen?: boolean): void {
     const next = forceOpen ?? !this.isOpen;
     if (next === this.isOpen) return;

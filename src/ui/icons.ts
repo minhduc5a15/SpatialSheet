@@ -34,7 +34,15 @@ export function svgIcon(
     | 'copy'
     | 'overview'
     | 'alert'
-    | 'compass',
+    | 'compass'
+    | 'command'
+    | 'keyboard'
+    | 'help'
+    | 'layers'
+    | 'filter'
+    | 'info'
+    | 'checkCircle'
+    | 'arrowRight',
   className = 'w-4 h-4'
 ): string {
   const common = `class="${className}" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"`;
@@ -74,6 +82,8 @@ export function svgIcon(
       return `<svg ${common}><path d="M12 5v14"/><polyline points="17 14 12 19 7 14"/></svg>`;
     case 'sortNone':
       return `<svg ${common}><polyline points="7 15 12 20 17 15"/><polyline points="7 9 12 4 17 9"/></svg>`;
+    case 'sparkles':
+      return `<svg ${common}><path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9L12 3z"/><path d="M5 17l.9 2.1L8 20l-2.1.9L5 23l-.9-2.1L2 20l2.1-.9L5 17z"/></svg>`;
     case 'xr':
       return `<svg ${common}><path d="M3 9a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2h-3.2a2 2 0 0 1-1.79-1.11l-.55-1.1a1.5 1.5 0 0 0-2.92 0l-.55 1.1A2 2 0 0 1 8.2 17H5a2 2 0 0 1-2-2V9z"/><circle cx="7.5" cy="12" r="1.5"/><circle cx="16.5" cy="12" r="1.5"/></svg>`;
     case 'close':
@@ -108,6 +118,22 @@ export function svgIcon(
       return `<svg ${common}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
     case 'compass':
       return `<svg ${common}><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>`;
+    case 'command':
+      return `<svg ${common}><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/></svg>`;
+    case 'keyboard':
+      return `<svg ${common}><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M6 12h.01"/><path d="M10 12h.01"/><path d="M14 12h.01"/><path d="M18 12h.01"/><path d="M7 16h10"/></svg>`;
+    case 'help':
+      return `<svg ${common}><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>`;
+    case 'layers':
+      return `<svg ${common}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`;
+    case 'filter':
+      return `<svg ${common}><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>`;
+    case 'info':
+      return `<svg ${common}><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
+    case 'checkCircle':
+      return `<svg ${common}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>`;
+    case 'arrowRight':
+      return `<svg ${common}><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`;
     default:
       return `<svg ${common}><circle cx="12" cy="12" r="4"/></svg>`;
   }

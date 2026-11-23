@@ -98,6 +98,19 @@ class MockElement {
     return child;
   }
 
+  append(...nodes: Array<MockElement | string>): void {
+    for (const n of nodes) {
+      if (typeof n !== 'string') this.appendChild(n);
+    }
+  }
+
+  remove(): void {
+    if (!this.parentNode) return;
+    const idx = this.parentNode.children.indexOf(this);
+    if (idx >= 0) this.parentNode.children.splice(idx, 1);
+    this.parentNode = null;
+  }
+
   contains(target: unknown): boolean {
     if (target === this) return true;
     for (const c of this.children) {
@@ -191,8 +204,14 @@ function setupMockDom(): {
   const body = new MockElement('body');
   body.style.cursor = '';
   body.style.userSelect = '';
-  const documentEl = new MockElement('document') as MockElement & {body: MockElement};
+  const documentEl = new MockElement('document') as MockElement & {
+    body: MockElement;
+    createElement: (tag: string) => MockElement;
+    activeElement: MockElement | null;
+  };
   documentEl.body = body;
+  documentEl.activeElement = body;
+  documentEl.createElement = (tag: string) => new MockElement(tag);
 
   let rafSeq = 1;
   const activeRafs = new Set<number>();
@@ -216,11 +235,15 @@ function setupMockDom(): {
   const windowTarget = new MockElement('window') as MockElement & {
     requestAnimationFrame: (cb: () => void) => number;
     cancelAnimationFrame: (id: number) => void;
+    setTimeout: typeof setTimeout;
+    clearTimeout: typeof clearTimeout;
     activeRafs: Set<number>;
     ResizeObserver: new () => {observe(): void; disconnect(): void; disconnected: boolean};
   };
   windowTarget.requestAnimationFrame = rafFn;
   windowTarget.cancelAnimationFrame = cancelRafFn;
+  windowTarget.setTimeout = setTimeout;
+  windowTarget.clearTimeout = clearTimeout;
   windowTarget.activeRafs = activeRafs;
   windowTarget.ResizeObserver = MockResizeObserver;
 
@@ -407,4 +430,53 @@ test('DatasetOverview dispose() detaches all listeners and clears host children'
     dom.teardown();
   }
 });
+
+test('ToastManager, KeyboardShortcutsHelp, and CommandPalette dispose() detach listeners, clear timers, and remove overlays cleanly', async () => {
+  const dom = setupMockDom();
+  try {
+    const {ToastManager} = await import('./ToastManager');
+    const {KeyboardShortcutsHelp} = await import('./KeyboardShortcutsHelp');
+    const {CommandPalette} = await import('./CommandPalette');
+
+    const host = new MockElement('div');
+    const toasts = new ToastManager(host as unknown as HTMLElement);
+    const help = new KeyboardShortcutsHelp(host as unknown as HTMLElement);
+    const palette = new CommandPalette(host as unknown as HTMLElement, {
+      getCommands: () => [
+        {
+          id: 'nav.split',
+          title: 'Switch to Split View',
+          category: 'Navigation',
+          icon: 'split',
+          execute: () => ({ok: true}),
+        },
+      ],
+      getContextLabel: () => 'demo.csv · Sheet 1',
+      onNotify: () => {},
+      onOpenShortcutsHelp: () => {},
+    });
+
+    assert.equal(host.children.length, 3);
+    toasts.show({kind: 'success', message: 'Saved', durationMs: 5000});
+    assert.equal(toasts.getActiveCount(), 1);
+    toasts.dispose();
+    assert.equal(toasts.getActiveCount(), 0);
+    assert.equal(host.children.length, 2);
+
+    help.open();
+    assert.equal(help.isOpen(), true);
+    help.dispose();
+    assert.equal(help.isOpen(), false);
+    assert.equal(host.children.length, 1);
+
+    palette.open();
+    assert.equal(palette.isOpen(), true);
+    palette.dispose();
+    assert.equal(palette.isOpen(), false);
+    assert.equal(host.children.length, 0);
+  } finally {
+    dom.teardown();
+  }
+});
+
 

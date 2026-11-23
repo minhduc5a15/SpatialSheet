@@ -96,5 +96,7 @@ export class ChartBuilder {
     x.setAttribute('aria-invalid', String(!!error));
   }
   openSeries(): void {this.series.open();}
+  isSeriesOpen(): boolean {return this.series.getIsOpen();}
+  closeSeries(): void {this.series.toggle(false);}
   dispose(): void {this.abort.abort(); this.series.dispose();}
 }

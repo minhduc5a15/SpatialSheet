@@ -62,7 +62,7 @@ export class KeyboardShortcutsHelp {
         </button>
       </header>
       <div data-role="shortcuts-help-body" class="p-5 overflow-y-auto sheet-scroll space-y-5"></div>
-      <footer class="px-5 py-2.5 border-t border-slate-200 bg-slate-50 text-[11px] text-slate-500 flex items-center justify-between gap-2 shrink-0">
+      <footer class="px-4 sm:px-5 py-2.5 border-t border-slate-200 bg-slate-50 text-[11px] text-slate-500 flex flex-wrap items-center justify-between gap-2 shrink-0">
         <span>Shortcuts respect active text inputs and inline cell editing.</span>
         <span class="inline-flex items-center gap-1 shrink-0">
           <kbd class="sp-kbd">Esc</kbd>

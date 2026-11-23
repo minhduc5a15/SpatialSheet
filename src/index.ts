@@ -103,31 +103,31 @@ class SpatialSheetApp {
     this.root.innerHTML = `
       <div class="flex flex-col min-h-screen lg:h-screen w-full lg:overflow-hidden bg-slate-50 text-slate-900">
         <!-- Top Bar (3-zone contract) -->
-        <header class="h-14 shrink-0 bg-white border-b border-slate-200 px-3 sm:px-4 lg:px-6 flex items-center justify-between gap-2 sm:gap-4 lg:gap-6">
+        <header class="h-14 shrink-0 bg-white border-b border-slate-200 px-2.5 sm:px-4 lg:px-6 flex items-center justify-between gap-1.5 sm:gap-4 lg:gap-6">
           <!-- Zone 1: Brand lockup -->
           <a
             href="#top"
             data-action="brand-home"
             aria-label="SpatialSheet home"
-            class="inline-flex items-center gap-2 sm:gap-2.5 whitespace-nowrap shrink-0 no-underline rounded-lg pr-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+            class="inline-flex items-center gap-1.5 sm:gap-2.5 whitespace-nowrap shrink-0 no-underline rounded-lg pr-0.5 sm:pr-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
           >
             ${renderBrandLogoHtml({
               variant: 'header',
               sizePx: 36,
               alt: 'SpatialSheet logo',
-              className: 'w-8 h-8 sm:w-9 sm:h-9',
+              className: 'w-7 h-7 sm:w-9 sm:h-9',
             })}
-            <span class="font-display text-base sm:text-lg font-bold tracking-tight text-slate-900 leading-none">
+            <span class="font-display text-sm sm:text-lg font-bold tracking-tight text-slate-900 leading-none">
               SpatialSheet
             </span>
           </a>
 
           <!-- Zone 2: File Actions -->
-          <nav class="flex items-center gap-2 sm:gap-3 overflow-x-auto" aria-label="File tools">
-            <label class="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg cursor-pointer transition-colors whitespace-nowrap shrink-0">
+          <nav class="flex items-center gap-1.5 sm:gap-3 min-w-0 overflow-x-auto" aria-label="File tools">
+            <label class="inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg cursor-pointer transition-colors whitespace-nowrap shrink-0">
               ${svgIcon('upload', 'w-3.5 h-3.5 text-blue-600')}
               <span class="hidden sm:inline">Open CSV / Excel</span>
-              <span class="sm:hidden">Open file</span>
+              <span class="sm:hidden">Open</span>
               <input
                 type="file"
                 data-role="file-input"
@@ -165,7 +165,7 @@ class SpatialSheetApp {
           </nav>
 
           <!-- Zone 3: Quick Palette, Shortcuts Help & Primary CTA -->
-          <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          <div class="flex items-center gap-1 sm:gap-2 shrink-0">
             <button
               type="button"
               data-action="open-command-palette"
@@ -183,7 +183,7 @@ class SpatialSheetApp {
               data-action="open-shortcuts-help"
               aria-label="Keyboard shortcuts help"
               title="Keyboard shortcuts (?)"
-              class="inline-flex items-center justify-center w-8 h-8 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-100 hover:text-slate-900 border border-slate-200 rounded-lg transition-colors shrink-0 cursor-pointer"
+              class="inline-flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-100 hover:text-slate-900 border border-slate-200 rounded-lg transition-colors shrink-0 cursor-pointer"
             >
               <span aria-hidden="true">?</span>
             </button>
@@ -191,10 +191,12 @@ class SpatialSheetApp {
             <button
               type="button"
               data-action="toggle-xr"
-              class="inline-flex items-center gap-1.5 px-2.5 sm:px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              aria-label="XR Space"
+              class="inline-flex items-center gap-1.5 px-2 sm:px-3.5 py-1.5 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               ${svgIcon('xr', 'w-4 h-4')}
-              <span>XR Space</span>
+              <span class="hidden min-[400px]:inline">XR Space</span>
+              <span class="min-[400px]:hidden">XR</span>
             </button>
           </div>
         </header>
@@ -207,8 +209,8 @@ class SpatialSheetApp {
         ></div>
 
         <!-- Secondary Workspace Toolbar -->
-        <div class="shrink-0 bg-white border-b border-slate-200 px-4 lg:px-6 py-2 flex flex-wrap items-center justify-between gap-3">
-          <div class="flex items-center gap-3 min-w-0">
+        <div class="shrink-0 bg-white border-b border-slate-200 px-3 sm:px-4 lg:px-6 py-2 flex flex-wrap items-center justify-between gap-2 sm:gap-3">
+          <div class="flex items-center gap-2 sm:gap-3 min-w-0 max-w-full">
             <div data-role="file-meta" class="text-xs text-slate-500 truncate"></div>
             <div
               data-role="loading-status"
@@ -216,7 +218,7 @@ class SpatialSheetApp {
               class="hidden items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-[11px] font-medium text-emerald-800 whitespace-nowrap shrink-0"
             ></div>
             <div class="h-4 w-px bg-slate-200 hidden sm:block" aria-hidden="true"></div>
-            <div data-role="sheet-tabs" class="flex items-center gap-1 overflow-x-auto" role="tablist" aria-label="Sheet tabs"></div>
+            <div data-role="sheet-tabs" class="flex items-center gap-1 min-w-0 overflow-x-auto" role="tablist" aria-label="Sheet tabs"></div>
           </div>
 
           <div class="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
@@ -231,7 +233,7 @@ class SpatialSheetApp {
                 aria-label="Search table"
                 title="Search table (${isMacPlatform() ? '⌘F' : 'Ctrl+F'})"
                 placeholder="Search data..."
-                class="w-44 sm:w-56 pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
+                class="w-40 sm:w-56 pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
               />
             </div>
 
@@ -258,25 +260,25 @@ class SpatialSheetApp {
             </div>
 
             <!-- Workspace View Mode -->
-            <div class="flex items-center gap-1 p-1 bg-slate-100 rounded-lg min-w-0 max-w-full overflow-x-auto" role="group" aria-label="Workspace layout">
-              <button type="button" data-layout="overview" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
-                ${svgIcon('overview', 'w-3.5 h-3.5')}
+            <div class="flex items-center gap-0.5 sm:gap-1 p-1 bg-slate-100 rounded-lg min-w-0 max-w-full overflow-x-auto" role="group" aria-label="Workspace layout">
+              <button type="button" data-layout="overview" class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('overview', 'w-3.5 h-3.5 hidden min-[430px]:inline-block shrink-0')}
                 <span>Overview</span>
               </button>
-              <button type="button" data-layout="split" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
-                ${svgIcon('split', 'w-3.5 h-3.5')}
+              <button type="button" data-layout="split" class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('split', 'w-3.5 h-3.5 hidden min-[430px]:inline-block shrink-0')}
                 <span>Split</span>
               </button>
-              <button type="button" data-layout="table" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
-                ${svgIcon('table', 'w-3.5 h-3.5')}
+              <button type="button" data-layout="table" class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('table', 'w-3.5 h-3.5 hidden min-[430px]:inline-block shrink-0')}
                 <span>Table</span>
               </button>
-              <button type="button" data-layout="charts" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
-                ${svgIcon('barChart', 'w-3.5 h-3.5')}
+              <button type="button" data-layout="charts" class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('barChart', 'w-3.5 h-3.5 hidden min-[430px]:inline-block shrink-0')}
                 <span>Charts</span>
               </button>
-              <button type="button" data-layout="spatial" class="inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
-                ${svgIcon('cube3d', 'w-3.5 h-3.5')}
+              <button type="button" data-layout="spatial" class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs rounded-md whitespace-nowrap shrink-0 cursor-pointer">
+                ${svgIcon('cube3d', 'w-3.5 h-3.5 hidden min-[430px]:inline-block shrink-0')}
                 <span>3D XR</span>
               </button>
             </div>

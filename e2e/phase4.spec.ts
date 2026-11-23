@@ -54,7 +54,7 @@ test('Command Palette opens via Ctrl+K, searches/executes contextual and dynamic
   await expect(palette).toBeHidden();
   const colManager = page.getByRole('dialog', {name: 'Manage spreadsheet columns'});
   await expect(colManager).toBeVisible();
-  await expect(colManager.getByLabel('Search columns')).toBeFocused();
+  await expect(colManager.getByLabel('Filter columns by name or letter')).toBeFocused();
 
   // Hide Revenue column, close Column Manager, then reveal & focus it via Command Palette
   await colManager.getByRole('button', {name: 'Hide column Revenue', exact: true}).click();
@@ -115,21 +115,30 @@ test('Keyboard Shortcuts Help opens on ? outside inputs, traps Tab, restores foc
   await expect(cell(page, 'B1')).toBeFocused();
 });
 
-test('Global Ctrl+F, Ctrl+Z, Ctrl+Shift+Z shortcuts work and Toasts keep total DOM node count invariant', async ({page}) => {
+test('Global Ctrl+F, Ctrl+Z, Ctrl+Shift+Z shortcuts work and ToastManager keeps a bounded slot pool across repeated cycles', async ({page}) => {
   await importCsv(page, sampleCsv, 4, 5);
   await page.getByRole('button', {name: 'Split', exact: true}).click();
 
-  // Capture settled DOM node count with 0 active toasts (after dismissing any import toast)
-  await page.locator('[data-toast-close="0"]').click({force: true}).catch(() => {});
-  await page.waitForTimeout(50);
-  const baselineNodes = await page.locator('*').count();
+  const toastContainer = role(page, 'toast-container');
+  const toastSlots = toastContainer.locator('[data-toast-slot]');
+  await expect(role(page, 'toast-live-polite')).toHaveCount(1);
+  await expect(role(page, 'toast-live-assertive')).toHaveCount(1);
+  await expect(toastSlots).toHaveCount(3);
+  await expect(toastContainer.locator('> *')).toHaveCount(5);
+
+  // Dismiss any visible import toast cleanly
+  for (let i = 0; i < 3; i++) {
+    const closeBtn = page.locator(`[data-toast-close="${i}"]`);
+    if (await closeBtn.isVisible()) await closeBtn.click();
+  }
+  await expect(toastContainer.locator('[data-toast-slot]:visible')).toHaveCount(0);
 
   // Ctrl+F focuses search input
   await cell(page, 'A1').click();
   await page.keyboard.press('Control+f');
   await expect(role(page, 'search-input')).toBeFocused();
 
-  // Edit cell then Undo via Ctrl+Z and Redo via Ctrl+Shift+Z, verifying toasts + DOM invariance
+  // Edit cell then Undo via Ctrl+Z and Redo via Ctrl+Shift+Z, verifying toasts + bounded slot pool
   await edit(page, 'C1', '9999');
   await expect(cell(page, 'C1')).toHaveText('9999');
 
@@ -139,18 +148,36 @@ test('Global Ctrl+F, Ctrl+Z, Ctrl+Shift+Z shortcuts work and Toasts keep total D
   await expect(page.locator('[data-toast-slot="0"]')).toBeVisible();
   await expect(page.locator('[data-toast-slot="0"]')).toContainText('Undid last change');
   await expect(role(page, 'toast-live-polite')).toContainText('Undid last change');
-  expect(await page.locator('*').count()).toBe(baselineNodes);
+  await expect(toastSlots).toHaveCount(3);
+  await expect(toastContainer.locator('> *')).toHaveCount(5);
 
   await page.keyboard.press('Control+Shift+z');
   await expect(cell(page, 'C1')).toHaveText('9999');
   await expect(role(page, 'toast-live-polite')).toContainText('Redid change');
-  expect(await page.locator('*').count()).toBe(baselineNodes);
+  await expect(toastSlots).toHaveCount(3);
+  await expect(toastContainer.locator('> *')).toHaveCount(5);
 
-  // Dismiss toast via close button
-  await page.locator('[data-toast-close="0"]').click();
-  await page.locator('[data-toast-close="1"]').click({force: true}).catch(() => {});
-  await expect(page.locator('[data-toast-slot="0"]')).toBeHidden();
-  expect(await page.locator('*').count()).toBe(baselineNodes);
+  // Exercise repeated show/dismiss/recycle cycles across all 3 slots (> MAX_SLOTS)
+  const settledToastNodes = await toastContainer.locator('*').count();
+  for (let cycle = 0; cycle < 4; cycle++) {
+    await page.keyboard.press('Control+z');
+    await expect(cell(page, 'C1')).toHaveText('1200');
+    await page.keyboard.press('Control+Shift+z');
+    await expect(cell(page, 'C1')).toHaveText('9999');
+    await expect(toastSlots).toHaveCount(3);
+    await expect(toastContainer.locator('> *')).toHaveCount(5);
+    const activeCount = await toastContainer.locator('[data-toast-slot]:visible').count();
+    expect(activeCount).toBeLessThanOrEqual(3);
+  }
+
+  for (let i = 0; i < 3; i++) {
+    const closeBtn = page.locator(`[data-toast-close="${i}"]`);
+    if (await closeBtn.isVisible()) await closeBtn.click();
+  }
+  await expect(toastContainer.locator('[data-toast-slot]:visible')).toHaveCount(0);
+  await expect(toastSlots).toHaveCount(3);
+  await expect(toastContainer.locator('> *')).toHaveCount(5);
+  await expect(toastContainer.locator('*')).toHaveCount(settledToastNodes);
 });
 
 test('Empty chart series and empty filter states offer clear recovery actions', async ({page}) => {
@@ -167,7 +194,15 @@ test('Empty chart series and empty filter states offer clear recovery actions', 
   await expect(seriesMgr).toBeVisible();
   await seriesMgr.getByRole('button', {name: 'Recommended', exact: true}).click();
   await page.keyboard.press('Escape');
-  await expect(role(page, 'chart-canvas-wrap').locator('svg')).toHaveCount(1);
+
+  await expect(role(page, 'chart-empty-selection')).toHaveCount(0);
+  await expect(role(page, 'series-manager-trigger')).toContainText('Series (2)');
+  await expect(role(page, 'chart-legend')).toContainText('Revenue');
+  await expect(role(page, 'chart-legend')).toContainText('Orders');
+  const svg = role(page, 'chart-canvas-wrap').locator('svg');
+  await expect(svg).toHaveCount(1);
+  await expect(svg.locator('[data-point-row]')).toHaveCount(8);
+  await expect(svg.locator('[data-point-row]').first()).toHaveAttribute('data-tip-sub', 'Revenue: 1,200');
 
   // Non-matching table search -> Clear filter button restores rows
   const searchInput = role(page, 'search-input');
@@ -178,33 +213,66 @@ test('Empty chart series and empty filter states offer clear recovery actions', 
   await expect(cell(page, 'A1')).toHaveText('North');
 });
 
-test('Command Palette and Shortcuts Help respond cleanly across Desktop (1280x800) and Mobile (390x844)', async ({page}) => {
+test('Command Palette and Shortcuts Help respond cleanly across Desktop (1280x800), Tablet (900x800), and Mobile (390x844)', async ({page}) => {
   await importCsv(page, sampleCsv, 4, 5);
   await page.getByRole('button', {name: 'Split', exact: true}).click();
 
   for (const vp of [
     {width: 1280, height: 800},
+    {width: 900, height: 800},
     {width: 390, height: 844},
   ]) {
     await page.setViewportSize(vp);
 
-    // Header has no horizontal overflow
+    // Document has no horizontal overflow
     const overflow = await page.evaluate(
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth
     );
     expect(overflow, `Viewport ${vp.width}x${vp.height} horizontal overflow`).toBeLessThanOrEqual(1);
 
-    // Palette fits inside viewport
+    // Palette fits inside viewport, input & list work, keyboard nav + Tab trap + close button stay accessible
     await page.locator('[data-action="open-command-palette"]').click();
     const palette = page.getByRole('dialog', {name: 'Command Palette'});
     await expect(palette).toBeVisible();
     const pBox = (await palette.boundingBox())!;
     expect(pBox.x).toBeGreaterThanOrEqual(0);
+    expect(pBox.width).toBeGreaterThanOrEqual(Math.min(340, vp.width - 32));
     expect(pBox.x + pBox.width).toBeLessThanOrEqual(vp.width + 1);
     expect(pBox.y + pBox.height).toBeLessThanOrEqual(vp.height + 1);
-    await page.keyboard.press('Escape');
 
-    // Shortcuts Help fits inside viewport
+    const paletteInput = palette.getByRole('combobox', {name: 'Search commands, columns, sheets, and actions'});
+    await expect(paletteInput).toBeVisible();
+    await expect(paletteInput).toBeFocused();
+    const inputBox = (await paletteInput.boundingBox())!;
+    expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(pBox.x + pBox.width + 1);
+
+    const listEl = role(page, 'command-palette-list');
+    await expect(listEl).toBeVisible();
+    const listBox = (await listEl.boundingBox())!;
+    expect(listBox.y + listBox.height).toBeLessThanOrEqual(pBox.y + pBox.height + 1);
+    const listScrollable = await listEl.evaluate((el) => el.scrollHeight > el.clientHeight);
+    expect(listScrollable).toBe(true);
+
+    const initialActive = await paletteInput.getAttribute('aria-activedescendant');
+    await page.keyboard.press('ArrowDown');
+    const nextActive = await paletteInput.getAttribute('aria-activedescendant');
+    expect(nextActive).not.toBe(initialActive);
+
+    // Tab focus remains trapped inside Command Palette
+    await page.keyboard.press('Tab');
+    const focusInsidePalette = await page.evaluate(() =>
+      Boolean(document.activeElement?.closest('[data-role="command-palette-dialog"]'))
+    );
+    expect(focusInsidePalette).toBe(true);
+
+    const closePaletteBtn = palette.getByRole('button', {name: 'Close Command Palette', exact: true});
+    await expect(closePaletteBtn).toBeVisible();
+    const closePBox = (await closePaletteBtn.boundingBox())!;
+    expect(closePBox.x + closePBox.width).toBeLessThanOrEqual(vp.width + 1);
+    await closePaletteBtn.click();
+    await expect(palette).toBeHidden();
+
+    // Shortcuts Help fits inside viewport with accessible close button and zero internal horizontal overflow
     await page.locator('[data-action="open-shortcuts-help"]').click();
     const help = page.getByRole('dialog', {name: 'Keyboard Shortcuts'});
     await expect(help).toBeVisible();
@@ -212,6 +280,10 @@ test('Command Palette and Shortcuts Help respond cleanly across Desktop (1280x80
     expect(hBox.x).toBeGreaterThanOrEqual(0);
     expect(hBox.x + hBox.width).toBeLessThanOrEqual(vp.width + 1);
     expect(hBox.y + hBox.height).toBeLessThanOrEqual(vp.height + 1);
-    await page.keyboard.press('Escape');
+
+    const closeHelpBtn = help.getByRole('button', {name: 'Close keyboard shortcuts help', exact: true});
+    await expect(closeHelpBtn).toBeVisible();
+    await closeHelpBtn.click();
+    await expect(help).toBeHidden();
   }
 });

@@ -673,13 +673,13 @@ export class DatasetOverview {
         </dl>
 
         <!-- Role Override -->
-        <div class="flex items-center justify-between gap-2 bg-slate-50 p-2.5 rounded-lg border border-slate-200/80">
+        <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-2.5 rounded-lg border border-slate-200/80">
           <label for="overview-role-override" class="text-xs font-medium text-slate-700">Role Override</label>
           <select
             id="overview-role-override"
             data-overview-role-override="${detail.colIndex}"
             aria-label="Role Override"
-            class="px-2 py-1 text-xs bg-white border border-slate-300 rounded-md text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
+            class="max-w-full min-w-0 px-2 py-1 text-xs bg-white border border-slate-300 rounded-md text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
           >
             <option value="auto" ${detail.roleOverride === null ? 'selected' : ''}>Auto (${ROLE_META[detail.inferredSemanticType].label})</option>
             ${roleOptions}

@@ -447,6 +447,7 @@ export class InteractiveChart2D {
 
     // Dedicated empty-selection state
     if (yCols.length === 0) {
+      this.lastPointsKey = null;
       this.cachedPoints = [];
       this.cachedHasNumeric = false;
       this.chartCanvasWrapEl.innerHTML = `

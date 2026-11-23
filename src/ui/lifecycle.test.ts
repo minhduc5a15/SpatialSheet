@@ -457,8 +457,19 @@ test('ToastManager, KeyboardShortcutsHelp, and CommandPalette dispose() detach l
     });
 
     assert.equal(host.children.length, 3);
-    toasts.show({kind: 'success', message: 'Saved', durationMs: 5000});
-    assert.equal(toasts.getActiveCount(), 1);
+    const container = host.children[0];
+    assert.equal(container.children.length, 5);
+    for (let i = 0; i < 10; i++) {
+      toasts.show({
+        kind: i % 3 === 0 ? 'error' : i % 2 === 0 ? 'success' : 'info',
+        message: `Toast message #${i}`,
+        durationMs: 5000,
+      });
+    }
+    assert.equal(toasts.getActiveCount(), 3);
+    assert.equal(container.children.length, 5);
+    toasts.dismissAll();
+    assert.equal(toasts.getActiveCount(), 0);
     toasts.dispose();
     assert.equal(toasts.getActiveCount(), 0);
     assert.equal(host.children.length, 2);

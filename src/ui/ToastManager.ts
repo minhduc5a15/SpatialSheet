@@ -248,6 +248,7 @@ export class ToastManager {
     slot.active = false;
     slot.key = '';
     slot.paused = false;
+    slot.root.removeAttribute('data-toast-kind');
     slot.root.classList.add('hidden');
     slot.root.classList.remove('flex');
     slot.messageEl.textContent = '';

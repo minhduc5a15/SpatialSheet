@@ -415,11 +415,15 @@ export class DatasetOverview {
 
   private renderHeader(summary: ReturnType<typeof analyzeDatasetOverview>['summary']): void {
     const formatLabel = summary.fileFormat.toUpperCase();
+    const sourceBadge = summary.sourceFileName
+      ? `<span class="text-xs text-slate-500">Source: <strong class="font-semibold text-slate-800">${esc(summary.sourceFileName)}</strong></span>`
+      : '';
     this.headerEl.innerHTML = `
       <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div class="min-w-0">
           <div class="flex flex-wrap items-center gap-2">
             <span class="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 uppercase tracking-wide">${esc(formatLabel)}</span>
+            ${sourceBadge}
             <span class="text-xs text-slate-500">Sheet: <strong class="font-semibold text-slate-800">${esc(summary.sheetName)}</strong></span>
             ${
               summary.isFiltered
@@ -427,7 +431,7 @@ export class DatasetOverview {
                 : ''
             }
           </div>
-          <h1 class="mt-1.5 text-lg sm:text-xl font-bold text-slate-900 truncate" title="${esc(summary.fileName)}">${esc(summary.fileName)}</h1>
+          <h1 data-role="overview-workbook-name" class="mt-1.5 text-lg sm:text-xl font-bold text-slate-900 truncate" title="${esc(summary.workbookName)}">${esc(summary.workbookName)}</h1>
           <p class="text-xs text-slate-500 mt-0.5">Dataset overview, semantic profiling, quality observations, and validated starting views for the active sheet.</p>
         </div>
 

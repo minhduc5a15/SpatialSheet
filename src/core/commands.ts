@@ -9,6 +9,7 @@ import type {
   WorkspaceLayout,
 } from '../types';
 import {columnIndexToLetter} from './tabular';
+import {getWorkbookDisplayName} from './fileNaming';
 import {evaluateSeriesEligibility} from '../ui/ChartSeriesManager';
 import type {ShortcutKeyCombo} from './shortcuts';
 
@@ -42,6 +43,7 @@ export type CommandIconName =
   | 'plus'
   | 'upload'
   | 'download'
+  | 'edit'
   | 'undo'
   | 'redo'
   | 'compass'
@@ -124,6 +126,8 @@ export interface CommandContext {
   redo: () => void;
   openFilePicker: () => void;
   newBlankWorkbook: () => void;
+  renameWorkbook?: () => void;
+  openSaveAsDialog?: () => void;
   exportCsv: () => void;
   exportXlsx: () => void;
   openColumnManager: () => void;
@@ -652,6 +656,39 @@ export function buildAppCommands(ctx: CommandContext): AppCommand[] {
     },
   });
 
+  if (ctx.renameWorkbook) {
+    commands.push({
+      id: 'workbook.rename',
+      title: 'Rename Workbook…',
+      subtitle: `Current name: "${getWorkbookDisplayName(ctx.workbook)}"`,
+      category: 'Workbook & Data',
+      keywords: ['rename', 'title', 'workbook', 'name', 'header'],
+      icon: 'edit',
+      contextWeight: 34,
+      execute: () => {
+        ctx.renameWorkbook?.();
+        return {ok: true};
+      },
+    });
+  }
+
+  if (ctx.openSaveAsDialog) {
+    commands.push({
+      id: 'workbook.saveAs',
+      title: 'Save As…',
+      subtitle: 'Choose filename, export format (.xlsx, .csv, .tsv), and scope',
+      category: 'Workbook & Data',
+      keywords: ['save as', 'export', 'download', 'filename', 'xlsx', 'csv', 'tsv'],
+      shortcut: {ctrlOrCmd: true, shift: true, key: 's'},
+      icon: 'download',
+      contextWeight: 35,
+      execute: () => {
+        ctx.openSaveAsDialog?.();
+        return {ok: true};
+      },
+    });
+  }
+
   commands.push({
     id: 'workbook.exportCsv',
     title: 'Export Active Sheet as CSV',
@@ -663,7 +700,7 @@ export function buildAppCommands(ctx: CommandContext): AppCommand[] {
       ctx.exportCsv();
       return {
         ok: true,
-        toast: {kind: 'success', message: `Exported "${sheet.name}" as CSV`},
+        toast: {kind: 'success', message: `Download started: CSV for "${sheet.name}"`},
       };
     },
   });
@@ -679,7 +716,10 @@ export function buildAppCommands(ctx: CommandContext): AppCommand[] {
       ctx.exportXlsx();
       return {
         ok: true,
-        toast: {kind: 'success', message: `Exported "${ctx.workbook.fileName}" as Excel`},
+        toast: {
+          kind: 'success',
+          message: `Download started: "${getWorkbookDisplayName(ctx.workbook)}.xlsx"`,
+        },
       };
     },
   });

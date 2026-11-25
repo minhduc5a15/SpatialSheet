@@ -551,6 +551,10 @@ export class CommandPalette {
     }
   }
 
+  public getPreviousFocus(): HTMLElement | null {
+    return this.previousFocus;
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -568,6 +572,8 @@ const COMMANDS_MANAGING_FOCUS = new Set<string>([
   'nav.focusSearch',
   'help.shortcuts',
   'workbook.open',
+  'workbook.rename',
+  'workbook.saveAs',
   'nav.inspector',
   'context.inspector.contributors',
 ]);

@@ -310,4 +310,36 @@ test('shortcuts detect zero conflicts, adapt modifier display by platform, and g
   assert.equal(undoCount, 1);
   assert.equal(helpCount, 1);
   assert.equal(matchesShortcut({key: '?', shiftKey: true}, {key: '?'}), true);
+
+  // Ctrl+Shift+S dispatches workbook.saveAs outside editable inputs only
+  let saveAsCount = 0;
+  const saveAsHandlers = {
+    'workbook.saveAs': () => { saveAsCount += 1; },
+  };
+  dispatchKeyboardShortcut({key: 's', ctrlKey: true, shiftKey: true}, {tagName: 'INPUT', getAttribute: () => 'text'}, saveAsHandlers);
+  assert.equal(saveAsCount, 0);
+  dispatchKeyboardShortcut({key: 'S', ctrlKey: true, shiftKey: true}, {tagName: 'BUTTON'}, saveAsHandlers);
+  assert.equal(saveAsCount, 1);
 });
+
+test('Phase 4.1 workbook.rename and workbook.saveAs commands are registered and executable', async () => {
+  const {ctx, calls} = makeMockContext({
+    renameWorkbook: () => calls.push({fn: 'renameWorkbook', args: []}),
+    openSaveAsDialog: () => calls.push({fn: 'openSaveAsDialog', args: []}),
+  });
+  const cmds = buildAppCommands(ctx);
+  validateCommandRegistry(cmds);
+
+  const renameCmd = cmds.find((c) => c.id === 'workbook.rename');
+  const saveAsCmd = cmds.find((c) => c.id === 'workbook.saveAs');
+  assert.ok(renameCmd);
+  assert.ok(saveAsCmd);
+  assert.match(renameCmd.subtitle ?? '', /sales/);
+
+  await renameCmd.execute();
+  assert.deepEqual(calls.at(-1), {fn: 'renameWorkbook', args: []});
+
+  await saveAsCmd.execute();
+  assert.deepEqual(calls.at(-1), {fn: 'openSaveAsDialog', args: []});
+});
+

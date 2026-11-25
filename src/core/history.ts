@@ -6,6 +6,7 @@ import type {
   WorkbookState,
 } from '../types';
 import {inferSingleColumnType} from './tabular';
+import {getWorkbookDisplayName} from './fileNaming';
 
 export interface CellPatchEntry {
   kind: 'cell-patch';
@@ -44,10 +45,17 @@ export interface WorkbookSwitchEntry {
   nextActiveSheetIndex: number;
 }
 
+export interface WorkbookRenameEntry {
+  kind: 'workbook-rename';
+  prevName: string;
+  nextName: string;
+}
+
 export type HistoryEntry =
   | CellPatchEntry
   | SheetSnapshotEntry
-  | WorkbookSwitchEntry;
+  | WorkbookSwitchEntry
+  | WorkbookRenameEntry;
 
 /**
  * Patch- and Copy-on-Write-based Undo/Redo history for large workbooks.
@@ -190,6 +198,22 @@ export class WorkbookHistoryManager {
     });
   }
 
+  /** Updates the logical workbook name with O(1) history entry. */
+  commitWorkbookRename(nextName: string): boolean {
+    const prevName = getWorkbookDisplayName(this.present);
+    if (prevName === nextName) return false;
+    this.present = {
+      ...this.present,
+      name: nextName,
+    };
+    this.pushEntry({
+      kind: 'workbook-rename',
+      prevName,
+      nextName,
+    });
+    return true;
+  }
+
   undo(): {wb: WorkbookState; entry: HistoryEntry} | null {
     if (this.past.length === 0) return null;
     const entry = this.past.pop()!;
@@ -261,6 +285,13 @@ export class WorkbookHistoryManager {
         ...wb,
         sheets: nextSheets,
         activeSheetIndex: targetActive,
+      };
+    }
+
+    if (entry.kind === 'workbook-rename') {
+      return {
+        ...wb,
+        name: direction === 'undo' ? entry.prevName : entry.nextName,
       };
     }
 

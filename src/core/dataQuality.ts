@@ -18,6 +18,7 @@ import type {
 import {recommendCharts} from './chartRecommender';
 import {validateChartConfig} from './chartValidation';
 import {getEffectiveSemanticType, parseTemporalValue} from './dataProfiler';
+import {getWorkbookDisplayName} from './fileNaming';
 import {createDefaultSpatialConfig, transformSpatialDataset} from './spatialTransform';
 import {columnIndexToLetter, formatDisplayNumber, parseNumericValue} from './tabular';
 
@@ -566,6 +567,10 @@ export function analyzeDatasetOverview(
 
   const totalCells = totalRows * totalCols;
   const summary: DatasetOverviewSummary = {
+    workbookName: getWorkbookDisplayName(workbook),
+    ...(workbook.sourceFileName !== undefined
+      ? {sourceFileName: workbook.sourceFileName}
+      : {}),
     fileName: workbook.fileName,
     fileFormat: workbook.fileFormat,
     sheetId: sheet.id,

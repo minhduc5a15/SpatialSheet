@@ -218,6 +218,14 @@ export const APP_SHORTCUTS: readonly ShortcutDefinition[] = [
     allowInEditable: false,
   },
   {
+    id: 'workbook.saveAs',
+    scope: 'global',
+    combo: {ctrlOrCmd: true, shift: true, key: 's'},
+    title: 'Save As…',
+    description: 'Choose export filename, format (.xlsx, .csv, .tsv), and scope.',
+    allowInEditable: false,
+  },
+  {
     id: 'overlay.close',
     scope: 'global',
     combo: {key: 'Escape'},

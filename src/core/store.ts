@@ -69,6 +69,7 @@ import {
   suggestChartConfig,
 } from './tabular';
 import {DataWorkerClient, buildFilterKey} from './workerClient';
+import {getWorkbookDisplayName, validateWorkbookName} from './fileNaming';
 import {matchesContributor} from './analyticalSelection';
 import {resetChartConfig} from './chartValidation';
 import {applySeriesPreset, evaluateSeriesEligibility} from '../ui/ChartSeriesManager';
@@ -228,7 +229,7 @@ export class AppStore {
     }
 
     const identity = computeSheetLayoutIdentity({
-      fileName: this.workbook.fileName,
+      fileName: this.workbook.sourceFileName ?? this.workbook.fileName,
       fileFormat: this.workbook.fileFormat,
       sheetName: sheet.name,
       columns: sheet.columns,
@@ -248,7 +249,7 @@ export class AppStore {
     view: ColumnViewState
   ): void {
     const identity = computeSheetLayoutIdentity({
-      fileName: this.workbook.fileName,
+      fileName: this.workbook.sourceFileName ?? this.workbook.fileName,
       fileFormat: this.workbook.fileFormat,
       sheetName: sheet.name,
       columns: sheet.columns,
@@ -1494,7 +1495,7 @@ export class AppStore {
     const fresh = createColumnViewState(sheet);
     this.columnViewsBySheetId.set(sheet.id, fresh);
     const identity = computeSheetLayoutIdentity({
-      fileName: this.workbook.fileName,
+      fileName: this.workbook.sourceFileName ?? this.workbook.fileName,
       fileFormat: this.workbook.fileFormat,
       sheetName: sheet.name,
       columns: sheet.columns,
@@ -1646,6 +1647,28 @@ export class AppStore {
     ]);
   }
 
+  public renameWorkbook(rawName: string): {
+    ok: boolean;
+    changed: boolean;
+    name?: string;
+    error?: string;
+  } {
+    const validation = validateWorkbookName(rawName);
+    if (!validation.ok) {
+      return {ok: false, changed: false, error: validation.error};
+    }
+    const current = getWorkbookDisplayName(this.workbook);
+    if (validation.name === current) {
+      return {ok: true, changed: false, name: current};
+    }
+    const committed = this.history.commitWorkbookRename(validation.name);
+    if (!committed) {
+      return {ok: true, changed: false, name: current};
+    }
+    this.emit(['workbook', 'history', 'overview']);
+    return {ok: true, changed: true, name: validation.name};
+  }
+
   public undo(): void {
     const prevVersion = this.sheetVersion;
     const res = this.history.undo();
@@ -1669,6 +1692,11 @@ export class AppStore {
     prevVersion: number,
     dir: 'undo' | 'redo'
   ): void {
+    if (entry.kind === 'workbook-rename') {
+      this.emit(['workbook', 'history', 'overview']);
+      return;
+    }
+
     this.cancelPendingSearchTimer();
     this.nextSheetVersion();
     this.filterSeq++;

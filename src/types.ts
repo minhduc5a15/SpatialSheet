@@ -199,7 +199,12 @@ export interface SheetData {
 }
 
 export interface WorkbookState {
+  /** User-facing logical workbook name (never includes synthetic export extension). */
+  name?: string;
+  /** Compatibility / imported filename string. */
   fileName: string;
+  /** Original imported source file name when loaded from disk; undefined for blank workbooks. */
+  sourceFileName?: string;
   fileFormat: 'csv' | 'tsv' | 'xlsx' | 'json' | 'blank';
   sheets: SheetData[];
   activeSheetIndex: number;
@@ -341,6 +346,8 @@ export interface CatalogFilterState {
 }
 
 export interface DatasetOverviewSummary {
+  workbookName: string;
+  sourceFileName?: string;
   fileName: string;
   fileFormat: WorkbookState['fileFormat'];
   sheetId: string;

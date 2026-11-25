@@ -6,6 +6,11 @@ import {
   isDesktopSplitViewport,
 } from './core/workspaceLayout';
 import {exportSheetAsCsv, exportWorkbookAsExcel} from './core/excelIO';
+import {
+  buildExportFilename,
+  deriveWorkbookNameFromFileName,
+  getWorkbookDisplayName,
+} from './core/fileNaming';
 import {resetChartConfig} from './core/chartValidation';
 import {buildAppCommands, validateCommandRegistry, type AppCommand} from './core/commands';
 import {dispatchKeyboardShortcut, isMacPlatform} from './core/shortcuts';
@@ -19,6 +24,8 @@ import {WorkspaceSplitter} from './ui/WorkspaceSplitter';
 import {CommandPalette} from './ui/CommandPalette';
 import {KeyboardShortcutsHelp} from './ui/KeyboardShortcutsHelp';
 import {ToastManager} from './ui/ToastManager';
+import {WorkbookTitle} from './ui/WorkbookTitle';
+import {SaveAsDialog} from './ui/SaveAsDialog';
 import {SpatialDataStage} from './xr/SpatialDataStage';
 import {svgIcon} from './ui/icons';
 import {renderBrandLogoHtml} from './ui/branding';
@@ -45,6 +52,8 @@ class SpatialSheetApp {
   private toastManager!: ToastManager;
   private shortcutsHelp!: KeyboardShortcutsHelp;
   private commandPalette!: CommandPalette;
+  private workbookTitle!: WorkbookTitle;
+  private saveAsDialog!: SaveAsDialog;
 
   // Layout containers
   private mainEl!: HTMLElement;
@@ -56,6 +65,7 @@ class SpatialSheetApp {
   private spatialHostEl!: HTMLElement;
   private xrCanvasMountEl!: HTMLElement;
   private xrCanvasEl!: HTMLCanvasElement;
+  private workbookTitleHostEl!: HTMLElement;
   private sheetTabsEl!: HTMLElement;
   private fileMetaEl!: HTMLElement;
   private loadingBadgeEl!: HTMLElement;
@@ -103,28 +113,35 @@ class SpatialSheetApp {
     this.root.innerHTML = `
       <div class="flex flex-col min-h-screen lg:h-screen w-full lg:overflow-hidden bg-slate-50 text-slate-900">
         <!-- Top Bar (3-zone contract) -->
-        <header class="h-14 shrink-0 bg-white border-b border-slate-200 px-2.5 sm:px-4 lg:px-6 flex items-center justify-between gap-1.5 sm:gap-4 lg:gap-6">
-          <!-- Zone 1: Brand lockup -->
-          <a
-            href="#top"
-            data-action="brand-home"
-            aria-label="SpatialSheet home"
-            class="inline-flex items-center gap-1.5 sm:gap-2.5 whitespace-nowrap shrink-0 no-underline rounded-lg pr-0.5 sm:pr-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
-          >
-            ${renderBrandLogoHtml({
-              variant: 'header',
-              sizePx: 36,
-              alt: 'SpatialSheet logo',
-              className: 'w-7 h-7 sm:w-9 sm:h-9',
-            })}
-            <span class="font-display text-sm sm:text-lg font-bold tracking-tight text-slate-900 leading-none">
-              SpatialSheet
-            </span>
-          </a>
+        <header class="min-h-14 shrink-0 bg-white border-b border-slate-200 px-2.5 sm:px-4 xl:px-6 py-1.5 lg:py-0 flex flex-wrap lg:flex-nowrap items-center justify-between gap-x-2 gap-y-1.5 sm:gap-3 xl:gap-5">
+          <!-- Zone 1: Brand lockup + Inline Workbook Title -->
+          <div class="order-1 flex items-center gap-1.5 sm:gap-2.5 min-w-0 flex-1 sm:flex-initial">
+            <a
+              href="#top"
+              data-action="brand-home"
+              aria-label="SpatialSheet home"
+              class="inline-flex items-center gap-1.5 sm:gap-2 whitespace-nowrap shrink-0 no-underline rounded-lg pr-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40"
+            >
+              ${renderBrandLogoHtml({
+                variant: 'header',
+                sizePx: 36,
+                alt: 'SpatialSheet logo',
+                className: 'w-7 h-7 sm:w-8 sm:h-8',
+              })}
+              <span class="font-display text-sm sm:text-base xl:text-lg font-bold tracking-tight text-slate-900 leading-none">
+                SpatialSheet
+              </span>
+            </a>
+            <div class="h-4 w-px bg-slate-200 shrink-0" aria-hidden="true"></div>
+            <div
+              data-role="workbook-title-host"
+              class="min-w-0 max-w-[145px] sm:max-w-[200px] xl:max-w-[240px]"
+            ></div>
+          </div>
 
           <!-- Zone 2: File Actions -->
-          <nav class="flex items-center gap-1.5 sm:gap-3 min-w-0 overflow-x-auto" aria-label="File tools">
-            <label class="inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg cursor-pointer transition-colors whitespace-nowrap shrink-0">
+          <nav class="order-3 lg:order-2 w-full lg:w-auto flex items-center gap-1.5 sm:gap-2 min-w-0 overflow-x-auto" aria-label="File tools">
+            <label class="inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg cursor-pointer transition-colors whitespace-nowrap shrink-0">
               ${svgIcon('upload', 'w-3.5 h-3.5 text-blue-600')}
               <span class="hidden sm:inline">Open CSV / Excel</span>
               <span class="sm:hidden">Open</span>
@@ -139,7 +156,7 @@ class SpatialSheetApp {
             <button
               type="button"
               data-action="new-blank"
-              class="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="hidden sm:inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               ${svgIcon('plus', 'w-3.5 h-3.5 text-slate-500')}
               <span>New Sheet</span>
@@ -147,8 +164,19 @@ class SpatialSheetApp {
 
             <button
               type="button"
+              data-action="save-as"
+              aria-label="Save As"
+              title="Save As (${isMacPlatform() ? '⌘⇧S' : 'Ctrl+Shift+S'})"
+              class="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50/80 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              ${svgIcon('download', 'w-3.5 h-3.5 text-emerald-700')}
+              <span>Save As</span>
+            </button>
+
+            <button
+              type="button"
               data-action="export-csv"
-              class="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="hidden md:inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               ${svgIcon('download', 'w-3.5 h-3.5')}
               <span>Export CSV</span>
@@ -157,7 +185,7 @@ class SpatialSheetApp {
             <button
               type="button"
               data-action="export-xlsx"
-              class="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="hidden md:inline-flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:text-slate-900 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               ${svgIcon('download', 'w-3.5 h-3.5 text-emerald-600')}
               <span>Export Excel</span>
@@ -165,7 +193,7 @@ class SpatialSheetApp {
           </nav>
 
           <!-- Zone 3: Quick Palette, Shortcuts Help & Primary CTA -->
-          <div class="flex items-center gap-1 sm:gap-2 shrink-0">
+          <div class="order-2 lg:order-3 flex items-center gap-1 sm:gap-2 shrink-0">
             <button
               type="button"
               data-action="open-command-palette"
@@ -175,7 +203,7 @@ class SpatialSheetApp {
             >
               ${svgIcon('command', 'w-3.5 h-3.5 text-emerald-700')}
               <span class="hidden sm:inline">Commands</span>
-              <kbd class="hidden md:inline-flex sp-kbd ml-0.5">${isMacPlatform() ? '⌘K' : 'Ctrl K'}</kbd>
+              <kbd class="hidden xl:inline-flex sp-kbd ml-0.5">${isMacPlatform() ? '⌘K' : 'Ctrl K'}</kbd>
             </button>
 
             <button
@@ -192,7 +220,7 @@ class SpatialSheetApp {
               type="button"
               data-action="toggle-xr"
               aria-label="XR Space"
-              class="inline-flex items-center gap-1.5 px-2 sm:px-3.5 py-1.5 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              class="inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               ${svgIcon('xr', 'w-4 h-4')}
               <span class="hidden min-[400px]:inline">XR Space</span>
@@ -379,6 +407,9 @@ class SpatialSheetApp {
       '[data-role="xr-canvas-mount"]'
     )!;
     this.xrCanvasEl = this.root.querySelector('[data-role="xr-canvas"]')!;
+    this.workbookTitleHostEl = this.root.querySelector(
+      '[data-role="workbook-title-host"]'
+    )!;
     this.sheetTabsEl = this.root.querySelector('[data-role="sheet-tabs"]')!;
     this.fileMetaEl = this.root.querySelector('[data-role="file-meta"]')!;
     this.loadingBadgeEl = this.root.querySelector(
@@ -625,6 +656,17 @@ class SpatialSheetApp {
 
     const overlayHost = (this.root.firstElementChild as HTMLElement | null) ?? this.root;
     this.toastManager = new ToastManager(overlayHost);
+    this.workbookTitle = new WorkbookTitle(this.workbookTitleHostEl, {
+      onCommitName: (rawName) => this.store.renameWorkbook(rawName),
+      onNotify: (toast) => this.toastManager.show(toast),
+    });
+    this.saveAsDialog = new SaveAsDialog(overlayHost, {
+      getWorkbookState: () => ({
+        workbook: this.store.workbook,
+        activeSheet: this.store.activeSheet,
+      }),
+      onNotify: (toast) => this.toastManager.show(toast),
+    });
     this.shortcutsHelp = new KeyboardShortcutsHelp(overlayHost);
     this.commandPalette = new CommandPalette(overlayHost, {
       getCommands: () => this.buildPaletteCommands(),
@@ -637,10 +679,11 @@ class SpatialSheetApp {
           : this.store.analyticalSelection?.kind === 'aggregate'
             ? `Group: ${this.store.analyticalSelection.label}`
             : 'No selection';
-        return `${wb.fileName} · ${sheet.name} · ${this.store.layout} · ${cellRef}`;
+        return `${getWorkbookDisplayName(wb)} · ${sheet.name} · ${this.store.layout} · ${cellRef}`;
       },
       onNotify: (toast) => this.toastManager.show(toast),
       onOpenShortcutsHelp: () => {
+        this.saveAsDialog.close(false);
         this.spreadsheet.closeColumnManager();
         this.chart2d.closeSeriesManager();
         this.shortcutsHelp.open();
@@ -894,7 +937,20 @@ class SpatialSheetApp {
   private syncMetadataAndTabs(): void {
     const wb = this.store.workbook;
     const sheet = this.store.activeSheet;
-    this.fileMetaEl.textContent = `${wb.fileName} · ${sheet.rows.length.toLocaleString('en-US')} rows · ${sheet.columns.length} cols`;
+    const displayName = getWorkbookDisplayName(wb);
+    this.workbookTitle.setName(displayName);
+
+    const rowsText = sheet.rows.length.toLocaleString('en-US');
+    const colsCount = sheet.columns.length;
+    if (wb.sourceFileName) {
+      const derivedSource = deriveWorkbookNameFromFileName(wb.sourceFileName);
+      this.fileMetaEl.textContent =
+        displayName === derivedSource
+          ? `${wb.sourceFileName} · ${rowsText} rows · ${colsCount} cols`
+          : `${displayName} · Source: ${wb.sourceFileName} · ${rowsText} rows · ${colsCount} cols`;
+    } else {
+      this.fileMetaEl.textContent = `${displayName} · ${rowsText} rows · ${colsCount} cols`;
+    }
 
     const tabsKey = `${wb.activeSheetIndex}|${wb.sheets.map((s) => `${s.id}:${s.name}`).join('\x00')}`;
     if (tabsKey === this.lastTabsKey) return;
@@ -936,9 +992,10 @@ class SpatialSheetApp {
       if (this.wasLoading && !this.store.errorMessage) {
         const wb = this.store.workbook;
         const sheet = this.store.activeSheet;
+        const loadedLabel = wb.sourceFileName || getWorkbookDisplayName(wb);
         this.toastManager?.show({
           kind: 'success',
-          message: `Loaded ${wb.fileName} · ${sheet.rows.length.toLocaleString('en-US')} rows · ${sheet.columns.length} cols`,
+          message: `Loaded ${loadedLabel} · ${sheet.rows.length.toLocaleString('en-US')} rows · ${sheet.columns.length} cols`,
         });
       }
       this.wasLoading = false;
@@ -1209,16 +1266,32 @@ class SpatialSheetApp {
         {signal}
       );
 
-    // Exports
+    // Save As & Quick Exports
+    this.root
+      .querySelector('[data-action="save-as"]')
+      ?.addEventListener(
+        'click',
+        () => {
+          this.openSaveAsDialog();
+        },
+        {signal}
+      );
+
     this.root
       .querySelector('[data-action="export-csv"]')
       ?.addEventListener(
         'click',
         () => {
-          exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName);
+          const baseName = getWorkbookDisplayName(this.store.workbook);
+          const includeSheetSuffix = this.store.workbook.sheets.length > 1;
+          exportSheetAsCsv(this.store.activeSheet, baseName, {includeSheetSuffix});
+          const outName = buildExportFilename(baseName, 'csv', {
+            includeSheetSuffix,
+            sheetName: this.store.activeSheet.name,
+          });
           this.toastManager?.show({
             kind: 'success',
-            message: `Exported ${this.store.activeSheet.name} as CSV`,
+            message: `Download started: ${outName}`,
           });
         },
         {signal}
@@ -1229,9 +1302,13 @@ class SpatialSheetApp {
         'click',
         () => {
           exportWorkbookAsExcel(this.store.workbook);
+          const outName = buildExportFilename(
+            getWorkbookDisplayName(this.store.workbook),
+            'xlsx'
+          );
           this.toastManager?.show({
             kind: 'success',
-            message: 'Exported workbook as Excel (.xlsx)',
+            message: `Download started: ${outName}`,
           });
         },
         {signal}
@@ -1434,6 +1511,7 @@ class SpatialSheetApp {
   }
 
   private openCommandPalette(): void {
+    this.saveAsDialog.close(false);
     this.spreadsheet.closeColumnManager();
     this.chart2d.closeSeriesManager();
     this.shortcutsHelp.close();
@@ -1441,15 +1519,37 @@ class SpatialSheetApp {
   }
 
   private openShortcutsHelp(): void {
+    this.saveAsDialog.close(false);
     this.commandPalette.close(true);
     this.spreadsheet.closeColumnManager();
     this.chart2d.closeSeriesManager();
     this.shortcutsHelp.open();
   }
 
+  private openSaveAsDialog(): void {
+    const restoreFocusTo = this.commandPalette.isOpen()
+      ? this.commandPalette.getPreviousFocus()
+      : (document.activeElement as HTMLElement | null);
+    this.spreadsheet.closeColumnManager();
+    this.chart2d.closeSeriesManager();
+    this.shortcutsHelp.close();
+    this.commandPalette.close(false);
+    this.saveAsDialog.open({restoreFocusTo});
+  }
+
+  private openWorkbookRename(): void {
+    this.saveAsDialog.close(false);
+    this.spreadsheet.closeColumnManager();
+    this.chart2d.closeSeriesManager();
+    this.shortcutsHelp.close();
+    this.commandPalette.close(false);
+    this.workbookTitle.beginRename();
+  }
+
   private handleGlobalKeyDown(e: KeyboardEvent): void {
     const isPaletteOpen = this.commandPalette.isOpen();
     const isHelpOpen = this.shortcutsHelp.isOpen();
+    const isSaveAsOpen = this.saveAsDialog.isOpen();
 
     const triggerRedo = () => {
       e.preventDefault();
@@ -1477,6 +1577,16 @@ class SpatialSheetApp {
           this.shortcutsHelp.close();
           return true;
         }
+        if (isSaveAsOpen) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.stopImmediatePropagation();
+          this.saveAsDialog.close(true);
+          return true;
+        }
+        if (this.workbookTitle.isEditing()) {
+          return false;
+        }
         if (this.spreadsheet.isLongTextModalOpen()) {
           e.preventDefault();
           e.stopPropagation();
@@ -1497,6 +1607,11 @@ class SpatialSheetApp {
           this.openCommandPalette();
         }
       },
+      'workbook.saveAs': () => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.openSaveAsDialog();
+      },
       'help.shortcuts': () => {
         e.preventDefault();
         e.stopPropagation();
@@ -1509,6 +1624,7 @@ class SpatialSheetApp {
       'search.focus': () => {
         e.preventDefault();
         e.stopPropagation();
+        this.saveAsDialog.close(false);
         this.commandPalette.close(false);
         this.searchInput.focus();
         this.searchInput.select();
@@ -1634,8 +1750,14 @@ class SpatialSheetApp {
           this.store.setLayout('split');
         }
       },
-      exportCsv: () =>
-        exportSheetAsCsv(this.store.activeSheet, this.store.workbook.fileName),
+      renameWorkbook: () => this.openWorkbookRename(),
+      openSaveAsDialog: () => this.openSaveAsDialog(),
+      exportCsv: () => {
+        const baseName = getWorkbookDisplayName(this.store.workbook);
+        exportSheetAsCsv(this.store.activeSheet, baseName, {
+          includeSheetSuffix: this.store.workbook.sheets.length > 1,
+        });
+      },
       exportXlsx: () => exportWorkbookAsExcel(this.store.workbook),
       openColumnManager: () => {
         if (this.store.layout !== 'split' && this.store.layout !== 'table') {
@@ -1679,6 +1801,8 @@ class SpatialSheetApp {
     this.storeUnsubscribes = [];
 
     this.commandPalette.dispose();
+    this.saveAsDialog.dispose();
+    this.workbookTitle.dispose();
     this.shortcutsHelp.dispose();
     this.toastManager.dispose();
     this.splitter.dispose();

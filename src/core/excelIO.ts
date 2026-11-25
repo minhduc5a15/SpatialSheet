@@ -5,11 +5,11 @@ import {
   parseCsvText,
   serializeCsv,
 } from './tabular';
-
-function stripExtension(fileName: string): string {
-  const dot = fileName.lastIndexOf('.');
-  return dot > 0 ? fileName.slice(0, dot) : fileName;
-}
+import {
+  buildExportFilename,
+  deriveWorkbookNameFromFileName,
+  getWorkbookDisplayName,
+} from './fileNaming';
 
 export async function importTabularFile(
   file: File,
@@ -25,10 +25,13 @@ export async function importTabularFile(
     onProgress?.(0.15, `Reading ${file.name}…`);
     const text = await file.text();
     onProgress?.(0.55, `Parsing CSV rows…`);
-    const sheet = parseCsvText(text, stripExtension(file.name), 'sheet-0');
+    const derivedName = deriveWorkbookNameFromFileName(file.name);
+    const sheet = parseCsvText(text, derivedName, 'sheet-0');
     onProgress?.(1, 'Ready');
     return {
+      name: derivedName,
       fileName: file.name,
+      sourceFileName: file.name,
       fileFormat: nameLower.endsWith('.tsv') ? 'tsv' : 'csv',
       sheets: [sheet],
       activeSheetIndex: 0,
@@ -63,14 +66,17 @@ export async function importTabularFile(
       }
     }
 
+    const derivedName = deriveWorkbookNameFromFileName(file.name);
     const sheet = normalizeRecordsToSheet(
       records,
-      stripExtension(file.name),
+      derivedName,
       'sheet-0'
     );
     onProgress?.(1, 'Ready');
     return {
+      name: derivedName,
       fileName: file.name,
+      sourceFileName: file.name,
       fileFormat: 'json',
       sheets: [sheet],
       activeSheetIndex: 0,
@@ -103,21 +109,30 @@ export async function importTabularFile(
 
   onProgress?.(1, 'Ready');
   return {
+    name: deriveWorkbookNameFromFileName(file.name),
     fileName: file.name,
+    sourceFileName: file.name,
     fileFormat: 'xlsx',
     sheets,
     activeSheetIndex: 0,
   };
 }
 
-export function exportSheetAsCsv(sheet: SheetData, baseFileName: string): void {
+export function exportSheetAsCsv(
+  sheet: SheetData,
+  baseFileName: string,
+  options?: {includeSheetSuffix?: boolean}
+): void {
   const csvContent = '\uFEFF' + serializeCsv(sheet);
   const blob = new Blob([csvContent], {type: 'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
-  const cleanBase = stripExtension(baseFileName);
+  const fileName = buildExportFilename(baseFileName, 'csv', {
+    includeSheetSuffix: options?.includeSheetSuffix ?? true,
+    sheetName: sheet.name,
+  });
   anchor.href = url;
-  anchor.download = `${cleanBase}-${sheet.name}.csv`;
+  anchor.download = fileName;
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
@@ -178,6 +193,6 @@ export function buildExcelWorkbookForExport(
 
 export function exportWorkbookAsExcel(workbook: WorkbookState): void {
   const wb = buildExcelWorkbookForExport(workbook);
-  const cleanBase = stripExtension(workbook.fileName) || 'Spreadsheet';
-  XLSX.writeFile(wb, `${cleanBase}.xlsx`);
+  const fileName = buildExportFilename(getWorkbookDisplayName(workbook), 'xlsx');
+  XLSX.writeFile(wb, fileName);
 }

@@ -254,10 +254,13 @@ export function parseCsvText(
   return normalizeRecordsToSheet(records, sheetName, id);
 }
 
-export function serializeCsv(sheet: SheetData): string {
+export function serializeDelimited(
+  sheet: SheetData,
+  delimiter: ',' | '\t' = ','
+): string {
   const escapeCell = (val: string): string => {
     if (
-      val.includes(',') ||
+      val.includes(delimiter) ||
       val.includes('"') ||
       val.includes('\n') ||
       val.includes('\r')
@@ -268,7 +271,7 @@ export function serializeCsv(sheet: SheetData): string {
   };
 
   const lines = new Array<string>(sheet.rows.length + 1);
-  lines[0] = sheet.columns.map(escapeCell).join(',');
+  lines[0] = sheet.columns.map(escapeCell).join(delimiter);
   const colCount = sheet.columns.length;
   for (let r = 0; r < sheet.rows.length; r++) {
     const row = sheet.rows[r];
@@ -276,9 +279,17 @@ export function serializeCsv(sheet: SheetData): string {
     for (let c = 0; c < colCount; c++) {
       cells[c] = escapeCell(row[c] ?? '');
     }
-    lines[r + 1] = cells.join(',');
+    lines[r + 1] = cells.join(delimiter);
   }
   return lines.join('\r\n');
+}
+
+export function serializeCsv(sheet: SheetData): string {
+  return serializeDelimited(sheet, ',');
+}
+
+export function serializeTsv(sheet: SheetData): string {
+  return serializeDelimited(sheet, '\t');
 }
 
 export function parseNumericValue(raw: string): {
@@ -590,7 +601,9 @@ export function cloneSheet(sheet: SheetData): SheetData {
 
 export function cloneWorkbook(wb: WorkbookState): WorkbookState {
   return {
+    ...(wb.name !== undefined ? {name: wb.name} : {}),
     fileName: wb.fileName,
+    ...(wb.sourceFileName !== undefined ? {sourceFileName: wb.sourceFileName} : {}),
     fileFormat: wb.fileFormat,
     activeSheetIndex: wb.activeSheetIndex,
     sheets: wb.sheets.map(cloneSheet),
@@ -685,6 +698,7 @@ export function createBlankWorkbook(): WorkbookState {
   const columns = ['Column A', 'Column B', 'Column C'];
   const rows = Array.from({length: 6}, () => ['', '', '']);
   return {
+    name: 'Untitled',
     fileName: 'Untitled.xlsx',
     fileFormat: 'blank',
     activeSheetIndex: 0,
